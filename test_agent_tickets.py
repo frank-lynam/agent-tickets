@@ -1,7 +1,9 @@
 """Tests for agent_tickets.py: a real server on a temporary folder, driven
 over HTTP. Standard library only:  python3 -m unittest -v"""
+import io
 import json
 import re
+import tarfile
 import tempfile
 import threading
 import unittest
@@ -206,6 +208,77 @@ class TicketsTest(unittest.TestCase):
         self.assertNotIn("root", json.dumps(c))
         sneaky = self.new(checklist_path=str(self.allowed / ".." / ".." / "etc" / "passwd"))
         self.assertFalse(self.j("GET", f"/api/tickets/{sneaky['id']}")[1]["checklist"]["readable"])
+
+    # --- backups
+    def test_export_and_restore(self):
+        t = self.new("in_progress", title="Back me up", checklist_path=str(self.allowed / "x.md"))
+        c = self.j("POST", f"/api/tickets/{t['id']}/comments", {"body": "progress"})[1]
+        clip = bytes(range(256)) * 20
+        self.j("POST", f"/api/tickets/{t['id']}/attachments?filename=clip.mp4&comment_id={c['id']}", raw=clip,
+               headers={"Content-Type": "video/mp4"})
+        self.assertEqual(self.call("GET", "/api/export")[0], 403)  # agents can't export
+        code, blob, h = self.call("GET", "/api/export", role="human")
+        self.assertEqual(code, 200)
+        self.assertIn("attachment", h["Content-Disposition"])
+        with tempfile.TemporaryDirectory() as tmp:
+            backup = Path(tmp) / "b.tar.gz"
+            backup.write_bytes(blob)
+            with tarfile.open(backup) as tar:
+                doc = json.load(tar.extractfile("export.json"))
+                self.assertEqual((doc["format"], doc["version"]), ("agent-tickets-export", 1))
+                self.assertIn("files/", " ".join(tar.getnames()))
+            # Restore into a fresh data folder: every row and file comes back as it was.
+            fresh = at.Store(Path(tmp) / "data", [str(self.allowed)])
+            counts = at.import_archive(fresh, backup)
+            self.assertEqual(counts["tickets"], len(doc["tables"]["tickets"]))
+            src = self.srv.store
+            for table in at.TABLES:
+                rows = lambda st: [dict(r) for r in st.db().execute(f"SELECT * FROM {table} ORDER BY rowid")]
+                self.assertEqual(rows(fresh), rows(src), table)
+            a = fresh.detail(t["id"])["attachments"][0]
+            self.assertEqual((fresh.files / fresh.attachment(a["id"])["path"]).read_bytes(), clip)
+            # A second restore refuses to overwrite, unless told to.
+            with self.assertRaises(ValueError):
+                at.import_archive(fresh, backup)
+            at.import_archive(fresh, backup, replace=True)
+            self.assertEqual(fresh.db().execute("SELECT COUNT(*) FROM tickets").fetchone()[0], counts["tickets"])
+
+    def test_export_folder_keeps_the_newest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for i in range(3):
+                dest, counts, pruned = at.export_to(self.srv.store, tmp + "/", keep=2)
+                (Path(tmp) / f"agent-tickets-0000000{i}-000000.tar.gz").write_bytes(b"old")
+            names = sorted(p.name for p in Path(tmp).glob("agent-tickets-*.tar.gz"))
+            self.assertEqual(len(names), 3)  # 2 kept by the last prune + the old one written after it
+            self.assertTrue(any(n.startswith("agent-tickets-2") for n in names))
+            # A folder that doesn't exist yet, given with a trailing slash, is created.
+            dest, _, _ = at.export_to(self.srv.store, tmp + "/new/sub/", keep=5)
+            self.assertTrue((Path(tmp) / "new" / "sub").is_dir())
+            self.assertEqual(dest.parent, Path(tmp) / "new" / "sub")
+
+    def test_bad_backups_are_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = at.Store(Path(tmp) / "data", [tmp])
+            def archive(doc, extra=None):
+                p = Path(tmp) / "x.tar.gz"
+                with tarfile.open(p, "w:gz") as tar:
+                    data = json.dumps(doc).encode()
+                    info = tarfile.TarInfo("export.json"); info.size = len(data)
+                    tar.addfile(info, io.BytesIO(data))
+                    for name, body in (extra or {}).items():
+                        info = tarfile.TarInfo(name); info.size = len(body)
+                        tar.addfile(info, io.BytesIO(body))
+                return p
+            with self.assertRaises(ValueError):
+                at.import_archive(store, archive({"format": "something-else"}))
+            with self.assertRaises(ValueError):
+                at.import_archive(store, archive({"format": "agent-tickets-export", "version": 99, "tables": {}}))
+            # A file trying to escape the data folder is skipped.
+            ok = {"format": "agent-tickets-export", "version": 1, "tables": {}}
+            at.import_archive(store, archive(ok, {"files/../../escaped.txt": b"x", "files/T/ok.txt": b"y"}))
+            self.assertFalse((Path(tmp) / "escaped.txt").exists())
+            self.assertFalse((store.dir / "escaped.txt").exists())
+            self.assertTrue((store.files / "T" / "ok.txt").exists())
 
     # --- pages
     def test_pages_render(self):

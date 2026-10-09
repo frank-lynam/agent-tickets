@@ -19,6 +19,12 @@ read `GET /api` on the running server instead.
   `keys.json`. Schema changes must keep existing databases working:
   `CREATE TABLE IF NOT EXISTS` plus additive `ALTER TABLE`s, never a
   rebuild.
+- **Backups must stay restorable.** Before a change that alters the
+  tables, make sure `import_archive()` still loads older backups (it
+  matches columns by name; add conversion code for anything renamed or
+  restructured), bump `SCHEMA_VERSION` (and `EXPORT_VERSION` if the
+  export layout changes), and test restoring a backup made before the
+  change. Take a backup (`--export`) before upgrading the running instance.
 - **Pages** are server-rendered HTML with a little inline JavaScript.
   Escape everything user- or agent-written (`esc()`), and check new
   pages at phone width.

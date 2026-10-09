@@ -6,6 +6,8 @@ and an SQLite database.
   python3 agent_tickets.py                     # serve on 127.0.0.1:43917, data in ./data
   python3 agent_tickets.py --port 8080 --data /srv/tickets
   python3 agent_tickets.py --keys              # print the access keys and exit
+  python3 agent_tickets.py --export backups/   # back everything up (see "Backups")
+  python3 agent_tickets.py --import FILE       # restore a backup into an empty data folder
 
 Tickets move through five statuses:
   backlog      an idea, not cleared for work yet
@@ -22,6 +24,7 @@ backlog or done tickets (comments are always allowed). API docs: GET /api.
 import argparse
 import hmac
 import html
+import io
 import json
 import mimetypes
 import os
@@ -30,6 +33,8 @@ import re
 import secrets
 import sqlite3
 import sys
+import tarfile
+import tempfile
 import threading
 import time
 from http.cookies import SimpleCookie
@@ -85,6 +90,11 @@ CREATE INDEX IF NOT EXISTS events_ticket ON events(ticket_id, at);
 """
 
 
+# Bumped (with a migration in Store.__init__) whenever the tables change.
+SCHEMA_VERSION = 1
+TABLES = ("tickets", "comments", "attachments", "events")
+
+
 class ApiError(Exception):
     def __init__(self, code, msg):
         super().__init__(msg)
@@ -103,7 +113,10 @@ class Store:
         self.roots = [Path(r).resolve() for r in checklist_roots]
         self.local = threading.local()
         self.write_lock = threading.Lock()
-        self.db().executescript(SCHEMA)
+        db = self.db()
+        db.executescript(SCHEMA)
+        if db.execute("PRAGMA user_version").fetchone()[0] == 0:
+            db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def db(self):
         c = getattr(self.local, "conn", None)
@@ -340,6 +353,108 @@ def load_keys(data_dir):
     return keys
 
 
+# --------------------------------------------------------------------------- backups
+#
+# A backup is a .tar.gz holding export.json and files/<ticket>/<file>.
+# export.json is plain and versioned, one list of rows per table, so a
+# backup stays readable (and convertible) across breaking changes:
+#   {"format": "agent-tickets-export", "version": 1, "schema_version": 1,
+#    "exported_at": "...", "statuses": [...], "missing_files": [...],
+#    "tables": {"tickets": [...], "comments": [...], "attachments": [...], "events": [...]}}
+
+EXPORT_FORMAT = "agent-tickets-export"
+EXPORT_VERSION = 1
+
+
+def export_archive(store, dest):
+    """Write a backup of everything to `dest` (a .tar.gz path). Rows are read
+    in one transaction, so the backup is consistent even while agents work."""
+    db = sqlite3.connect(store.db_path, timeout=30)
+    db.row_factory = sqlite3.Row
+    try:
+        db.execute("BEGIN")
+        tables = {t: [dict(r) for r in db.execute(f"SELECT * FROM {t} ORDER BY rowid")] for t in TABLES}
+        schema = db.execute("PRAGMA user_version").fetchone()[0]
+        db.execute("COMMIT")
+    finally:
+        db.close()
+    missing = [a["path"] for a in tables["attachments"] if not (store.files / a["path"]).is_file()]
+    doc = {"format": EXPORT_FORMAT, "version": EXPORT_VERSION, "schema_version": schema,
+           "exported_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "statuses": STATUSES,
+           "missing_files": missing, "tables": tables}
+    data = json.dumps(doc, indent=1, ensure_ascii=False).encode()
+    tmp = Path(str(dest) + ".part")
+    with tarfile.open(tmp, "w:gz") as tar:
+        info = tarfile.TarInfo("export.json")
+        info.size, info.mtime = len(data), int(time.time())
+        tar.addfile(info, io.BytesIO(data))
+        for a in tables["attachments"]:
+            if a["path"] not in missing:
+                tar.add(store.files / a["path"], arcname="files/" + a["path"], recursive=False)
+    os.replace(tmp, dest)
+    return {t: len(rows) for t, rows in tables.items()}
+
+
+def export_to(store, target, keep=30):
+    """--export: to a file, or into a folder as agent-tickets-<time>.tar.gz,
+    keeping the newest `keep` backups there."""
+    as_folder = str(target).endswith(("/", os.sep))  # check before Path() drops the slash
+    target = Path(target)
+    if as_folder or target.is_dir():
+        target.mkdir(parents=True, exist_ok=True)
+        dest = target / time.strftime("agent-tickets-%Y%m%d-%H%M%S.tar.gz")
+        counts = export_archive(store, dest)
+        old = sorted(target.glob("agent-tickets-*.tar.gz"))[:-keep] if keep > 0 else []
+        for p in old:
+            p.unlink()
+        return dest, counts, len(old)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    return target, export_archive(store, target), 0
+
+
+def import_archive(store, src, replace=False):
+    """Restore a backup. Ids are kept, so links, ticket names and comment
+    numbers stay the same. Refuses a data folder that already has tickets
+    unless `replace`, which deletes them first. Columns this version doesn't
+    know are skipped; ones it has that the backup lacks get their defaults."""
+    with tarfile.open(src, "r:gz") as tar:
+        doc = json.load(tar.extractfile("export.json"))
+        if doc.get("format") != EXPORT_FORMAT:
+            raise ValueError(f"{src} isn't an agent-tickets backup")
+        if doc.get("version", 0) > EXPORT_VERSION:
+            raise ValueError(f"{src} was made by a newer agent-tickets (backup version {doc['version']})")
+        with store.write_lock:
+            db = store.db()
+            have = db.execute("SELECT COUNT(*) FROM tickets").fetchone()[0]
+            if have and not replace:
+                raise ValueError(f"this data folder already has {have} tickets; restore into an empty one, or use --replace")
+            with db:
+                if replace:
+                    for t in reversed(TABLES):
+                        db.execute(f"DELETE FROM {t}")
+                for t in TABLES:
+                    cols = {r[1] for r in db.execute(f"PRAGMA table_info({t})")}
+                    for row in doc["tables"].get(t, []):
+                        keep = {k: v for k, v in row.items() if k in cols}
+                        db.execute(f"INSERT INTO {t} ({', '.join(keep)}) VALUES ({', '.join('?' * len(keep))})",
+                                   list(keep.values()))
+            # Files: only regular files under files/, never outside the data folder.
+            root = store.files.resolve()
+            restored = 0
+            for m in tar.getmembers():
+                if not m.isfile() or not m.name.startswith("files/"):
+                    continue
+                dest = (store.files / m.name[len("files/"):]).resolve()
+                if root not in dest.parents:
+                    continue
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                with tar.extractfile(m) as f, open(dest, "wb") as out:
+                    while chunk := f.read(CHUNK):
+                        out.write(chunk)
+                restored += 1
+    return {t: len(doc["tables"].get(t, [])) for t in TABLES} | {"files": restored, "missing_files": len(doc.get("missing_files", []))}
+
+
 # --------------------------------------------------------------------------- HTML
 
 CSS = """
@@ -506,7 +621,8 @@ def render_list(store, status, q):
     search = (f'<form class="row" method="get" style="margin-bottom:12px"><input type="search" name="q" value="{esc(q)}" '
               f'placeholder="Search {title.lower()}" aria-label="Search"><button>Search</button></form>')
     hint = ('<p class="meta">Ideas waiting to be cleared. "Make ready" lets agents pick one up.</p>' if status == "backlog"
-            else '<p class="meta">Work you approved.</p>')
+            else '<p class="meta">Work you approved. <a href="/api/export">Download a backup</a> of everything '
+                 '(tickets, comments, history and files).</p>')
     body = f'<h1>{title}</h1>{hint}{search}<div class="list">{"".join(rows) or "<p class=empty>Nothing here.</p>"}</div>'
     return page(title, body, "/" + status, len(store.tickets(["review"])))
 
@@ -665,6 +781,7 @@ GET   /api/tickets/ID           ticket with comments, attachments, events, check
 POST  /api/tickets              {"title", "description", "priority": 1|2|3, "checklist_path"}  (lands in backlog)
 PATCH /api/tickets/ID           any of {"status", "title", "description", "priority", "checklist_path"}
 POST  /api/tickets/ID/comments  {"body": "..."}  -> {"id": comment id, ...}
+GET   /api/export               (human key only) a backup: .tar.gz of export.json + files
 POST  /api/tickets/ID/attachments?filename=demo.mp4[&comment_id=N]
                                 raw file bytes as the body, with its Content-Type
                                 (images, audio and video play in the page)
@@ -802,6 +919,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.html(render_ticket(store, tm.group(1)))
             if method == "GET" and (fm := re.fullmatch(r"/files/(\d+)/[^/]*", path)):
                 return self.serve_file(store.attachment(int(fm.group(1))))
+            if method == "GET" and path == "/api/export":
+                if role != "human":
+                    raise ApiError(403, "only the human key can export")
+                return self.serve_export()
             if method == "GET" and path == "/api":
                 return self.send(200, API_DOCS, "text/markdown; charset=utf-8")
             if method == "GET" and path == "/api/next":
@@ -842,6 +963,27 @@ class Handler(BaseHTTPRequestHandler):
                              "text/html; charset=utf-8")
         except (BrokenPipeError, ConnectionResetError):
             pass
+
+    def serve_export(self):
+        store = self.server.store
+        fd, tmp = tempfile.mkstemp(suffix=".tar.gz", dir=store.dir)
+        os.close(fd)
+        try:
+            export_archive(store, tmp)
+            size = os.path.getsize(tmp)
+            name = time.strftime("agent-tickets-%Y%m%d-%H%M%S.tar.gz")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/gzip")
+            self.send_header("Content-Length", str(size))
+            self.send_header("Content-Disposition", f'attachment; filename="{name}"')
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            if self.command != "HEAD":
+                with open(tmp, "rb") as f:
+                    while chunk := f.read(CHUNK):
+                        self.wfile.write(chunk)
+        finally:
+            os.unlink(tmp)
 
     def serve_file(self, a):
         p = self.server.store.files / a["path"]
@@ -910,12 +1052,29 @@ def main():
     ap.add_argument("--human-name", default=os.environ.get("AT_HUMAN", "human"),
                     help="your name on comments and changes you make in the web pages")
     ap.add_argument("--keys", action="store_true", help="print the access keys and exit")
+    ap.add_argument("--export", metavar="PATH",
+                    help="back up everything to PATH (a .tar.gz), or into PATH/ as agent-tickets-<time>.tar.gz, and exit")
+    ap.add_argument("--keep", type=int, default=30, help="with --export to a folder: backups to keep (default 30)")
+    ap.add_argument("--import", dest="import_", metavar="FILE", help="restore a backup into the data folder and exit")
+    ap.add_argument("--replace", action="store_true", help="with --import: delete the tickets already there first")
     a = ap.parse_args()
+    roots = a.checklist_root or [str(Path.home())]
+    if a.export:
+        dest, counts, pruned = export_to(Store(a.data, roots), a.export, a.keep)
+        print(f"Backed up to {dest}: " + ", ".join(f"{n} {t}" for t, n in counts.items())
+              + (f" (removed {pruned} old backup{'s' if pruned != 1 else ''})" if pruned else ""))
+        return
+    if a.import_:
+        try:
+            counts = import_archive(Store(a.data, roots), a.import_, a.replace)
+        except (ValueError, OSError, KeyError, tarfile.TarError) as e:
+            sys.exit(f"Import failed: {e}")
+        print(f"Restored from {a.import_}: " + ", ".join(f"{n} {t}" for t, n in counts.items()))
+        return
     if a.keys:
         k = load_keys(a.data)
         print(f"human (web pages, full control): {k['human']}\nagent (API):                    {k['agent']}")
         return
-    roots = a.checklist_root or [str(Path.home())]
     srv = make_server(a.host, a.port, a.data, roots, a.max_upload_mb, a.human_name)
     print(f"agent-tickets on http://{a.host}:{a.port}  data: {Path(a.data).resolve()}  checklists under: {', '.join(roots)}",
           flush=True)

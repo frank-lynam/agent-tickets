@@ -1,0 +1,7 @@
+[Unit]
+Description=agent-tickets: nightly backup (export to ~/backups/agent-tickets, keep 30)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/workspace/agent-tickets/agent_tickets.py --export %h/backups/agent-tickets/ --keep 30
+WorkingDirectory=%h/workspace/agent-tickets

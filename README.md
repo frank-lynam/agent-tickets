@@ -46,6 +46,31 @@ ln -s "$PWD/agent-tickets.service" ~/.config/systemd/user/
 systemctl --user daemon-reload && systemctl --user enable --now agent-tickets
 ```
 
+## Backups
+
+A backup is one `.tar.gz`: `export.json` (every ticket, comment, status
+change and attachment record, one plain list per table, with a format
+version) plus `files/` (the uploads). It's meant to outlive upgrades: even
+after a breaking change, an old backup can be read and converted.
+
+```bash
+python3 agent_tickets.py --export backups/            # into a folder, as agent-tickets-<time>.tar.gz (keeps 30)
+python3 agent_tickets.py --export ticket-backup.tar.gz
+python3 agent_tickets.py --data fresh-data --import ticket-backup.tar.gz   # restore (ids kept)
+python3 agent_tickets.py --import FILE --replace      # restore over existing tickets
+```
+
+From the pages: **Done → Download a backup** (`GET /api/export`, human key
+only). A nightly backup runs from a systemd user timer:
+
+```bash
+ln -s "$PWD"/agent-tickets-backup.{service,timer} ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now agent-tickets-backup.timer
+```
+
+That writes to `~/backups/agent-tickets/` at 03:30, keeping the last 30.
+They're on the same disk as the data, so copy them somewhere else too.
+
 ## Pages
 
 - **Dashboard**: what's in flight: needs your review, in progress, ready.
