@@ -16,8 +16,8 @@ read `GET /api` on the running server instead.
   agents. Checklist files are read only from the allowed roots. Only
   humans manage users or export; the last active human can't be disabled.
   Tokens are stored only as hashes and never appear in logs or backups.
-- **Data** lives in `data/` (gitignored): `tickets.db`, `files/`,
-  `keys.json`. Schema changes must keep existing databases working:
+- **Data** lives in `data/` (gitignored): `tickets.db` (tickets and
+  users) and `files/`. Schema changes must keep existing databases working:
   `CREATE TABLE IF NOT EXISTS` plus additive `ALTER TABLE`s, never a
   rebuild.
 - **Backups must stay restorable.** Before a change that alters the

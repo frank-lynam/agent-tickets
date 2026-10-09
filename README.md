@@ -59,7 +59,7 @@ Then open `http://127.0.0.1:43917/?key=<your token>`.
 |---|---|---|
 | `--host` / `AT_HOST` | `127.0.0.1` | `0.0.0.0` to reach it from the LAN |
 | `--port` / `AT_PORT` | `43917` | |
-| `--data` / `AT_DATA` | `./data` | database, uploaded files, `keys.json` |
+| `--data` / `AT_DATA` | `./data` | the database (tickets, users) and uploaded files |
 | `--checklist-root` | your home folder | folders checklist files may be read from (repeatable) |
 | `--max-upload-mb` | `1024` | per file |
 | `--human-name` / `AT_HUMAN` | `human` | only when upgrading from the old two-key setup: the username the human key becomes |
