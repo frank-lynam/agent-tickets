@@ -1,0 +1,27 @@
+# Working on agent-tickets
+
+This file is for agents changing this repo. Agents *using* the tracker
+read `GET /api` on the running server instead.
+
+- **Standard library only.** No pip installs, no frameworks, no build
+  step, no CDN assets in the pages. It's one file, `agent_tickets.py`;
+  keep it that way unless it truly outgrows it.
+- **Tests:** `python3 -m unittest -v`. They start a real server on a
+  temporary folder. Add a test for every behaviour you change, and run
+  them before committing.
+- **The rules that matter** (tests cover them; don't loosen them without
+  the owner asking): agents can't set backlog or done, can't change
+  backlog or done tickets except by commenting, and file new tickets in
+  the backlog only. `/api/next?claim=1` must never give one ticket to two
+  agents. Checklist files are read only from the allowed roots. Keys
+  never appear in logs.
+- **Data** lives in `data/` (gitignored): `tickets.db`, `files/`,
+  `keys.json`. Schema changes must keep existing databases working:
+  `CREATE TABLE IF NOT EXISTS` plus additive `ALTER TABLE`s, never a
+  rebuild.
+- **Pages** are server-rendered HTML with a little inline JavaScript.
+  Escape everything user- or agent-written (`esc()`), and check new
+  pages at phone width.
+- The running instance on the owner's machine is the user service
+  `agent-tickets` (`systemctl --user restart agent-tickets` after a
+  change). Commit and push to GitHub when done.
