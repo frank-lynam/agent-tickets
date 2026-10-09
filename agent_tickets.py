@@ -634,7 +634,8 @@ class Store:
             raise ApiError(413, f"file is larger than the {max_bytes // (1 << 20)} MB limit")
         name = re.sub(r"[^\w.\- ]+", "_", Path(filename or "upload").name).strip() or "upload"
         mime = (mime or "").split(";")[0].strip()
-        if not mime or mime == "application/octet-stream":
+        # curl --data-binary (and urllib) send form-urlencoded when no type is given.
+        if mime in ("", "application/octet-stream", "application/x-www-form-urlencoded"):
             mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
         folder = self.files / t["id"]
         folder.mkdir(exist_ok=True)
@@ -849,6 +850,10 @@ form.stack{display:grid;gap:8px}
 .att{margin-top:8px}
 .att img,.att video{max-width:100%;max-height:420px;border-radius:8px;display:block}
 .att audio{width:100%}
+.att.file{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:8px 10px}
+.att .dl{font-weight:600;word-break:break-all}
+.att details{margin-top:6px}.att summary{cursor:pointer;color:var(--dim);font-size:13px}
+.pv{margin:6px 0 0;max-height:360px;overflow:auto;font-size:12px;line-height:1.45;background:var(--bg);padding:8px;border-radius:6px;white-space:pre}
 .ck{list-style:none;padding:0;margin:8px 0 0}
 .ck li{padding:2px 0}.ck li.note{color:var(--dim);font-size:13px}
 .ck .x{color:var(--ready)}
@@ -1158,9 +1163,43 @@ $('saveper').onclick = async () => {{
     return page("Guidance", body, "/guidance", len(store.tickets(["review"])))
 
 
-def render_attachment(a):
+TEXT_EXT = {".md", ".txt", ".log", ".py", ".sh", ".bash", ".js", ".mjs", ".ts", ".json", ".yaml", ".yml", ".toml",
+            ".ini", ".cfg", ".conf", ".csv", ".tsv", ".diff", ".patch", ".sql", ".xml", ".html", ".css", ".rs", ".go",
+            ".c", ".h", ".cpp", ".java", ".kt", ".rb", ".lua", ".ps1", ".bat", ".env.example", ".service", ".gradle"}
+TEXT_MIME = {"application/json", "application/javascript", "application/xml", "application/x-sh", "application/toml",
+             "application/x-yaml", "application/yaml", "application/sql"}
+PREVIEW_BYTES = 256 * 1024
+PREVIEW_LINES = 400
+
+
+def text_preview(store, a):
+    """The first lines of a small text file (script, markdown, log), or None."""
+    ext = Path(a["filename"]).suffix.lower()
+    if not (a["mime"].startswith("text/") or a["mime"] in TEXT_MIME or ext in TEXT_EXT) or a["size"] > PREVIEW_BYTES:
+        return None
+    try:
+        raw = (store.files / store.attachment(a["id"])["path"]).read_bytes()[:PREVIEW_BYTES]
+        if b"\0" in raw:
+            return None
+        text = raw.decode("utf-8")
+    except (OSError, UnicodeDecodeError, ApiError):
+        return None
+    lines = text.splitlines()
+    more = f"\n… {len(lines) - PREVIEW_LINES} more lines in the download" if len(lines) > PREVIEW_LINES else ""
+    return "\n".join(lines[:PREVIEW_LINES]) + more
+
+
+def render_attachment(a, store=None):
     name = esc(a["filename"])
     link = f'<a href="{a["url"]}" target="_blank">{name}</a> <span class="meta">{size_text(a["size"])}</span>'
+    media_type = a["mime"].split("/")[0]
+    if media_type not in ("image", "video", "audio"):
+        # Anything else (tarballs, scripts, docs) is a download; small text files get a preview.
+        preview = text_preview(store, a) if store else None
+        body = (f'<details><summary>Preview</summary><pre class="pv">{esc(preview)}</pre></details>'
+                if preview is not None else "")
+        return (f'<div class="att file"><a class="dl" href="{a["url"]}" download="{name}">⬇ {name}</a> '
+                f'<span class="meta">{size_text(a["size"])}</span>{body}</div>')
     if a["mime"].startswith("image/"):
         media = f'<a href="{a["url"]}" target="_blank"><img src="{a["url"]}" alt="{name}" loading="lazy"></a>'
     elif a["mime"].startswith("video/"):
@@ -1180,7 +1219,7 @@ def render_ticket(store, tid):
         (by_comment.setdefault(a["comment_id"], []) if a["comment_id"] else loose).append(a)
     items = []
     for c in t["comments"]:
-        files = "".join(render_attachment(a) for a in by_comment.get(c["id"], []))
+        files = "".join(render_attachment(a, store) for a in by_comment.get(c["id"], []))
         role = "agent" if c["role"] == "agent" else ""
         items.append((c["created_at"], f'<div class="c {role}"><span class="who {role}">{esc(c["author"])}</span> '
                                        f'<span class="meta" title="{when(c["created_at"])}">{ago(c["created_at"])}</span>'
@@ -1188,7 +1227,7 @@ def render_ticket(store, tid):
     for a in loose:
         items.append((a["created_at"], f'<div class="c {"agent" if a["role"] == "agent" else ""}"><span class="who">'
                                        f'{esc(a["author"])}</span> <span class="meta">attached a file · {ago(a["created_at"])}</span>'
-                                       f'{render_attachment(a)}</div>'))
+                                       f'{render_attachment(a, store)}</div>'))
     for e in t["events"]:
         if e["field"] == "created":
             text = f'{esc(e["actor"])} created it in {LABELS.get(e["new"], e["new"])}'
@@ -1463,9 +1502,17 @@ Ticket ids are four or five letters, like `KAMI`, in any case.
                                      the file's raw bytes as the body, with its Content-Type;
                                      comment_id (optional) attaches it to that comment
 
-Priorities: 1 high, 2 normal, 3 low. Images, audio and video play inline
-on the ticket page; other files are offered as downloads. Uploads up to the
-server's limit (1 GB by default).
+Priorities: 1 high, 2 normal, 3 low.
+
+**Files**: attach anything: screenshots, recordings, audio, but also
+tarballs of build output, scripts, patches, markdown write-ups, logs. Send
+the raw bytes with a sensible `filename` (the extension sets the type when
+you don't send a Content-Type). Images, audio and video play on the ticket
+page; everything else is a download, and small text files (scripts,
+markdown, logs) also get a preview there. Download any attachment with
+`GET` on its `url` (same token). Files are kept on the server with the
+ticket and included in backups. Uploads up to the server's limit (1 GB by
+default). Prefer one tarball over dozens of loose files.
 
 A ticket looks like:
 
@@ -1492,6 +1539,9 @@ for you, 404 no such ticket, 409 conflict, 413 too large.
          -d '{"body": "Done. Login form validates; screenshot attached."}' "$URL/api/tickets/KAMI/comments"
     curl -s -H "Authorization: Bearer $TOKEN" -H "Content-Type: image/png" \\
          --data-binary @login.png "$URL/api/tickets/KAMI/attachments?filename=login.png&comment_id=12"
+    tar czf build.tar.gz dist/ && curl -s -H "Authorization: Bearer $TOKEN" \\
+         --data-binary @build.tar.gz "$URL/api/tickets/KAMI/attachments?filename=build.tar.gz"
+    curl -s -H "Authorization: Bearer $TOKEN" -o build.tar.gz "$URL/files/7/build.tar.gz"
     curl -s -X PATCH -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \\
          -d '{"status": "review"}' "$URL/api/tickets/KAMI"
 
@@ -1818,6 +1868,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Cache-Control", "private, max-age=86400")
         self.send_header("X-Content-Type-Options", "nosniff")
+        # Uploaded files are untrusted: an SVG or HTML file opened in a tab
+        # mustn't run scripts as the signed-in human.
+        self.send_header("Content-Security-Policy", "sandbox; default-src 'none'; img-src 'self' data:; "
+                                                    "media-src 'self'; style-src 'unsafe-inline'")
         inline = a["mime"].split("/")[0] in ("image", "audio", "video")
         self.send_header("Content-Disposition", f"{'inline' if inline else 'attachment'}; filename*=UTF-8''{quote(a['filename'])}")
         if code == 206:

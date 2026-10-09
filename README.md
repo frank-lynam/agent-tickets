@@ -150,7 +150,9 @@ They're on the same disk as the data, so copy them somewhere else too.
   "Make ready" to clear one for agents.
 - **Done**: approved (or declined) work, newest first, searchable.
 - **Ticket**: description, the full history (comments, status changes,
-  images, video and audio inline), the agent's checklist file with
+  images, video and audio inline; any other file, like a tarball, script
+  or markdown write-up, as a download, with a preview for small text
+  files), the agent's checklist file with
   progress, its epic, what must be done first and what it unblocks, and
   buttons to approve, send back, or move it anywhere. An epic's page lists
   its tickets.

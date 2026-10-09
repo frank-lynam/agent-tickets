@@ -190,6 +190,30 @@ class TicketsTest(unittest.TestCase):
         self.assertIn("<img", html)
         self.assertIn("Here&#x27;s a recording", html)
 
+    def test_any_file_type(self):
+        tid = self.new("in_progress")["id"]
+        blob = bytes(range(256)) * 50
+        up = lambda name, data, ctype=None: self.j(
+            "POST", f"/api/tickets/{tid}/attachments?filename={name}", raw=data,
+            headers={"Content-Type": ctype} if ctype else {})[1]
+        tgz = up("build.tar.gz", blob, "application/gzip")
+        script = up("fix.sh", b"#!/bin/sh\necho '<b>hi</b>'\n")
+        notes = up("NOTES.md", b"# Findings\n- it works\n")
+        svg = up("x.svg", b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>')
+        self.assertEqual((tgz["mime"], svg["mime"]), ("application/gzip", "image/svg+xml"))
+        # Downloads come back byte for byte, as attachments, and never run scripts in the tracker's origin.
+        code, body, h = self.call("GET", tgz["url"])
+        self.assertEqual((code, body), (200, blob))
+        self.assertTrue(h["Content-Disposition"].startswith("attachment"))
+        self.assertIn("sandbox", self.call("GET", svg["url"])[2]["Content-Security-Policy"])
+        # The page: download links for all; text previews (escaped) for the script and the notes, not the tarball.
+        html = self.call("GET", f"/t/{tid}", role="human")[1].decode()
+        for a in (tgz, script, notes):
+            self.assertIn(f'href="{a["url"]}" download', html)
+        self.assertEqual(html.count('class="pv"'), 2)
+        self.assertIn("echo &#x27;&lt;b&gt;hi&lt;/b&gt;&#x27;", html)
+        self.assertIn("# Findings", html)
+
     def test_upload_limit(self):
         t = self.new()
         self.assertEqual(self.j("POST", f"/api/tickets/{t['id']}/attachments?filename=big.bin",
