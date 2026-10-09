@@ -12,13 +12,37 @@ No dependencies to install.
 
 | Status | Meaning | Who moves it there |
 |---|---|---|
-| Backlog | An idea, not cleared for work | You; agents can file new tickets here |
+| Backlog | An idea, not cleared for work | You; agents propose new tickets here |
 | Ready | Cleared: agents may pick it up | You (from the backlog), or an agent releasing it |
 | In progress | An agent is on it; partial work counts | An agent |
 | Needs review | Done, or stopped at a decision; the agent's comment says which | An agent |
 | Done | Approved | You only |
 
 Agents can't set Backlog or Done, and can only comment on tickets in them.
+
+## Proposals, epics and dependencies
+
+- **Proposals.** Tickets an agent creates are proposals: they wait at the
+  top of the Backlog page until you **Accept** (into the backlog),
+  **Accept & make ready**, or **Decline** them (to Done, marked Declined).
+  Moving a proposal out of the backlog yourself also accepts it.
+- **Epics** group the tickets of one plan. An epic is a ticket of kind
+  `epic`; tickets belong to at most one epic, and epics don't nest. The
+  epic's page lists its tickets with progress; open epics are on the
+  dashboard. Epics aren't worked: agents never get one from
+  `/api/next` and can only comment on them. Close an epic when its plan is
+  finished. Accepting or declining a proposed epic does the same to its
+  proposed tickets, so an agent's whole plan is one decision.
+- **Dependencies** ("must be done first") are enforced, for everyone: a
+  ticket whose predecessors aren't done can't move to In progress, Needs
+  review or Done, and `/api/next` skips it. Comments are always allowed. A
+  declined predecessor counts as done. Loops are refused. To override,
+  remove the dependency on the ticket page.
+
+The design-review flow: talk a plan through with an agent, then ask it to
+"propose this as an epic with tickets". It creates the epic, then each
+ticket with `epic_id` and `depends_on`; you review the lot on the Backlog
+page.
 
 ## Assignment
 
@@ -120,12 +144,16 @@ They're on the same disk as the data, so copy them somewhere else too.
 
 ## Pages
 
-- **Dashboard**: what's in flight: needs your review, in progress, ready.
-- **Backlog**: ideas, with "Make ready" to clear one for agents.
-- **Done**: approved work, newest first, searchable.
+- **Dashboard**: what's in flight: needs your review, in progress, ready
+  (blocked tickets marked), then open epics with progress.
+- **Backlog**: agents' proposals to accept or decline, then ideas, with
+  "Make ready" to clear one for agents.
+- **Done**: approved (or declined) work, newest first, searchable.
 - **Ticket**: description, the full history (comments, status changes,
   images, video and audio inline), the agent's checklist file with
-  progress, and buttons to approve, send back, or move it anywhere.
+  progress, its epic, what must be done first and what it unblocks, and
+  buttons to approve, send back, or move it anywhere. An epic's page lists
+  its tickets.
 - **New ticket**.
 
 ## For agents

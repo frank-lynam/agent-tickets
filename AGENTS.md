@@ -12,7 +12,11 @@ read `GET /api` on the running server instead.
 - **The rules that matter** (tests cover them; don't loosen them without
   the owner asking): agents can't set backlog or done, can't change
   backlog or done tickets except by commenting, and file new tickets in
-  the backlog only. `/api/next?claim=1` must never give one ticket to two
+  the backlog only, as proposals only a human accepts or declines. Epics
+  are only commented on by agents and never claimed. A ticket with
+  unfinished predecessors can't move to in_progress, review or done, for
+  anyone, and is never claimed; comments are always allowed; dependency
+  loops are refused. `/api/next?claim=1` must never give one ticket to two
   agents. Checklist files are read only from the allowed roots. Only
   humans manage users or export; the last active human can't be disabled.
   Tokens are stored only as hashes and never appear in logs or backups.

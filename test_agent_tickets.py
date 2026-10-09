@@ -423,6 +423,115 @@ class TicketsTest(unittest.TestCase):
         self.j("PUT", "/api/guidance", {"guidance": None}, role="human")
         self.assertIn("How we work", self.j("GET", "/api/guidance")[1]["guidance"])
 
+    # --- proposals, epics, dependencies
+    def test_proposals(self):
+        tok = self.j("POST", "/api/users", {"username": "agent-p", "kind": "agent"}, role="human")[1]["token"]
+        code, p = self.j("POST", "/api/tickets", {"title": "Idea"}, role=None, token=tok)
+        self.assertEqual((code, p["status"], p["proposed"]), (201, "backlog", 1))
+        self.assertEqual(self.new("backlog")["proposed"], 0)  # humans' tickets aren't proposals
+        self.assertIn(p["id"], {t["id"] for t in self.j("GET", "/api/tickets?proposed=1", role="human")[1]["tickets"]})
+        self.assertIn("Proposed by agents", self.call("GET", "/backlog", role="human")[1].decode())
+        # Only humans decide.
+        self.assertEqual(self.j("POST", f"/api/tickets/{p['id']}/accept", {}, role=None, token=tok)[0], 403)
+        a = self.j("POST", f"/api/tickets/{p['id']}/accept", {"ready": True}, role="human")[1]
+        self.assertEqual((a["status"], a["proposed"]), ("ready", 0))
+        self.assertEqual(self.j("POST", f"/api/tickets/{p['id']}/accept", {}, role="human")[0], 409)  # not a proposal now
+        # Declined: done, marked declined.
+        q = self.j("POST", "/api/tickets", {"title": "Bad idea"}, role=None, token=tok)[1]
+        d = self.j("POST", f"/api/tickets/{q['id']}/decline", {}, role="human")[1]
+        self.assertEqual((d["status"], d["declined"], d["proposed"]), ("done", 1, 0))
+        self.assertIn("Declined", self.call("GET", "/done", role="human")[1].decode())
+        # Over one kept-alive connection, as a browser does: the body must be read.
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", self.srv.server_address[1])
+        hdr = {"Authorization": "Bearer " + self.keys["human"], "Content-Type": "application/json"}
+        q2 = self.j("POST", "/api/tickets", {"title": "Worse idea"}, role=None, token=tok)[1]
+        conn.request("POST", f"/api/tickets/{q2['id']}/decline", body=b"{}", headers=hdr)
+        self.assertEqual(conn.getresponse().read() and 200, 200)
+        conn.request("GET", "/api/me", headers=hdr)
+        self.assertEqual(conn.getresponse().status, 200)
+        conn.close()
+        # A human promoting a proposal by hand accepts it too.
+        r = self.j("POST", "/api/tickets", {"title": "Another"}, role=None, token=tok)[1]
+        self.assertEqual(self.j("PATCH", f"/api/tickets/{r['id']}", {"status": "ready"}, role="human")[1]["proposed"], 0)
+
+    def test_epics(self):
+        tok = self.j("POST", "/api/users", {"username": "agent-e", "kind": "agent"}, role="human")[1]["token"]
+        # An agent proposes a plan: the epic, then its stories in order.
+        e = self.j("POST", "/api/tickets", {"title": "New login", "kind": "epic"}, role=None, token=tok)[1]
+        s1 = self.j("POST", "/api/tickets", {"title": "Schema", "epic_id": e["id"].lower()}, role=None, token=tok)[1]
+        s2 = self.j("POST", "/api/tickets", {"title": "Form", "epic_id": e["id"], "depends_on": [s1["id"]]},
+                    role=None, token=tok)[1]
+        self.assertEqual((s1["epic_id"], s2["blocked_by"]), (e["id"], [s1["id"]]))
+        self.assertEqual(self.j("POST", "/api/tickets", {"title": "x", "epic_id": s1["id"]}, role="human")[0], 400)
+        self.assertEqual(self.j("POST", "/api/tickets", {"title": "x", "kind": "epic", "epic_id": e["id"]},
+                                role="human")[0], 400)  # no nesting
+        self.assertEqual(self.j("POST", "/api/tickets", {"title": "x", "kind": "saga"}, role="human")[0], 400)
+        # Accepting the epic accepts its proposed tickets; "ready" makes the tickets ready, not the epic.
+        self.j("POST", f"/api/tickets/{e['id']}/accept", {"ready": True}, role="human")
+        got = self.j("GET", f"/api/tickets/{e['id']}", role="human")[1]
+        self.assertEqual((got["status"], got["proposed"]), ("backlog", 0))
+        self.assertEqual({t["id"]: (t["status"], t["proposed"]) for t in got["tickets"]},
+                         {s1["id"]: ("ready", 0), s2["id"]: ("ready", 0)})
+        self.assertEqual(got["progress"]["total"], 2)
+        # Epics aren't worked: agents only comment on them, and claims never return one.
+        self.j("PATCH", f"/api/tickets/{e['id']}", {"status": "ready", "assignee": "agent-e"}, role="human")
+        self.assertEqual(self.j("PATCH", f"/api/tickets/{e['id']}", {"status": "in_progress"}, role=None, token=tok)[0], 403)
+        self.assertEqual(self.j("POST", f"/api/tickets/{e['id']}/comments", {"body": "plan ok"}, role=None, token=tok)[0], 201)
+        self.j("PATCH", f"/api/tickets/{s1['id']}", {"assignee": "agent-e"}, role="human")
+        n = self.j("GET", "/api/next?claim=1", role=None, token=tok)[1]["ticket"]
+        self.assertEqual(n["id"], s1["id"])
+        # Declining an epic declines its proposed tickets.
+        e2 = self.j("POST", "/api/tickets", {"title": "Plan B", "kind": "epic"}, role=None, token=tok)[1]
+        c = self.j("POST", "/api/tickets", {"title": "B1", "epic_id": e2["id"]}, role=None, token=tok)[1]
+        self.j("POST", f"/api/tickets/{e2['id']}/decline", {}, role="human")
+        self.assertEqual(self.j("GET", f"/api/tickets/{c['id']}", role="human")[1]["declined"], 1)
+        # Pages.
+        self.assertIn("Schema", self.call("GET", f"/t/{e['id']}", role="human")[1].decode())
+        self.assertIn("New login", self.call("GET", "/", role="human")[1].decode())
+        self.assertIn(f'value="{e["id"]}" selected', self.call("GET", f"/new?epic={e['id']}", role="human")[1].decode())
+
+    def test_dependencies_block(self):
+        tok = self.j("POST", "/api/users", {"username": "agent-d", "kind": "agent"}, role="human")[1]["token"]
+        first = self.new("ready", title="first", assignee="agent-d", priority=3)
+        then = self.new("ready", title="then", assignee="agent-d", priority=1, depends_on=first["id"])
+        self.assertEqual(then["blocked_by"], [first["id"]])
+        # Blocked for everyone, humans included; comments still fine.
+        for role, tk in (("human", None), (None, tok)):
+            code, err = self.j("PATCH", f"/api/tickets/{then['id']}", {"status": "in_progress"}, role=role, token=tk)
+            self.assertEqual(code, 409)
+            self.assertIn(first["id"], err["error"])
+        self.assertEqual(self.j("POST", f"/api/tickets/{then['id']}/comments", {"body": "idea"}, role=None, token=tok)[0], 201)
+        # /api/next skips it despite its higher priority.
+        self.assertEqual(self.j("GET", "/api/next?claim=1", role=None, token=tok)[1]["ticket"]["id"], first["id"])
+        self.assertNotEqual((self.j("GET", "/api/next", role=None, token=tok)[1]["ticket"] or {}).get("id"), then["id"])
+        self.assertIn("Blocked", self.call("GET", f"/t/{then['id']}", role="human")[1].decode())
+        # Loops are refused; so are dependencies on epics.
+        self.assertEqual(self.j("POST", f"/api/tickets/{first['id']}/deps", {"depends_on": then["id"]}, role="human")[0], 409)
+        self.assertEqual(self.j("POST", f"/api/tickets/{first['id']}/deps", {"depends_on": first["id"]}, role="human")[0], 409)
+        third = self.new("backlog", title="third")
+        self.j("POST", f"/api/tickets/{third['id']}/deps", {"depends_on": then["id"]}, role="human")
+        self.assertEqual(self.j("POST", f"/api/tickets/{first['id']}/deps", {"depends_on": third["id"]}, role="human")[0], 409)
+        epic = self.new("backlog", title="ep", kind="epic")
+        self.assertEqual(self.j("POST", f"/api/tickets/{third['id']}/deps", {"depends_on": epic["id"]}, role="human")[0], 400)
+        # Done predecessor: unblocked, and claimable.
+        self.j("PATCH", f"/api/tickets/{first['id']}", {"status": "review"}, role=None, token=tok)
+        self.j("PATCH", f"/api/tickets/{first['id']}", {"status": "done"}, role="human")
+        self.assertEqual(self.j("GET", "/api/next?claim=1", role=None, token=tok)[1]["ticket"]["id"], then["id"])
+        got = self.j("GET", f"/api/tickets/{first['id']}", role="human")[1]
+        self.assertEqual([u["id"] for u in got["unblocks"]], [then["id"]])
+        # Removing a dependency unblocks too (the human's override).
+        self.assertEqual(self.j("GET", f"/api/tickets/{third['id']}", role="human")[1]["blocked_by"], [then["id"]])
+        d = self.j("DELETE", f"/api/tickets/{third['id']}/deps/{then['id'].lower()}", role="human")[1]
+        self.assertEqual((d["blocked_by"], d["depends_on"]), ([], []))
+        # Dependencies survive a backup and restore.
+        self.j("POST", f"/api/tickets/{third['id']}/deps", {"depends_on": first["id"]}, role="human")
+        with tempfile.TemporaryDirectory() as tmp:
+            at.export_archive(self.srv.store, Path(tmp) / "b.tar.gz")
+            other = at.Store(Path(tmp) / "data", [tmp])
+            at.import_archive(other, Path(tmp) / "b.tar.gz")
+            self.assertEqual([x["id"] for x in other.detail(third["id"])["depends_on"]], [first["id"]])
+
     def test_old_database_upgrades(self):
         with tempfile.TemporaryDirectory() as tmp:
             data = Path(tmp) / "data"

@@ -90,6 +90,9 @@ CREATE TABLE IF NOT EXISTS users (
   kind TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, created_by TEXT, created_at REAL NOT NULL,
   disabled INTEGER NOT NULL DEFAULT 0, last_seen REAL);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS deps (
+  ticket_id TEXT NOT NULL REFERENCES tickets(id), depends_on TEXT NOT NULL REFERENCES tickets(id),
+  PRIMARY KEY (ticket_id, depends_on));
 CREATE INDEX IF NOT EXISTS tickets_status ON tickets(status, priority, created_at);
 CREATE INDEX IF NOT EXISTS comments_ticket ON comments(ticket_id, created_at);
 CREATE INDEX IF NOT EXISTS attachments_ticket ON attachments(ticket_id);
@@ -98,8 +101,8 @@ CREATE INDEX IF NOT EXISTS events_ticket ON events(ticket_id, at);
 
 
 # Bumped (with a migration in Store.__init__) whenever the tables change.
-SCHEMA_VERSION = 3
-TABLES = ("users", "settings", "tickets", "comments", "attachments", "events")
+SCHEMA_VERSION = 4
+TABLES = ("users", "settings", "tickets", "deps", "comments", "attachments", "events")
 KINDS = ("human", "agent")
 USERNAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,31}")
 
@@ -148,12 +151,17 @@ class Store:
         self.write_lock = threading.Lock()
         db = self.db()
         db.executescript(SCHEMA)
-        # 1 -> 2 added the users table, 2 -> 3 the settings table (both
-        # created above), tickets.assignee and users.guidance (added here).
-        for table, col, decl in (("tickets", "assignee", "TEXT"), ("users", "guidance", "TEXT")):
+        # 1 -> 2 added the users table, 2 -> 3 the settings table, 3 -> 4 the
+        # deps table (all created above); the columns are added here.
+        for table, col, decl in (("tickets", "assignee", "TEXT"), ("users", "guidance", "TEXT"),
+                                 ("tickets", "kind", "TEXT NOT NULL DEFAULT 'task'"), ("tickets", "epic_id", "TEXT"),
+                                 ("tickets", "proposed", "INTEGER NOT NULL DEFAULT 0"),
+                                 ("tickets", "declined", "INTEGER NOT NULL DEFAULT 0")):
             if col not in {r[1] for r in db.execute(f"PRAGMA table_info({table})")}:
                 db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
         db.execute("CREATE INDEX IF NOT EXISTS tickets_assignee ON tickets(assignee, status)")
+        db.execute("CREATE INDEX IF NOT EXISTS tickets_epic ON tickets(epic_id)")
+        db.execute("CREATE INDEX IF NOT EXISTS deps_on ON deps(depends_on)")
         if db.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
             db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
@@ -261,7 +269,8 @@ class Store:
             raise ApiError(404, f"no ticket {tid}")
         return dict(row)
 
-    def tickets(self, statuses=None, q=None, limit=500, recent_first=False, assignee=None):
+    def tickets(self, statuses=None, q=None, limit=500, recent_first=False, assignee=None, kind=None, epic=None,
+                proposed=None):
         sql, args = "SELECT t.*, (SELECT COUNT(*) FROM comments c WHERE c.ticket_id = t.id) AS comment_count, " \
                     "(SELECT COUNT(*) FROM attachments a WHERE a.ticket_id = t.id) AS attachment_count FROM tickets t", []
         where = []
@@ -271,6 +280,15 @@ class Store:
         if q:
             where.append("(t.id LIKE ? OR t.title LIKE ? OR t.description LIKE ?)")
             args += [f"%{q}%"] * 3
+        if kind:
+            where.append("t.kind = ?")
+            args.append(kind)
+        if epic:
+            where.append("t.epic_id = ?")
+            args.append(epic.upper())
+        if proposed is not None:
+            where.append("t.proposed = ?")
+            args.append(1 if proposed else 0)
         if assignee == "":
             where.append("t.assignee IS NULL")
         elif assignee:
@@ -285,7 +303,29 @@ class Store:
             last = self.db().execute("SELECT author, role, body, created_at FROM comments WHERE ticket_id = ? "
                                      "ORDER BY created_at DESC, id DESC LIMIT 1", (t["id"],)).fetchone()
             t["last_comment"] = dict(last) if last else None
+            self._links(t)
         return out
+
+    def blockers(self, tid):
+        """Ids of the tickets that must be done first and aren't yet."""
+        return [r["id"] for r in self.db().execute(
+            "SELECT p.id FROM deps d JOIN tickets p ON p.id = d.depends_on "
+            "WHERE d.ticket_id = ? AND p.status != 'done' ORDER BY p.id", (tid,))]
+
+    def _links(self, t):
+        """Add what a list needs to show: blockers, the epic's title, an epic's progress."""
+        t["blocked_by"] = self.blockers(t["id"])
+        if t.get("epic_id"):
+            row = self.db().execute("SELECT title FROM tickets WHERE id = ?", (t["epic_id"],)).fetchone()
+            t["epic_title"] = row["title"] if row else None
+        if t.get("kind") == "epic":
+            t["progress"] = self.epic_progress(t["id"])
+        return t
+
+    def epic_progress(self, eid):
+        counts = {r[0]: r[1] for r in self.db().execute(
+            "SELECT status, COUNT(*) FROM tickets WHERE epic_id = ? AND declined = 0 GROUP BY status", (eid,))}
+        return {"total": sum(counts.values()), "done": counts.get("done", 0), "by_status": counts}
 
     def detail(self, tid):
         t = self.ticket(tid)
@@ -297,6 +337,15 @@ class Store:
         t["events"] = [dict(r) for r in db.execute(
             "SELECT * FROM events WHERE ticket_id = ? ORDER BY at, id", (t["id"],))]
         t["checklist"] = self.checklist(t["checklist_path"])
+        t["depends_on"] = [dict(r) for r in db.execute(
+            "SELECT p.id, p.title, p.status, p.declined FROM deps d JOIN tickets p ON p.id = d.depends_on "
+            "WHERE d.ticket_id = ? ORDER BY p.id", (t["id"],))]
+        t["unblocks"] = [dict(r) for r in db.execute(
+            "SELECT n.id, n.title, n.status FROM deps d JOIN tickets n ON n.id = d.ticket_id "
+            "WHERE d.depends_on = ? ORDER BY n.id", (t["id"],))]
+        if t["kind"] == "epic":
+            t["tickets"] = self.tickets(epic=t["id"], limit=1000)
+        self._links(t)
         return t
 
     def attachment_json(self, a):
@@ -353,15 +402,57 @@ class Store:
             return None
         return self.user(str(name))["username"]
 
+    def _check_epic(self, eid):
+        """An epic's id, or None."""
+        if eid in (None, ""):
+            return None
+        e = self.ticket(str(eid))
+        if e["kind"] != "epic":
+            raise ApiError(400, f"{e['id']} isn't an epic")
+        return e["id"]
+
+    def _would_cycle(self, db, tid, dep):
+        """Would "tid depends on dep" make a loop (dep already waits on tid)?"""
+        seen, todo = set(), [dep]
+        while todo:
+            cur = todo.pop()
+            if cur == tid:
+                return True
+            if cur in seen:
+                continue
+            seen.add(cur)
+            todo += [r[0] for r in db.execute("SELECT depends_on FROM deps WHERE ticket_id = ?", (cur,))]
+        return False
+
+    def _check_agent_may_change(self, t, actor):
+        if t["kind"] == "epic":
+            raise ApiError(403, f"{t['id']} is an epic: agents can only comment on it")
+        if t["status"] in AGENT_LOCKED:
+            raise ApiError(403, f"ticket {t['id']} is {t['status']}: agents can only comment on it")
+        if t["assignee"] and t["assignee"].lower() != actor.lower():
+            raise ApiError(403, f"ticket {t['id']} is assigned to {t['assignee']}: you can only comment on it")
+
     def create(self, data, actor, role):
         title = str(data.get("title") or "").strip()
         if not title:
             raise ApiError(400, "a ticket needs a title")
+        kind = data.get("kind") or "task"
+        if kind not in ("task", "epic"):
+            raise ApiError(400, 'kind is "task" or "epic"')
+        epic_id = self._check_epic(data.get("epic_id"))
+        if kind == "epic" and epic_id:
+            raise ApiError(400, "epics can't belong to another epic")
+        deps = data.get("depends_on") or []
+        if isinstance(deps, str):
+            deps = [d for d in re.split(r"[\s,]+", deps) if d]
+        deps = [self.ticket(d)["id"] for d in deps]
+        if kind == "epic" and deps:
+            raise ApiError(400, "epics don't have predecessors; put them on the epic's tickets")
         status = data.get("status") or "backlog"
         if status not in STATUSES:
             raise ApiError(400, f"status must be one of {STATUSES}")
         if role == "agent" and status != "backlog":
-            raise ApiError(403, "agents file new tickets in the backlog; the human promotes them")
+            raise ApiError(403, "agents propose new tickets (they land in the backlog); a human accepts them")
         priority = int(data.get("priority") or 2)
         if priority not in PRIORITIES:
             raise ApiError(400, "priority is 1 (high), 2 (normal) or 3 (low)")
@@ -373,30 +464,41 @@ class Store:
             db = self.db()
             tid = new_id(lambda x: db.execute("SELECT 1 FROM tickets WHERE id = ?", (x,)).fetchone())
             with db:
+                # Tickets an agent creates are proposals until a human accepts them.
                 db.execute("INSERT INTO tickets (id, title, description, status, priority, checklist_path, created_by, "
-                           "created_at, updated_at, assignee) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                           "created_at, updated_at, assignee, kind, epic_id, proposed) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                            (tid, title, str(data.get("description") or ""), status, priority,
-                            data.get("checklist_path") or None, actor, now, now, assignee))
-                self._event(db, tid, actor, role, "created", None, status, now)
+                            data.get("checklist_path") or None, actor, now, now, assignee, kind, epic_id,
+                            1 if role == "agent" else 0))
+                self._event(db, tid, actor, role, "proposed" if role == "agent" else "created", None, status, now)
+                for d in deps:
+                    db.execute("INSERT OR IGNORE INTO deps (ticket_id, depends_on) VALUES (?, ?)", (tid, d))
                 if assignee:
                     self._event(db, tid, actor, role, "assignee", None, assignee, now)
-        return self.ticket(tid)
+        return self._links(self.ticket(tid))
 
     def update(self, tid, data, actor, role):
-        fields = {k: data[k] for k in ("title", "description", "status", "priority", "checklist_path", "assignee")
-                  if k in data}
+        fields = {k: data[k] for k in ("title", "description", "status", "priority", "checklist_path", "assignee",
+                                        "epic_id") if k in data}
         if not fields:
-            raise ApiError(400, "nothing to change (title, description, status, priority, checklist_path, assignee)")
+            raise ApiError(400, "nothing to change (title, description, status, priority, checklist_path, assignee, epic_id)")
         if "assignee" in fields:
             fields["assignee"] = self._check_assignee(fields["assignee"])
+        if "epic_id" in fields:
+            fields["epic_id"] = self._check_epic(fields["epic_id"])
         with self.write_lock:
             db = self.db()
             t = self.ticket(tid)
+            if t["kind"] == "epic" and fields.get("epic_id"):
+                raise ApiError(400, "epics can't belong to another epic")
+            # Waiting on unfinished predecessors: it can't start, be reviewed or be approved.
+            if fields.get("status") in ("in_progress", "review", "done") and t["kind"] == "task":
+                waiting = self.blockers(t["id"])
+                if waiting:
+                    raise ApiError(409, f"{t['id']} is blocked: {', '.join(waiting)} must be done first "
+                                        f"(you can still comment on it)")
             if role == "agent":
-                if t["status"] in AGENT_LOCKED:
-                    raise ApiError(403, f"ticket {t['id']} is {t['status']}: agents can only comment on it")
-                if t["assignee"] and t["assignee"].lower() != actor.lower():
-                    raise ApiError(403, f"ticket {t['id']} is assigned to {t['assignee']}: you can only comment on it")
+                self._check_agent_may_change(t, actor)
                 if "status" in fields and fields["status"] not in AGENT_TARGETS:
                     raise ApiError(403, "agents can set ready, in_progress or review; only humans move "
                                         "tickets to backlog or done")
@@ -413,6 +515,9 @@ class Store:
                 fields["priority"] = int(fields["priority"])
                 if fields["priority"] not in PRIORITIES:
                     raise ApiError(400, "priority is 1 (high), 2 (normal) or 3 (low)")
+            # A human moving a proposal out of the backlog accepts it.
+            if role == "human" and t["proposed"] and fields.get("status", "backlog") != "backlog":
+                fields["proposed"] = 0
             now = time.time()
             with db:
                 for k, v in fields.items():
@@ -424,7 +529,61 @@ class Store:
                         self._event(db, t["id"], actor, role, k, None if k == "description" else t[k],
                                     None if k == "description" else v, now)
                 db.execute("UPDATE tickets SET updated_at = ? WHERE id = ?", (now, t["id"]))
-        return self.ticket(t["id"])
+        return self._links(self.ticket(t["id"]))
+
+    def review_proposal(self, tid, accept, ready, actor, role):
+        """Accept (to the backlog, or ready) or decline (to done, marked
+        declined) a proposal. On an epic, its proposed tickets go the same way."""
+        if role != "human":
+            raise ApiError(403, "only humans accept or decline proposals")
+        with self.write_lock:
+            db = self.db()
+            t = self.ticket(tid)
+            if not t["proposed"]:
+                raise ApiError(409, f"{t['id']} isn't a proposal")
+            ids = [t["id"]] + ([r[0] for r in db.execute(
+                "SELECT id FROM tickets WHERE epic_id = ? AND proposed = 1", (t["id"],))] if t["kind"] == "epic" else [])
+            now = time.time()
+            with db:
+                for i in ids:
+                    cur = db.execute("SELECT status FROM tickets WHERE id = ?", (i,)).fetchone()["status"]
+                    if accept:
+                        # An epic itself isn't worked; "ready" applies to tickets only.
+                        kind = db.execute("SELECT kind FROM tickets WHERE id = ?", (i,)).fetchone()[0]
+                        to = "ready" if ready and kind == "task" else cur
+                        db.execute("UPDATE tickets SET proposed = 0, status = ?, updated_at = ? WHERE id = ?", (to, now, i))
+                        self._event(db, i, actor, role, "accepted", None, to, now)
+                    else:
+                        db.execute("UPDATE tickets SET proposed = 0, declined = 1, status = 'done', updated_at = ? "
+                                   "WHERE id = ?", (now, i))
+                        self._event(db, i, actor, role, "declined", cur, "done", now)
+        return self._links(self.ticket(t["id"]))
+
+    def add_dep(self, tid, dep, actor, role):
+        with self.write_lock:
+            db = self.db()
+            t, d = self.ticket(tid), self.ticket(dep)
+            if role == "agent":
+                self._check_agent_may_change(t, actor)
+            if "epic" in (t["kind"], d["kind"]):
+                raise ApiError(400, "dependencies are between tickets, not epics")
+            if t["id"] == d["id"] or self._would_cycle(db, t["id"], d["id"]):
+                raise ApiError(409, f"that would make a loop: {d['id']} already waits on {t['id']}")
+            with db:
+                if db.execute("INSERT OR IGNORE INTO deps (ticket_id, depends_on) VALUES (?, ?)", (t["id"], d["id"])).rowcount:
+                    self._event(db, t["id"], actor, role, "depends_on", None, d["id"], time.time())
+        return self.detail(t["id"])
+
+    def remove_dep(self, tid, dep, actor, role):
+        with self.write_lock:
+            db = self.db()
+            t = self.ticket(tid)
+            if role == "agent":
+                self._check_agent_may_change(t, actor)
+            with db:
+                if db.execute("DELETE FROM deps WHERE ticket_id = ? AND depends_on = ?", (t["id"], dep.upper())).rowcount:
+                    self._event(db, t["id"], actor, role, "depends_on", dep.upper(), None, time.time())
+        return self.detail(t["id"])
 
     def claim_next(self, actor, role, claim):
         """The next ready ticket for this user: assigned to them first, then
@@ -433,8 +592,11 @@ class Store:
         the same step, so two agents never take the same one."""
         with self.write_lock:
             db = self.db()
-            row = db.execute("SELECT id, assignee FROM tickets WHERE status = 'ready' AND "
-                             "(assignee IS NULL OR assignee = ? COLLATE NOCASE) "
+            # Only real work: not epics, not proposals, not blocked.
+            row = db.execute("SELECT id, assignee FROM tickets t WHERE status = 'ready' AND kind = 'task' AND proposed = 0 "
+                             "AND (assignee IS NULL OR assignee = ? COLLATE NOCASE) AND NOT EXISTS ("
+                             "  SELECT 1 FROM deps d JOIN tickets p ON p.id = d.depends_on "
+                             "  WHERE d.ticket_id = t.id AND p.status != 'done') "
                              "ORDER BY assignee IS NULL, priority, created_at LIMIT 1", (actor,)).fetchone()
             if not row:
                 return None
@@ -695,6 +857,14 @@ form.stack{display:grid;gap:8px}
 dl.kv{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;margin:0;font-size:14px}
 dl.kv dt{color:var(--dim)}dl.kv dd{margin:0;overflow-wrap:anywhere}
 .err{color:var(--review)}
+.tag{display:inline-block;font-size:12px;padding:1px 7px;border-radius:5px;background:var(--back-bg);color:var(--back);font-weight:600}
+.tag.blocked{background:var(--review-bg);color:var(--review)}
+.tag.epic{background:var(--prog-bg);color:var(--agent)}
+.banner{border-radius:10px;padding:10px 14px;margin-bottom:14px;background:var(--review-bg);color:var(--review)}
+.banner.prop{background:var(--prog-bg);color:var(--prog)}
+.list .item.prop{flex-wrap:wrap}.list .item.prop>a{flex:1 1 240px;min-width:0}.list .item.prop>.row{flex-wrap:wrap}
+.sub{margin-left:18px;border-left:2px solid var(--line);padding-left:10px}
+.deps li{margin:2px 0}
 """
 
 JS = """
@@ -766,6 +936,13 @@ def card(t):
     pr = '<span class="p1">High · </span>' if t["priority"] == 1 else ""
     if t.get("assignee"):
         extras.insert(0, f'<b>{esc(t["assignee"])}</b>')
+    tags = ""
+    if t.get("blocked_by"):
+        tags += f'<span class="tag blocked">blocked by {", ".join(t["blocked_by"])}</span> '
+    if t.get("epic_title"):
+        tags += f'<span class="tag epic">{esc(t["epic_title"])}</span>'
+    if tags:
+        snip = f'<div style="margin-top:6px">{tags}</div>' + snip
     return (f'<a class="card" href="/t/{t["id"]}"><div class="row"><span class="id">{t["id"]}</span>'
             f'<span class="t">{esc(t["title"])}</span></div>'
             f'<div class="meta">{pr}updated {ago(t["updated_at"])}{" · " + " · ".join(extras) if extras else ""}</div>{snip}</a>')
@@ -777,22 +954,79 @@ def column(title, tickets, empty):
 
 
 def render_dashboard(store):
-    by = {s: store.tickets([s]) for s in ("review", "in_progress", "ready")}
+    by = {s: store.tickets([s], kind="task", proposed=False) for s in ("review", "in_progress", "ready")}
+    epics = [e for e in store.tickets(["backlog", "ready", "in_progress", "review"], kind="epic", proposed=False)]
+    rows = []
+    for e in epics:
+        pr = e["progress"]
+        pct = round(100 * pr["done"] / pr["total"]) if pr["total"] else 0
+        doing = pr["by_status"].get("in_progress", 0)
+        rows.append(f'<a class="card" href="/t/{e["id"]}"><div class="row"><span class="id">{e["id"]}</span>'
+                    f'<span class="t">{esc(e["title"])}</span></div><div class="meta">{pr["done"]} of {pr["total"]} done'
+                    f'{f" · {doing} in progress" if doing else ""}</div><div class="bar"><i style="width:{pct}%"></i></div></a>')
+    proposals = len(store.tickets(["backlog"], proposed=True))
     body = ('<h1>In flight</h1><div class="cols">'
             + column("Needs your review", by["review"], "Nothing waiting on you.")
             + column("In progress", by["in_progress"], "No agent is working on anything.")
             + column("Ready to work", by["ready"], "Nothing cleared for agents. Promote something from the backlog.")
-            + '</div><script>setInterval(() => { if (!document.hidden) location.reload(); }, 60000);</script>')
+            + '</div>'
+            + (f'<p class="banner prop">Agents proposed {proposals} ticket{"s" if proposals != 1 else ""}: '
+               f'<a href="/backlog">review them in the backlog</a>.</p>' if proposals else "")
+            + f'<h2>Epics ({len(epics)})</h2>' + ("".join(rows) or '<p class="empty">No open epics.</p>')
+            + '<script>setInterval(() => { if (!document.hidden) location.reload(); }, 60000);</script>')
     return page("Dashboard", body, "/", len(by["review"]))
 
 
+PROPOSAL_JS = """
+async function review(tid, action, ready){
+  try { await api('POST', '/api/tickets/' + tid + '/' + action, action === 'accept' ? {ready} : {}); location.reload(); }
+  catch (e) { fail(e); }
+}
+"""
+
+
+def proposal_row(t, children=()):
+    kind = '<span class="tag epic">Epic</span> ' if t["kind"] == "epic" else ""
+    deps = f' · after {", ".join(t["blocked_by"])}' if t.get("blocked_by") else ""
+    more = f" (and its {len(children)} proposed ticket{'s' if len(children) != 1 else ''})" if children else ""
+    tid = t["id"]
+    head = (f'<div class="item prop"><a href="/t/{tid}"><span class="id">{tid}</span> {kind}<b>{esc(t["title"])}</b>'
+            f'<div class="meta">proposed by {esc(t["created_by"])} {ago(t["created_at"])}{deps}</div></a><div class="row">'
+            f'<button class="primary" onclick="review(\'{tid}\',\'accept\',false)" title="Accept{esc(more)}">Accept</button>'
+            + ("" if t["kind"] == "epic" else
+               f'<button onclick="review(\'{tid}\',\'accept\',true)">Accept &amp; make ready</button>')
+            + f'<button onclick="review(\'{tid}\',\'decline\')" title="Decline{esc(more)}">Decline</button></div></div>')
+    if children:
+        head += '<div class="sub">' + "".join(proposal_row(c) for c in children) + "</div>"
+    return head
+
+
 def render_list(store, status, q):
-    items = store.tickets([status], q=q or None, recent_first=status == "done")
+    items = store.tickets([status], q=q or None, recent_first=status == "done",
+                          proposed=False if status == "backlog" else None)
+    props = ""
+    if status == "backlog" and not q:
+        proposed = store.tickets(["backlog"], proposed=True)
+        ids = {t["id"] for t in proposed}
+        epics = [t for t in proposed if t["kind"] == "epic"]
+        loose = [t for t in proposed if t["kind"] != "epic" and t.get("epic_id") not in ids]
+        blocks = [proposal_row(e, [t for t in proposed if t.get("epic_id") == e["id"]]) for e in epics]
+        blocks += [proposal_row(t) for t in loose]
+        if blocks:
+            props = (f'<h2>Proposed by agents ({len(proposed)})</h2><p class="meta">Accepting or declining an epic does the same '
+                     f'to its proposed tickets.</p><div class="list">{"".join(blocks)}</div><h2>Accepted</h2>'
+                     f'<script>{PROPOSAL_JS}</script>')
     rows = []
     for t in items:
         btn = (f'<button class="primary" onclick="setStatus(\'{t["id"]}\',\'ready\')">Make ready</button>'
                if status == "backlog" else "")
         pr = '<span class="p1">High · </span>' if t["priority"] == 1 else ""
+        if t["kind"] == "epic":
+            pr = '<span class="tag epic">Epic</span> ' + pr
+        if t.get("declined"):
+            pr = '<span class="tag">Declined</span> ' + pr
+        if t.get("blocked_by"):
+            pr += f'<span class="tag blocked">after {", ".join(t["blocked_by"])}</span> '
         rows.append(f'<div class="item"><a href="/t/{t["id"]}"><span class="id">{t["id"]}</span> '
                     f'<b>{esc(t["title"])}</b><div class="meta">{pr}{"created" if status == "backlog" else "finished"} '
                     f'{ago(t["created_at"] if status == "backlog" else t["updated_at"])}</div></a>{btn}</div>')
@@ -802,7 +1036,7 @@ def render_list(store, status, q):
     hint = ('<p class="meta">Ideas waiting to be cleared. "Make ready" lets agents pick one up.</p>' if status == "backlog"
             else '<p class="meta">Work you approved. <a href="/api/export">Download a backup</a> of everything '
                  '(tickets, comments, history and files).</p>')
-    body = f'<h1>{title}</h1>{hint}{search}<div class="list">{"".join(rows) or "<p class=empty>Nothing here.</p>"}</div>'
+    body = f'<h1>{title}</h1>{hint}{search}{props}<div class="list">{"".join(rows) or "<p class=empty>Nothing here.</p>"}</div>'
     return page(title, body, "/" + status, len(store.tickets(["review"])))
 
 
@@ -817,7 +1051,15 @@ def assignee_options(store, current=None):
     return "".join(opts)
 
 
-def render_new(store):
+def epic_options(store, current=None):
+    opts = ['<option value="">None</option>']
+    for e in store.tickets(["backlog", "ready", "in_progress", "review"], kind="epic"):
+        sel = " selected" if current and e["id"] == current.upper() else ""
+        opts.append(f'<option value="{e["id"]}"{sel}>{e["id"]} · {esc(e["title"])}</option>')
+    return "".join(opts)
+
+
+def render_new(store, epic=None):
     opts = "".join(f'<option value="{s}"{" selected" if s == "backlog" else ""}>{LABELS[s]}</option>' for s in STATUSES)
     body = f"""<h1>New ticket</h1><form class="stack box" id="nf">
 <label>Title<input type="text" id="nt-title" required></label>
@@ -825,13 +1067,17 @@ def render_new(store):
 <div class="row"><label>Status <select id="nt-status">{opts}</select></label>
 <label>Priority <select id="nt-prio"><option value="1">High</option><option value="2" selected>Normal</option><option value="3">Low</option></select></label>
 <label>Assign to <select id="nt-who">{assignee_options(store)}</select></label></div>
+<div class="row"><label>Kind <select id="nt-kind"><option value="task">Ticket</option><option value="epic">Epic (a plan that groups tickets)</option></select></label>
+<label>Epic <select id="nt-epic">{epic_options(store, epic)}</select></label></div>
+<label>Must be done first (ticket ids, optional)<input type="text" id="nt-deps" placeholder="KAMI, ROZU"></label>
 <label>Checklist file (optional, a path on this machine)<input type="text" id="nt-ck" placeholder="/home/.../checklist.md"></label>
 <div><button class="primary">Create</button></div></form>
 <script>const $ = (id) => document.getElementById(id);
 $('nf').onsubmit = async (e) => {{ e.preventDefault();
  try {{ const t = await api('POST', '/api/tickets', {{title: $('nt-title').value, description: $('nt-desc').value,
    status: $('nt-status').value, priority: +$('nt-prio').value, checklist_path: $('nt-ck').value || null,
-   assignee: $('nt-who').value || null}});
+   assignee: $('nt-who').value || null, kind: $('nt-kind').value, epic_id: $('nt-epic').value || null,
+   depends_on: $('nt-deps').value}});
    location = '/t/' + t.id; }} catch (err) {{ fail(err); }} }};</script>"""
     return page("New ticket", body, "/new", len(store.tickets(["review"])))
 
@@ -946,6 +1192,18 @@ def render_ticket(store, tid):
     for e in t["events"]:
         if e["field"] == "created":
             text = f'{esc(e["actor"])} created it in {LABELS.get(e["new"], e["new"])}'
+        elif e["field"] == "proposed":
+            text = f'{esc(e["actor"])} proposed it'
+        elif e["field"] == "accepted":
+            text = f'{esc(e["actor"])} accepted it into {LABELS.get(e["new"], e["new"])}'
+        elif e["field"] == "declined":
+            text = f'{esc(e["actor"])} <b>declined</b> it'
+        elif e["field"] == "depends_on":
+            text = (f'{esc(e["actor"])} said <a href="/t/{esc(e["new"])}">{esc(e["new"])}</a> must be done first' if e["new"]
+                    else f'{esc(e["actor"])} removed the dependency on {esc(e["old"])}')
+        elif e["field"] == "epic_id":
+            text = (f'{esc(e["actor"])} moved it into epic <a href="/t/{esc(e["new"])}">{esc(e["new"])}</a>' if e["new"]
+                    else f'{esc(e["actor"])} took it out of its epic')
         elif e["field"] == "status":
             text = f'{esc(e["actor"])} moved it from {LABELS.get(e["old"], e["old"])} to <b>{LABELS.get(e["new"], e["new"])}</b>'
         elif e["field"] == "assignee":
@@ -972,6 +1230,45 @@ def render_ticket(store, tid):
                   + (f'<div class="meta">{ck["done"]} of {ck["total"]} done</div><div class="bar"><i style="width:{pct}%"></i></div>'
                      if ck["total"] else "") + f'<ul class="ck">{lis}</ul>')
 
+    def chip(x):
+        st = x["status"]
+        label = "Declined" if x.get("declined") else LABELS[st]
+        return f'<span class="chip s-{st}">{label}</span>'
+
+    def link_list(items, removable=False):
+        lis = "".join(f'<li><a href="/t/{x["id"]}"><span class="id">{x["id"]}</span> {esc(x["title"])}</a> {chip(x)}'
+                      + (f' <button onclick="rmDep(\'{x["id"]}\')" aria-label="Remove {x["id"]}" '
+                         f'style="padding:1px 7px">×</button>' if removable else "") + "</li>" for x in items)
+        return f'<ul class="ck deps">{lis}</ul>' if lis else '<p class="meta">None.</p>'
+
+    banners = ""
+    if t["proposed"]:
+        banners += (f'<div class="banner prop">Proposed by {esc(t["created_by"])}. '
+                    f'<button class="primary" onclick="review(TID,\'accept\',false)">Accept</button> '
+                    + ("" if t["kind"] == "epic" else '<button onclick="review(TID,\'accept\',true)">Accept &amp; make ready</button> ')
+                    + '<button onclick="review(TID,\'decline\')">Decline</button>'
+                    + (' <span class="meta">(its proposed tickets go the same way)</span>' if t["kind"] == "epic" else "")
+                    + '</div>')
+    if t["blocked_by"]:
+        banners += (f'<div class="banner">Blocked: {", ".join(f"<a href=/t/{b}>{b}</a>" for b in t["blocked_by"])} '
+                    f'must be done first. It can\'t start until then; comments are fine.</div>')
+    epic_box = ""
+    if t["kind"] == "epic":
+        pr = t["progress"]
+        pct = round(100 * pr["done"] / pr["total"]) if pr["total"] else 0
+        epic_box = (f'<h2>Tickets in this epic ({pr["total"]})</h2><div class="box">'
+                    f'<div class="meta">{pr["done"]} of {pr["total"]} done</div><div class="bar"><i style="width:{pct}%"></i></div>'
+                    + link_list(t["tickets"]) + f'<p><a href="/new?epic={t["id"]}">Add a ticket to this epic</a></p></div>')
+    if t["kind"] == "epic":
+        side_links = ""
+    else:
+        side_links = (f'<h2>Epic</h2><div class="box"><select id="epic" aria-label="Epic" onchange="setEpic(this.value)">'
+                      f'{epic_options(store, t["epic_id"])}</select></div>'
+                      f'<h2>Must be done first</h2><div class="box">{link_list(t["depends_on"], True)}'
+                      f'<form class="row" id="df"><input type="text" id="dep" placeholder="ticket id" aria-label="Add a predecessor" '
+                      f'style="flex:1;min-width:90px"><button>Add</button></form></div>'
+                      f'<h2>Unblocks</h2><div class="box">{link_list(t["unblocks"])}</div>')
+
     s = t["status"]
     actions = {
         "backlog": [("ready", "Make ready", True)],
@@ -980,16 +1277,23 @@ def render_ticket(store, tid):
         "review": [("done", "Approve", True), ("in_progress", "Send back", False)],
         "done": [("in_progress", "Reopen", False)],
     }[s]
+    if t["kind"] == "epic":  # epics aren't worked, only closed when their plan is finished
+        actions = [("backlog", "Reopen epic", False)] if s == "done" else [("done", "Close epic", False)]
+    if t["proposed"]:  # the proposal banner has the buttons
+        actions = []
     btns = "".join(f'<button class="{"primary" if p else ""}" onclick="setStatus(\'{t["id"]}\',\'{to}\')">{esc(lbl)}</button>'
                    for to, lbl, p in actions)
     move_opts = "".join(f'<option value="{x}">{LABELS[x]}</option>' for x in STATUSES if x != s)
     body = f"""<div class="row" style="margin-bottom:6px"><span class="id">{t['id']}</span>
 <span class="chip s-{s}">{LABELS[s]}</span>{'<span class="p1">High priority</span>' if t['priority'] == 1 else ''}
-<span class="meta">{'assigned to <b>' + esc(t['assignee']) + '</b>' if t['assignee'] else 'unassigned'}</span></div>
-<h1>{esc(t['title'])}</h1>
+<span class="meta">{'assigned to <b>' + esc(t['assignee']) + '</b>' if t['assignee'] else 'unassigned'}</span>
+{'<span class="tag epic">Epic</span>' if t['kind'] == 'epic' else ''}
+{f'<span class="meta">in epic <a href="/t/{t["epic_id"]}">{t["epic_id"]} · {esc(t.get("epic_title") or "")}</a></span>' if t['epic_id'] else ''}</div>
+<h1>{esc(t['title'])}</h1>{banners}
 <div class="row" style="margin-bottom:16px">{btns}</div>
 <div class="detail"><div>
  <div class="box"><div class="desc">{linkify(t['description']) or '<span class="meta">No description.</span>'}</div></div>
+ {epic_box}
  <h2>Activity</h2><div class="tl">{timeline}</div>
  <h2>Comment</h2><form class="stack box" id="cf">
   <textarea id="cbody" placeholder="Feedback, a decision, or a question for the agent" aria-label="Comment"></textarea>
@@ -1000,6 +1304,7 @@ def render_ticket(store, tid):
  <h2 style="margin-top:0">Checklist</h2><div class="box">{ckhtml}</div>
  <h2>Assigned to</h2><div class="box"><select id="who" aria-label="Assigned to"
   onchange="assign(this.value)">{assignee_options(store, t['assignee'])}</select></div>
+ {side_links}
  <h2>Details</h2><div class="box"><dl class="kv"><dt>Priority</dt><dd>{PRIORITIES[t['priority']]}</dd>
   <dt>Created</dt><dd>{when(t['created_at'])} by {esc(t['created_by'])}</dd><dt>Updated</dt><dd>{ago(t['updated_at'])}</dd></dl>
   <details style="margin-top:10px"><summary>Edit</summary><form class="stack" id="ef" style="margin-top:8px">
@@ -1024,6 +1329,15 @@ document.getElementById('cf').onsubmit = async (e) => {{
 }};
 async function assign(name) {{ try {{ await api('PATCH', '/api/tickets/' + TID, {{assignee: name || null}}); location.reload(); }}
   catch (err) {{ fail(err); }} }}
+async function setEpic(id) {{ try {{ await api('PATCH', '/api/tickets/' + TID, {{epic_id: id || null}}); location.reload(); }}
+  catch (err) {{ fail(err); }} }}
+async function rmDep(id) {{ try {{ await api('DELETE', '/api/tickets/' + TID + '/deps/' + id); location.reload(); }}
+  catch (err) {{ fail(err); }} }}
+const df = document.getElementById('df');
+if (df) df.onsubmit = async (e) => {{ e.preventDefault();
+  try {{ await api('POST', '/api/tickets/' + TID + '/deps', {{depends_on: $('dep').value.trim()}}); location.reload(); }}
+  catch (err) {{ fail(err); }} }};
+{PROPOSAL_JS}
 document.getElementById('ef').onsubmit = async (e) => {{
   e.preventDefault();
   try {{ await api('PATCH', '/api/tickets/' + TID, {{title: $('etitle').value, description: $('edesc').value,
@@ -1054,7 +1368,8 @@ put it in comments or files.
     backlog -> ready -> in_progress -> review -> done
 
 - **backlog**: ideas, not cleared for work. Don't work on these. You may
-  *file* new tickets here (things you noticed that need doing).
+  *propose* new tickets here (things you noticed that need doing); a human
+  accepts or declines them.
 - **ready**: cleared for work. Pick these up when you have time.
 - **in_progress**: someone is working on it. Move a ticket here when you
   start it, so no one else takes it.
@@ -1065,11 +1380,34 @@ put it in comments or files.
 Tickets can be assigned to one user (an agent or a human). Work on tickets
 assigned to you; you may also take unassigned ready ones.
 
+**Epics** group the tickets of one plan (`"kind": "epic"`). They aren't
+worked directly: you'll never get one from /api/next, and you can only
+comment on them. A ticket belongs to at most one epic (`epic_id`).
+
+**Dependencies**: a ticket can list tickets that must be done first
+(`depends_on`). Until they're done (approved, or declined), it's
+**blocked**: it can't move to in_progress, review or done (you get a 409
+naming the blockers), and /api/next skips it. You can still comment on it.
+
+**Proposals**: tickets you create are proposals. They wait in the backlog,
+marked proposed, until a human accepts (to the backlog or straight to
+ready) or declines them (they move to done, marked declined).
+
 Rules the server enforces: you can set ready, in_progress and review; you
 can't set backlog or done; you can't change backlog or done tickets, or
 tickets assigned to someone else, except by commenting. You can assign a
 ticket to yourself or to no one, never to someone else. Starting an
 unassigned ticket assigns it to you. You can always comment.
+
+## Proposing a plan (after a design session)
+
+When a human asks you to break a plan into tickets: create the epic first
+(`{"kind": "epic", "title", "description"}`), then each ticket with
+`"epic_id"` set to it and `"depends_on"` listing the tickets that must come
+first (create them in order, so the ids exist). Give every ticket a
+description that someone else could work from cold, and say what "done"
+means. The human accepts or declines the epic, and with it all of its
+proposed tickets, in one step.
 
 ## How to work a ticket
 
@@ -1111,11 +1449,15 @@ Ticket ids are four or five letters, like `KAMI`, in any case.
     GET   /api/next                  your next ready ticket, or {"ticket": null}; plus "guidance"
     GET   /api/next?claim=1          ...and move it to in_progress, assigned to you
     GET   /api/tickets               {"tickets": [...]}; filters: ?status=ready,in_progress  ?q=text
-                                     ?assignee=me (or a name, or "none")
+                                     ?assignee=me (or a name, or "none")  ?epic=ID  ?kind=epic  ?proposed=1
     GET   /api/tickets/ID            one ticket, with comments, attachments, events, checklist
-    POST  /api/tickets               {"title", "description", "priority": 1|2|3, "checklist_path"}
-                                     -> the new ticket (always in backlog)
-    PATCH /api/tickets/ID            any of {"status", "title", "description", "priority", "checklist_path", "assignee"}
+    POST  /api/tickets               {"title", "description", "priority": 1|2|3, "checklist_path",
+                                      "kind": "task"|"epic", "epic_id", "depends_on": ["KAMI", ...]}
+                                     -> the new ticket (a proposal, in the backlog)
+    POST  /api/tickets/ID/deps       {"depends_on": "KAMI"}: KAMI must be done before ID
+    DELETE /api/tickets/ID/deps/KAMI remove that dependency
+    PATCH /api/tickets/ID            any of {"status", "title", "description", "priority", "checklist_path", "assignee",
+                                      "epic_id"}
     POST  /api/tickets/ID/comments   {"body": "..."} -> the comment, with its "id"
     POST  /api/tickets/ID/attachments?filename=demo.mp4&comment_id=N
                                      the file's raw bytes as the body, with its Content-Type;
@@ -1128,6 +1470,8 @@ server's limit (1 GB by default).
 A ticket looks like:
 
     {"id": "KAMI", "title": "...", "description": "...", "status": "in_progress", "assignee": "agent-1",
+     "kind": "task", "epic_id": "ROZU", "epic_title": "...", "proposed": 0, "declined": 0,
+     "blocked_by": [], "depends_on": [{"id": "BEDO", "title": "...", "status": "done"}], "unblocks": [...],
      "priority": 2, "checklist_path": "/home/me/work/plan.md", "created_by": "frank",
      "created_at": 1760000000.0, "updated_at": 1760000300.0,
      "comments": [{"id": 12, "author": "frank", "role": "human", "body": "...", "created_at": ...}],
@@ -1268,6 +1612,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_PUT(self):
         self.route("PUT")
 
+    def do_DELETE(self):
+        self.route("DELETE")
+
     def route(self, method):
         url = urlsplit(self.path)
         query = parse_qs(url.query)
@@ -1301,13 +1648,14 @@ class Handler(BaseHTTPRequestHandler):
             if method != "GET" and not bearer and self.headers.get("X-Tickets") != "1":
                 raise ApiError(403, "missing X-Tickets header")
 
-            m = re.fullmatch(r"/api/tickets/([A-Za-z]{4,5})(/comments|/attachments)?", path)
+            m = re.fullmatch(r"/api/tickets/([A-Za-z]{4,5})(/comments|/attachments|/deps|/accept|/decline)?(?:/([A-Za-z]{4,5}))?",
+                             path)
             if method == "GET" and path == "/":
                 return self.html(render_dashboard(store))
             if method == "GET" and path in ("/backlog", "/done"):
                 return self.html(render_list(store, path[1:], (query.get("q") or [""])[0].strip()))
             if method == "GET" and path == "/new":
-                return self.html(render_new(store))
+                return self.html(render_new(store, (query.get("epic") or [None])[0]))
             if method == "GET" and (tm := re.fullmatch(r"/t/([A-Za-z]{4,5})", path)):
                 return self.html(render_ticket(store, tm.group(1)))
             if method == "GET" and (fm := re.fullmatch(r"/files/(\d+)/[^/]*", path)):
@@ -1377,12 +1725,26 @@ class Handler(BaseHTTPRequestHandler):
                         who = actor
                     elif who == "none":
                         who = ""
-                    return self.json(200, {"tickets": store.tickets(st or None, (query.get("q") or [""])[0] or None,
-                                                                    assignee=who)})
+                    prop = (query.get("proposed") or [None])[0]
+                    return self.json(200, {"tickets": store.tickets(
+                        st or None, (query.get("q") or [""])[0] or None, assignee=who,
+                        kind=(query.get("kind") or [None])[0], epic=(query.get("epic") or [None])[0],
+                        proposed=None if prop is None else prop in ("1", "true", "yes"))})
                 if method == "POST":
                     return self.json(201, store.create(self.body_json(), actor, role))
             if m:
-                tid, sub = m.group(1), m.group(2)
+                tid, sub, other = m.group(1), m.group(2), m.group(3)
+                if sub == "/deps" and method == "POST" and not other:
+                    return self.json(200, store.add_dep(tid, str(self.body_json().get("depends_on") or ""), actor, role))
+                if sub == "/deps" and method == "DELETE" and other:
+                    return self.json(200, store.remove_dep(tid, other, actor, role))
+                if sub in ("/accept", "/decline") and method == "POST" and not other:
+                    # Always read the body, even for decline: left unread, it would
+                    # be taken for the start of the next request on this connection.
+                    ready = bool(self.body_json().get("ready")) and sub == "/accept"
+                    return self.json(200, store.review_proposal(tid, sub == "/accept", ready, actor, role))
+                if other:
+                    raise ApiError(404, "not found")
                 if not sub and method == "GET":
                     return self.json(200, store.detail(tid))
                 if not sub and method == "PATCH":
