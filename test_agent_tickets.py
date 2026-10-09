@@ -21,9 +21,10 @@ class TicketsTest(unittest.TestCase):
         root = Path(cls.tmp.name)
         cls.allowed = root / "work"
         cls.allowed.mkdir()
-        cls.srv = at.make_server("127.0.0.1", 0, root / "data", [str(cls.allowed)], max_upload_mb=1, human_name="Frank")
+        cls.srv = at.make_server("127.0.0.1", 0, root / "data", [str(cls.allowed)], max_upload_mb=1)
         cls.url = f"http://127.0.0.1:{cls.srv.server_address[1]}"
-        cls.keys = cls.srv.keys
+        cls.keys = {"human": cls.srv.store.add_user("Frank", "human", "test")[1],
+                    "agent": cls.srv.store.add_user("tester", "agent", "test")[1]}
         threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
 
     @classmethod
@@ -32,10 +33,10 @@ class TicketsTest(unittest.TestCase):
         cls.srv.server_close()
         cls.tmp.cleanup()
 
-    def call(self, method, path, body=None, role="agent", headers=None, raw=None):
-        h = {"X-Agent": "tester"}
-        if role:
-            h["Authorization"] = "Bearer " + self.keys[role]
+    def call(self, method, path, body=None, role="agent", headers=None, raw=None, token=None):
+        h = {}
+        if token or role:
+            h["Authorization"] = "Bearer " + (token or self.keys[role])
         data = raw
         if body is not None:
             data = json.dumps(body).encode()
@@ -279,6 +280,68 @@ class TicketsTest(unittest.TestCase):
             self.assertFalse((Path(tmp) / "escaped.txt").exists())
             self.assertFalse((store.dir / "escaped.txt").exists())
             self.assertTrue((store.files / "T" / "ok.txt").exists())
+
+    # --- users
+    def test_humans_manage_users(self):
+        code, r = self.j("POST", "/api/users", {"username": "builder-2", "kind": "agent"}, role="human")
+        self.assertEqual(code, 201, r)
+        tok = r["token"]
+        self.assertTrue(tok.startswith("at_"))
+        me = self.j("GET", "/api/me", role=None, token=tok)[1]
+        self.assertEqual(me, {"username": "builder-2", "kind": "agent"})
+        # Identity comes from the token: the old X-Agent header changes nothing.
+        t = self.j("POST", "/api/tickets", {"title": "from builder-2"}, role=None, token=tok,
+                   headers={"X-Agent": "someone-else"})[1]
+        self.assertEqual(t["created_by"], "builder-2")
+        # A second human can manage users too.
+        h2 = self.j("POST", "/api/users", {"username": "sam", "kind": "human"}, role="human")[1]["token"]
+        self.assertEqual(self.j("GET", "/api/users", role=None, token=h2)[0], 200)
+        # Agents can't manage users or see the Users page.
+        self.assertEqual(self.j("POST", "/api/users", {"username": "sneaky"})[0], 403)
+        self.assertEqual(self.j("GET", "/api/users")[0], 403)
+        self.assertEqual(self.call("GET", "/users")[0], 403)
+        # Names: unique (any case) and sane.
+        self.assertEqual(self.j("POST", "/api/users", {"username": "BUILDER-2"}, role="human")[0], 409)
+        self.assertEqual(self.j("POST", "/api/users", {"username": "bad name!"}, role="human")[0], 400)
+        self.assertEqual(self.j("POST", "/api/users", {"username": "x", "kind": "robot"}, role="human")[0], 400)
+        # A new token replaces the old one; disabling locks the user out until re-enabled.
+        tok2 = self.j("POST", "/api/users/builder-2/token", role="human")[1]["token"]
+        self.assertEqual(self.j("GET", "/api/me", role=None, token=tok)[0], 401)
+        self.assertEqual(self.j("GET", "/api/me", role=None, token=tok2)[0], 200)
+        self.assertTrue(self.j("PATCH", "/api/users/builder-2", {"disabled": True}, role="human")[1]["disabled"])
+        self.assertEqual(self.j("GET", "/api/me", role=None, token=tok2)[0], 401)
+        self.j("PATCH", "/api/users/builder-2", {"disabled": False}, role="human")
+        self.assertEqual(self.j("GET", "/api/me", role=None, token=tok2)[0], 200)
+        # Tokens are never stored or listed, only their hashes.
+        users = self.j("GET", "/api/users", role="human")[1]["users"]
+        self.assertNotIn("token_hash", json.dumps(users))
+        raw = (Path(self.srv.store.db_path)).read_bytes() + Path(str(self.srv.store.db_path) + "-wal").read_bytes()
+        self.assertNotIn(tok2.encode(), raw)
+        html = self.call("GET", "/users", role="human")[1].decode()
+        self.assertIn("builder-2", html)
+
+    def test_last_human_cant_be_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = at.Store(Path(tmp) / "data", [tmp])
+            store.add_user("only", "human", "test")
+            with self.assertRaises(at.ApiError):
+                store.set_disabled("only", True)
+            store.add_user("second", "human", "test")
+            self.assertTrue(store.set_disabled("only", True)["disabled"])
+
+    def test_old_keys_become_users(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp) / "data"
+            data.mkdir()
+            (data / "keys.json").write_text(json.dumps({"human": "old-human-key", "agent": "old-agent-key"}))
+            srv = at.make_server("127.0.0.1", 0, data, [tmp], human_name="Frank")
+            try:
+                self.assertEqual(srv.migrated, ["Frank", "agent"])
+                self.assertFalse((data / "keys.json").exists())
+                self.assertEqual(srv.store.user_by_token("old-human-key")["username"], "Frank")
+                self.assertEqual(srv.store.user_by_token("old-agent-key")["kind"], "agent")
+            finally:
+                srv.server_close()
 
     # --- pages
     def test_pages_render(self):

@@ -5,7 +5,7 @@ and an SQLite database.
 
   python3 agent_tickets.py                     # serve on 127.0.0.1:43917, data in ./data
   python3 agent_tickets.py --port 8080 --data /srv/tickets
-  python3 agent_tickets.py --keys              # print the access keys and exit
+  python3 agent_tickets.py --add-user frank --kind human   # make a user, print their token
   python3 agent_tickets.py --export backups/   # back everything up (see "Backups")
   python3 agent_tickets.py --import FILE       # restore a backup into an empty data folder
 
@@ -16,13 +16,15 @@ Tickets move through five statuses:
   review       the agent is done or needs a decision: the human's turn
   done         approved by the human
 
-Two keys (made on first run, in <data>/keys.json): the human key opens the
-web pages and can do anything; the agent key is for the JSON API and can
-only move tickets between ready, in_progress and review, and can't change
-backlog or done tickets (comments are always allowed). API docs: GET /api.
+Users have a name, a kind (human or agent) and their own token, which is
+who they are. Humans can do anything, including adding users and issuing
+or revoking tokens (the Users page). Agents use the JSON API and can only
+move tickets between ready, in_progress and review, and can't change
+backlog or done tickets (comments are always allowed). Only a hash of each
+token is stored. API docs: GET /api.
 """
 import argparse
-import hmac
+import hashlib
 import html
 import io
 import json
@@ -83,6 +85,10 @@ CREATE TABLE IF NOT EXISTS attachments (
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT, ticket_id TEXT NOT NULL REFERENCES tickets(id),
   actor TEXT NOT NULL, role TEXT NOT NULL, field TEXT NOT NULL, old TEXT, new TEXT, at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+  kind TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, created_by TEXT, created_at REAL NOT NULL,
+  disabled INTEGER NOT NULL DEFAULT 0, last_seen REAL);
 CREATE INDEX IF NOT EXISTS tickets_status ON tickets(status, priority, created_at);
 CREATE INDEX IF NOT EXISTS comments_ticket ON comments(ticket_id, created_at);
 CREATE INDEX IF NOT EXISTS attachments_ticket ON attachments(ticket_id);
@@ -91,8 +97,18 @@ CREATE INDEX IF NOT EXISTS events_ticket ON events(ticket_id, at);
 
 
 # Bumped (with a migration in Store.__init__) whenever the tables change.
-SCHEMA_VERSION = 1
-TABLES = ("tickets", "comments", "attachments", "events")
+SCHEMA_VERSION = 2
+TABLES = ("users", "tickets", "comments", "attachments", "events")
+KINDS = ("human", "agent")
+USERNAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,31}")
+
+
+def new_token():
+    return "at_" + secrets.token_urlsafe(24)
+
+
+def token_hash(token):
+    return hashlib.sha256(token.encode()).hexdigest()
 
 
 class ApiError(Exception):
@@ -115,7 +131,8 @@ class Store:
         self.write_lock = threading.Lock()
         db = self.db()
         db.executescript(SCHEMA)
-        if db.execute("PRAGMA user_version").fetchone()[0] == 0:
+        # 1 -> 2 added the users table (created above).
+        if db.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
             db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def db(self):
@@ -127,6 +144,66 @@ class Store:
             c.execute("PRAGMA foreign_keys=ON")
             self.local.conn = c
         return c
+
+    # --- users
+    def users(self):
+        return [dict(r) for r in self.db().execute(
+            "SELECT id, username, kind, created_by, created_at, disabled, last_seen FROM users ORDER BY kind, username")]
+
+    def user(self, username):
+        row = self.db().execute("SELECT id, username, kind, created_by, created_at, disabled, last_seen FROM users "
+                                "WHERE username = ?", (username,)).fetchone()
+        if not row:
+            raise ApiError(404, f"no user {username}")
+        return dict(row)
+
+    def user_by_token(self, token):
+        """The active user this token belongs to, or None."""
+        row = self.db().execute("SELECT id, username, kind, disabled, last_seen FROM users WHERE token_hash = ?",
+                                (token_hash(token),)).fetchone()
+        if not row or row["disabled"]:
+            return None
+        now = time.time()
+        if not row["last_seen"] or now - row["last_seen"] > 60:
+            with self.write_lock, self.db() as db:
+                db.execute("UPDATE users SET last_seen = ? WHERE id = ?", (now, row["id"]))
+        return dict(row)
+
+    def add_user(self, username, kind, created_by, token=None):
+        """A new user and their token (returned once; only its hash is kept)."""
+        username = str(username or "").strip()
+        if not USERNAME_RE.fullmatch(username):
+            raise ApiError(400, "usernames are 1-32 letters, digits, '.', '_' or '-', starting with a letter or digit")
+        if kind not in KINDS:
+            raise ApiError(400, f"kind is one of {list(KINDS)}")
+        token = token or new_token()
+        with self.write_lock:
+            db = self.db()
+            if db.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone():
+                raise ApiError(409, f"there's already a user called {username}")
+            with db:
+                db.execute("INSERT INTO users (username, kind, token_hash, created_by, created_at) VALUES (?,?,?,?,?)",
+                           (username, kind, token_hash(token), created_by, time.time()))
+        return self.user(username), token
+
+    def new_user_token(self, username):
+        """Replace a user's token; the old one stops working at once."""
+        u = self.user(username)
+        token = new_token()
+        with self.write_lock, self.db() as db:
+            db.execute("UPDATE users SET token_hash = ? WHERE id = ?", (token_hash(token), u["id"]))
+        return token
+
+    def set_disabled(self, username, disabled):
+        u = self.user(username)
+        with self.write_lock:
+            db = self.db()
+            if disabled and u["kind"] == "human" and db.execute(
+                    "SELECT COUNT(*) FROM users WHERE kind = 'human' AND disabled = 0 AND id != ?", (u["id"],)).fetchone()[0] == 0:
+                raise ApiError(409, "that's the last active human; add another before disabling this one")
+            with db:
+                db.execute("UPDATE users SET disabled = ? WHERE id = ?", (1 if disabled else 0, u["id"]))
+        return self.user(username)
 
     # --- reads
     def ticket(self, tid):
@@ -342,15 +419,22 @@ class Store:
 
 # --------------------------------------------------------------------------- keys
 
-def load_keys(data_dir):
-    path = Path(data_dir) / "keys.json"
-    if path.exists():
-        return json.loads(path.read_text())
-    keys = {"human": secrets.token_urlsafe(24), "agent": secrets.token_urlsafe(24)}
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(keys, indent=2) + "\n")
-    path.chmod(0o600)
-    return keys
+def migrate_keys(store, human_name="human"):
+    """Before users existed there were two shared keys in <data>/keys.json.
+    The first run after the upgrade turns them into users (a human named
+    `human_name` and an agent named "agent", same tokens, so nothing stops
+    working) and deletes the file."""
+    path = store.dir / "keys.json"
+    if not path.exists() or store.users():
+        return []
+    keys = json.loads(path.read_text())
+    made = []
+    for username, kind in ((human_name, "human"), ("agent", "agent")):
+        if keys.get(kind):
+            store.add_user(username, kind, "migrated from keys.json", token=keys[kind])
+            made.append(username)
+    path.unlink()
+    return made
 
 
 # --------------------------------------------------------------------------- backups
@@ -428,14 +512,23 @@ def import_archive(store, src, replace=False):
             have = db.execute("SELECT COUNT(*) FROM tickets").fetchone()[0]
             if have and not replace:
                 raise ValueError(f"this data folder already has {have} tickets; restore into an empty one, or use --replace")
+            # Users: a backup's users are added (by name, skipping names that
+            # already exist here); a backup without any (older ones) leaves the
+            # users here alone, so nobody gets locked out by a restore.
+            backup_users = doc["tables"].get("users") or []
             with db:
                 if replace:
                     for t in reversed(TABLES):
-                        db.execute(f"DELETE FROM {t}")
+                        if t != "users" or backup_users:
+                            db.execute(f"DELETE FROM {t}")
                 for t in TABLES:
                     cols = {r[1] for r in db.execute(f"PRAGMA table_info({t})")}
                     for row in doc["tables"].get(t, []):
                         keep = {k: v for k, v in row.items() if k in cols}
+                        if t == "users":
+                            keep.pop("id", None)
+                            if db.execute("SELECT 1 FROM users WHERE username = ?", (keep.get("username"),)).fetchone():
+                                continue
                         db.execute(f"INSERT INTO {t} ({', '.join(keep)}) VALUES ({', '.join('?' * len(keep))})",
                                    list(keep.values()))
             # Files: only regular files under files/, never outside the data folder.
@@ -568,7 +661,7 @@ def linkify(text):
 
 
 def page(title, body, active="", review_count=0):
-    tabs = [("/", "Dashboard"), ("/backlog", "Backlog"), ("/done", "Done"), ("/new", "New ticket")]
+    tabs = [("/", "Dashboard"), ("/backlog", "Backlog"), ("/done", "Done"), ("/new", "New ticket"), ("/users", "Users")]
     nav = "".join(f'<a href="{h}" class="{"on" if h == active else ""}">{esc(n)}'
                   f'{f"<span class=n>{review_count}</span>" if h == "/" and review_count else ""}</a>' for h, n in tabs)
     return (f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
@@ -642,6 +735,52 @@ $('nf').onsubmit = async (e) => {{ e.preventDefault();
    status: $('nt-status').value, priority: +$('nt-prio').value, checklist_path: $('nt-ck').value || null}});
    location = '/t/' + t.id; }} catch (err) {{ fail(err); }} }};</script>"""
     return page("New ticket", body, "/new", len(store.tickets(["review"])))
+
+
+def render_users(store, me):
+    rows = []
+    for u in store.users():
+        state = '<span class="chip s-backlog">Disabled</span>' if u["disabled"] else ""
+        you = ' <span class="meta">(you)</span>' if u["username"].lower() == me.lower() else ""
+        seen = ago(u["last_seen"]) if u["last_seen"] else "never"
+        toggle = "Enable" if u["disabled"] else "Disable"
+        name = json.dumps(u["username"])
+        rows.append(f'<div class="item"><div style="min-width:0;flex:1"><b>{esc(u["username"])}</b>{you} '
+                    f'<span class="chip {"s-in_progress" if u["kind"] == "human" else "s-ready"}">{u["kind"]}</span> {state}'
+                    f'<div class="meta">added {when(u["created_at"])}{" by " + esc(u["created_by"]) if u["created_by"] else ""}'
+                    f' · last seen {seen}</div></div><div class="row">'
+                    f"<button onclick='newToken({esc(name)})'>New token</button>"
+                    f"<button onclick='toggleUser({esc(name)}, {str(not u['disabled']).lower()})'>{toggle}</button></div></div>")
+    body = f"""<h1>Users</h1>
+<p class="meta">Humans can do anything, including managing users. Agents use the API: they can move tickets between
+Ready, In progress and Needs review, and comment. Each user has their own token; only a hash of it is stored, so a
+token is shown once, when it's made. Give agents theirs as <code>Authorization: Bearer &lt;token&gt;</code>.</p>
+<div id="tok" class="box" hidden style="margin-bottom:14px;border-color:var(--ready)"><b id="tokwho"></b>
+<p class="meta">Copy it now: it won't be shown again.</p><div class="row"><input type="text" id="tokval" readonly>
+<button class="primary" onclick="copyTok()">Copy</button></div></div>
+<div class="list">{"".join(rows)}</div>
+<h2>Add a user</h2><form class="row box" id="uf"><input type="text" id="uname" placeholder="name, e.g. builder"
+ aria-label="Username" style="flex:1;min-width:160px" required><select id="ukind" style="width:auto" aria-label="Kind">
+ <option value="agent">Agent</option><option value="human">Human</option></select><button class="primary">Add</button></form>
+<script>
+const $ = (id) => document.getElementById(id);
+function showTok(who, token) {{ $('tok').hidden = false; $('tokwho').textContent = 'Token for ' + who; $('tokval').value = token;
+  $('tokval').select(); window.scrollTo(0, 0); }}
+async function copyTok() {{ try {{ await navigator.clipboard.writeText($('tokval').value); }} catch (e) {{ $('tokval').select(); }} }}
+async function newToken(name) {{
+  if (!confirm('Give ' + name + ' a new token? Their current one stops working immediately.')) return;
+  try {{ const r = await api('POST', '/api/users/' + encodeURIComponent(name) + '/token'); showTok(name, r.token); }} catch (e) {{ fail(e); }}
+}}
+async function toggleUser(name, disable) {{
+  try {{ await api('PATCH', '/api/users/' + encodeURIComponent(name), {{disabled: disable}}); location.reload(); }} catch (e) {{ fail(e); }}
+}}
+$('uf').onsubmit = async (e) => {{ e.preventDefault();
+  try {{ const r = await api('POST', '/api/users', {{username: $('uname').value.trim(), kind: $('ukind').value}});
+    showTok(r.user.username + ' (' + r.user.kind + ')', r.token); $('uname').value = '';
+    const note = document.createElement('p'); note.className = 'meta'; note.textContent = 'Reload to see them in the list.';
+    $('tok').appendChild(note); }} catch (err) {{ fail(err); }} }};
+</script>"""
+    return page("Users", body, "/users", len(store.tickets(["review"])))
 
 
 def render_attachment(a):
@@ -759,9 +898,9 @@ document.getElementById('ef').onsubmit = async (e) => {{
 
 API_DOCS = """# Agent tickets API
 
-Send your key with every request: `Authorization: Bearer <agent key>`.
-Name yourself with `X-Agent: <name>` (shown on your comments and changes).
-JSON in, JSON out. Ticket ids are four or five letters, like `KAMI`
+Send your token with every request: `Authorization: Bearer <token>`.
+The token is who you are: your username goes on your comments and
+changes (`GET /api/me` shows it). JSON in, JSON out. Ticket ids are four or five letters, like `KAMI`
 (any case).
 
 ## Statuses
@@ -781,7 +920,12 @@ GET   /api/tickets/ID           ticket with comments, attachments, events, check
 POST  /api/tickets              {"title", "description", "priority": 1|2|3, "checklist_path"}  (lands in backlog)
 PATCH /api/tickets/ID           any of {"status", "title", "description", "priority", "checklist_path"}
 POST  /api/tickets/ID/comments  {"body": "..."}  -> {"id": comment id, ...}
-GET   /api/export               (human key only) a backup: .tar.gz of export.json + files
+GET   /api/me                   {"username", "kind"}
+GET   /api/export               (humans only) a backup: .tar.gz of export.json + files
+GET   /api/users                (humans only) list users
+POST  /api/users                (humans only) {"username", "kind": "agent"|"human"} -> {"user", "token"}
+POST  /api/users/NAME/token     (humans only) a new token; the old one stops working
+PATCH /api/users/NAME           (humans only) {"disabled": true|false}
 POST  /api/tickets/ID/attachments?filename=demo.mp4[&comment_id=N]
                                 raw file bytes as the body, with its Content-Type
                                 (images, audio and video play in the page)
@@ -797,12 +941,12 @@ POST  /api/tickets/ID/attachments?filename=demo.mp4[&comment_id=N]
    comment saying where you got to, or release it back to ready.
 
 ## Example
-curl -s -H "Authorization: Bearer $KEY" -H "X-Agent: builder" "$URL/api/next?claim=1"
-curl -s -H "Authorization: Bearer $KEY" -H "X-Agent: builder" -H "Content-Type: application/json" \\
+curl -s -H "Authorization: Bearer $TOKEN" "$URL/api/next?claim=1"
+curl -s -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \\
      -d '{"body": "Tests pass. Recording attached."}' $URL/api/tickets/KAMI/comments
-curl -s -H "Authorization: Bearer $KEY" -H "X-Agent: builder" -H "Content-Type: video/mp4" \\
+curl -s -H "Authorization: Bearer $TOKEN" -H "Content-Type: video/mp4" \\
      --data-binary @demo.mp4 "$URL/api/tickets/KAMI/attachments?filename=demo.mp4&comment_id=12"
-curl -s -X PATCH -H "Authorization: Bearer $KEY" -H "X-Agent: builder" -H "Content-Type: application/json" \\
+curl -s -X PATCH -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \\
      -d '{"status": "review"}' $URL/api/tickets/KAMI
 """
 
@@ -820,7 +964,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # --- auth
     def who(self, query):
-        keys = self.server.keys
+        """(kind, username, came as a Bearer header) for the request's token."""
         given = None
         auth = self.headers.get("Authorization", "")
         if auth.startswith("Bearer "):
@@ -832,11 +976,10 @@ class Handler(BaseHTTPRequestHandler):
             given = c.value if c else None
         if not given:
             return None, None, False
-        for role in ("human", "agent"):
-            if hmac.compare_digest(given, keys[role]):
-                name = self.server.human_name if role == "human" else (self.headers.get("X-Agent") or "agent").strip()[:40] or "agent"
-                return role, name, auth.startswith("Bearer ")
-        return None, None, False
+        u = self.server.store.user_by_token(given)
+        if not u:
+            return None, None, False
+        return u["kind"], u["username"], auth.startswith("Bearer ")
 
     # --- responses
     def send(self, code, body, ctype, extra=None):
@@ -893,9 +1036,9 @@ class Handler(BaseHTTPRequestHandler):
             role, actor, bearer = self.who(query)
             if role is None:
                 if path.startswith("/api") or path.startswith("/files"):
-                    raise ApiError(401, "missing or wrong key (Authorization: Bearer <key>)")
+                    raise ApiError(401, "missing, wrong or disabled token (Authorization: Bearer <token>)")
                 return self.send(401, page("Locked", "<h1>Locked</h1><p>Open this page once with "
-                                           "<code>?key=…</code> (the human key) to sign in.</p>"), "text/html; charset=utf-8")
+                                           "<code>?key=…</code> (your token) to sign in.</p>"), "text/html; charset=utf-8")
             if "key" in query and method == "GET" and not path.startswith("/api"):
                 # Trade the key in the URL for a cookie, then drop it from the address bar.
                 secure = "; Secure" if self.headers.get("X-Forwarded-Proto") == "https" else ""
@@ -919,9 +1062,35 @@ class Handler(BaseHTTPRequestHandler):
                 return self.html(render_ticket(store, tm.group(1)))
             if method == "GET" and (fm := re.fullmatch(r"/files/(\d+)/[^/]*", path)):
                 return self.serve_file(store.attachment(int(fm.group(1))))
+            um = re.fullmatch(r"/api/users(?:/([^/]+))?(/token)?", path)
+            if method == "GET" and path == "/users":
+                if role != "human":
+                    raise ApiError(403, "only humans manage users")
+                return self.html(render_users(store, actor))
+            if method == "GET" and path == "/api/me":
+                return self.json(200, {"username": actor, "kind": role})
+            if um:
+                if role != "human":
+                    raise ApiError(403, "only humans manage users")
+                name, tok = um.group(1), um.group(2)
+                if not name and method == "GET":
+                    return self.json(200, {"users": store.users()})
+                if not name and method == "POST":
+                    d = self.body_json()
+                    user, token = store.add_user(d.get("username"), d.get("kind") or "agent", actor)
+                    return self.json(201, {"user": user, "token": token})
+                if name and tok and method == "POST":
+                    return self.json(200, {"user": store.user(name), "token": store.new_user_token(name)})
+                if name and not tok and method == "PATCH":
+                    d = self.body_json()
+                    if "disabled" not in d:
+                        raise ApiError(400, 'send {"disabled": true} or {"disabled": false}')
+                    return self.json(200, store.set_disabled(name, bool(d["disabled"])))
+                if name and not tok and method == "GET":
+                    return self.json(200, store.user(name))
             if method == "GET" and path == "/api/export":
                 if role != "human":
-                    raise ApiError(403, "only the human key can export")
+                    raise ApiError(403, "only humans can export")
                 return self.serve_export()
             if method == "GET" and path == "/api":
                 return self.send(200, API_DOCS, "text/markdown; charset=utf-8")
@@ -1034,9 +1203,8 @@ def make_server(host, port, data_dir, checklist_roots, max_upload_mb=1024, human
     srv = ThreadingHTTPServer((host, port), Handler)
     srv.daemon_threads = True
     srv.store = Store(data_dir, checklist_roots)
-    srv.keys = load_keys(data_dir)
+    srv.migrated = migrate_keys(srv.store, human_name)
     srv.max_upload = max_upload_mb << 20
-    srv.human_name = human_name
     return srv
 
 
@@ -1050,8 +1218,13 @@ def main():
                     help="a folder checklist files may live in (repeatable; default: your home folder)")
     ap.add_argument("--max-upload-mb", type=int, default=int(os.environ.get("AT_MAX_UPLOAD_MB", 1024)))
     ap.add_argument("--human-name", default=os.environ.get("AT_HUMAN", "human"),
-                    help="your name on comments and changes you make in the web pages")
-    ap.add_argument("--keys", action="store_true", help="print the access keys and exit")
+                    help="upgrading from the old two-key setup: the username the human key becomes")
+    ap.add_argument("--add-user", metavar="NAME", help="add a user, print their token, and exit")
+    ap.add_argument("--kind", choices=KINDS, default="agent", help="with --add-user: human or agent (default agent)")
+    ap.add_argument("--new-token", metavar="NAME", help="give a user a new token (the old one stops working) and exit")
+    ap.add_argument("--disable", metavar="NAME", help="disable a user and exit")
+    ap.add_argument("--enable", metavar="NAME", help="re-enable a user and exit")
+    ap.add_argument("--list-users", action="store_true", help="list users and exit")
     ap.add_argument("--export", metavar="PATH",
                     help="back up everything to PATH (a .tar.gz), or into PATH/ as agent-tickets-<time>.tar.gz, and exit")
     ap.add_argument("--keep", type=int, default=30, help="with --export to a folder: backups to keep (default 30)")
@@ -1071,14 +1244,32 @@ def main():
             sys.exit(f"Import failed: {e}")
         print(f"Restored from {a.import_}: " + ", ".join(f"{n} {t}" for t, n in counts.items()))
         return
-    if a.keys:
-        k = load_keys(a.data)
-        print(f"human (web pages, full control): {k['human']}\nagent (API):                    {k['agent']}")
+    if a.add_user or a.new_token or a.disable or a.enable or a.list_users:
+        store = Store(a.data, roots)
+        migrate_keys(store, a.human_name)
+        try:
+            if a.add_user:
+                u, token = store.add_user(a.add_user, a.kind, "command line")
+                print(f"Added {u['kind']} {u['username']}. Their token (shown once):\n{token}")
+            elif a.new_token:
+                print(f"New token for {a.new_token} (the old one no longer works):\n{store.new_user_token(a.new_token)}")
+            elif a.disable or a.enable:
+                u = store.set_disabled(a.disable or a.enable, bool(a.disable))
+                print(f"{u['username']} is now {'disabled' if u['disabled'] else 'enabled'}")
+            else:
+                for u in store.users():
+                    seen = when(u["last_seen"]) if u["last_seen"] else "never"
+                    print(f"{u['username']:24} {u['kind']:6} {'disabled' if u['disabled'] else 'active':9} last seen {seen}")
+        except ApiError as e:
+            sys.exit(e.msg)
         return
     srv = make_server(a.host, a.port, a.data, roots, a.max_upload_mb, a.human_name)
     print(f"agent-tickets on http://{a.host}:{a.port}  data: {Path(a.data).resolve()}  checklists under: {', '.join(roots)}",
           flush=True)
-    print("keys: python3 agent_tickets.py --keys", flush=True)
+    if srv.migrated:
+        print(f"Turned the old keys.json into users: {', '.join(srv.migrated)} (same tokens).", flush=True)
+    if not srv.store.users():
+        print("No users yet. Add yourself: python3 agent_tickets.py --add-user NAME --kind human", flush=True)
     srv.serve_forever()
 
 

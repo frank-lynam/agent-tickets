@@ -20,15 +20,40 @@ No dependencies to install.
 
 Agents can't set Backlog or Done, and can only comment on tickets in them.
 
+## Users and tokens
+
+Every user has a username, a kind (**human** or **agent**) and their own
+token, which is who they are: the username goes on their comments and
+changes. Humans can do everything, including adding users of either kind,
+issuing new tokens (the old one stops working at once) and disabling users
+(never the last active human). Agents can only work tickets, as above.
+
+Only a hash of each token is stored (not in the database, not in backups),
+so a token is shown once, when it's made. Lost one? Issue a new one.
+
+```bash
+python3 agent_tickets.py --add-user frank --kind human     # the first human: prints their token
+python3 agent_tickets.py --add-user builder                # an agent (the default kind)
+python3 agent_tickets.py --list-users
+python3 agent_tickets.py --new-token builder               # replace a token
+python3 agent_tickets.py --disable builder                 # and --enable
+```
+
+After that, humans can do the same from the **Users** page. Agents send
+`Authorization: Bearer <token>`; humans open any page once with
+`?key=<token>` and a cookie keeps them signed in.
+
+Run the server under its own system account so agents can't read its data
+folder; hand each agent only its own token.
+
 ## Run it
 
 ```bash
 python3 agent_tickets.py                 # http://127.0.0.1:43917, data in ./data
-python3 agent_tickets.py --keys          # print the two access keys
+python3 agent_tickets.py --add-user NAME --kind human   # once, for yourself
 ```
 
-Open `http://127.0.0.1:43917/?key=<human key>` once; a cookie keeps you
-signed in. Give agents the **agent** key.
+Then open `http://127.0.0.1:43917/?key=<your token>`.
 
 | Option | Default | |
 |---|---|---|
@@ -37,7 +62,7 @@ signed in. Give agents the **agent** key.
 | `--data` / `AT_DATA` | `./data` | database, uploaded files, `keys.json` |
 | `--checklist-root` | your home folder | folders checklist files may be read from (repeatable) |
 | `--max-upload-mb` | `1024` | per file |
-| `--human-name` / `AT_HUMAN` | `human` | your name on comments and changes |
+| `--human-name` / `AT_HUMAN` | `human` | only when upgrading from the old two-key setup: the username the human key becomes |
 
 As a service (systemd user unit, starts at boot when lingering is on):
 
@@ -86,7 +111,7 @@ They're on the same disk as the data, so copy them somewhere else too.
 `GET /api` returns the API docs as Markdown: point an agent at it. In short:
 
 ```bash
-curl -H "Authorization: Bearer $AGENT_KEY" -H "X-Agent: builder" "$URL/api/next?claim=1"   # take the next ready ticket
+curl -H "Authorization: Bearer $TOKEN" "$URL/api/next?claim=1"                           # take the next ready ticket
 curl ... -d '{"body": "..."}' "$URL/api/tickets/KAMI/comments"                            # report progress
 curl ... -H "Content-Type: video/mp4" --data-binary @demo.mp4 \
      "$URL/api/tickets/KAMI/attachments?filename=demo.mp4&comment_id=12"                   # attach a recording
