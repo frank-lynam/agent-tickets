@@ -800,10 +800,42 @@ CSS = """
 :root{--bg:#f6f5f1;--panel:#fff;--ink:#1f2328;--dim:#646b73;--line:#e2dfd7;--accent:#3a5bd9;--accent-ink:#fff;
 --review:#b5480f;--review-bg:#fdf0e7;--prog:#3a5bd9;--prog-bg:#edf1fd;--ready:#1d7a55;--ready-bg:#e8f6ef;
 --back:#6b6f76;--back-bg:#efeeea;--done:#4b5563;--done-bg:#eceff2;--agent:#6d4bd1;color-scheme:light}
-@media (prefers-color-scheme:dark){:root{--bg:#15171a;--panel:#1d2024;--ink:#e6e8eb;--dim:#9aa1aa;--line:#2c3036;
+@media (prefers-color-scheme:dark){:root:not([data-theme]){--bg:#15171a;--panel:#1d2024;--ink:#e6e8eb;--dim:#9aa1aa;--line:#2c3036;
 --accent:#7d97f5;--accent-ink:#0e1530;--review:#f29a63;--review-bg:#3a2417;--prog:#8ea6f7;--prog-bg:#1e2742;
 --ready:#62d1a1;--ready-bg:#16302a;--back:#aab0b8;--back-bg:#26292e;--done:#b8c0ca;--done-bg:#262b31;--agent:#b39cf7;
 color-scheme:dark}}
+:root[data-theme=dark]{--bg:#15171a;--panel:#1d2024;--ink:#e6e8eb;--dim:#9aa1aa;--line:#2c3036;
+--accent:#7d97f5;--accent-ink:#0e1530;--review:#f29a63;--review-bg:#3a2417;--prog:#8ea6f7;--prog-bg:#1e2742;
+--ready:#62d1a1;--ready-bg:#16302a;--back:#aab0b8;--back-bg:#26292e;--done:#b8c0ca;--done-bg:#262b31;--agent:#b39cf7;
+color-scheme:dark}
+/* Goth rave: black-violet, hot magenta, UV cyan, acid green, a strobe's afterglow. */
+:root[data-theme=goth]{--bg:#09060d;--panel:#130c1b;--ink:#f3e8ff;--dim:#a993c4;--line:#2f1d42;
+--accent:#ff2bd6;--accent-ink:#14000f;--review:#ff3d7f;--review-bg:#3a0a22;--prog:#29e7ff;--prog-bg:#062a33;
+--ready:#b4ff39;--ready-bg:#1d2e06;--back:#c3a9e3;--back-bg:#21142f;--done:#8f7aa8;--done-bg:#1a1124;--agent:#c77dff;
+--glow:0 0 10px rgba(255,43,214,.55),0 0 26px rgba(255,43,214,.2);color-scheme:dark}
+:root[data-theme=goth] body{background:radial-gradient(1200px 600px at 85% -10%,#2a0b3a 0%,transparent 60%),
+radial-gradient(900px 500px at -10% 110%,#06283a 0%,transparent 55%),var(--bg);background-attachment:fixed}
+:root[data-theme=goth] header.top{background:rgba(19,12,27,.92);border-bottom:1px solid transparent;
+border-image:linear-gradient(90deg,#ff2bd6,#8a3dff,#29e7ff) 1}
+:root[data-theme=goth] header.top b{color:#ff2bd6;text-shadow:var(--glow);letter-spacing:.08em;text-transform:uppercase}
+:root[data-theme=goth] h1{text-shadow:0 0 14px rgba(199,125,255,.45)}
+:root[data-theme=goth] h2{color:#29e7ff;text-shadow:0 0 8px rgba(41,231,255,.35)}
+:root[data-theme=goth] nav a.on{background:#24113a;color:#ff2bd6;box-shadow:inset 0 -2px 0 #ff2bd6}
+:root[data-theme=goth] nav .n{background:#ff2bd6;color:#14000f;box-shadow:var(--glow)}
+:root[data-theme=goth] button.primary{box-shadow:var(--glow)}
+:root[data-theme=goth] button.primary:hover{background:#ff5ce0}
+:root[data-theme=goth] .card:hover,:root[data-theme=goth] .list .item:hover{border-color:#ff2bd6;box-shadow:var(--glow)}
+:root[data-theme=goth] .chip,:root[data-theme=goth] .tag{box-shadow:0 0 8px -2px currentColor;text-shadow:0 0 6px currentColor}
+:root[data-theme=goth] .bar{background:#24113a}
+:root[data-theme=goth] .bar i{background:linear-gradient(90deg,#ff2bd6,#8a3dff,#29e7ff);box-shadow:0 0 10px #8a3dff}
+:root[data-theme=goth] .c.agent{border-left-color:#c77dff;box-shadow:-4px 0 14px -6px #c77dff}
+:root[data-theme=goth] .id{color:#29e7ff}
+:root[data-theme=goth] ::selection{background:#ff2bd6;color:#14000f}
+:root[data-theme=goth] *{scrollbar-color:#5b2a7a var(--bg)}
+input[type=file]{color:var(--dim);font-size:13px;max-width:100%}
+input[type=file]::file-selector-button{font:600 13px system-ui,sans-serif;padding:6px 12px;margin-right:8px;border-radius:7px;
+border:1px solid var(--line);background:var(--panel);color:var(--ink);cursor:pointer}
+.theme{margin-left:auto;width:auto;padding:4px 8px;font-size:13px}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
 a{color:var(--accent)}
@@ -873,6 +905,14 @@ dl.kv dt{color:var(--dim)}dl.kv dd{margin:0;overflow-wrap:anywhere}
 """
 
 JS = """
+(function(){ try { const t = localStorage.getItem('at-theme'); if (t) document.documentElement.dataset.theme = t; } catch (e) {} })();
+function setTheme(t){
+  if (t) document.documentElement.dataset.theme = t; else delete document.documentElement.dataset.theme;
+  try { t ? localStorage.setItem('at-theme', t) : localStorage.removeItem('at-theme'); } catch (e) {}
+}
+document.addEventListener('DOMContentLoaded', () => {
+  const sel = document.getElementById('theme'); if (sel) sel.value = document.documentElement.dataset.theme || '';
+});
 async function api(method, url, body){
   const r = await fetch(url, {method, headers: {'Content-Type':'application/json','X-Tickets':'1'},
     body: body === undefined ? undefined : JSON.stringify(body), credentials: 'same-origin'});
@@ -926,7 +966,10 @@ def page(title, body, active="", review_count=0):
     return (f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} · Agent tickets</title>'
             f'<style>{CSS}</style><script>{JS}</script></head><body>'
-            f'<header class="top"><b>Agent tickets</b><nav>{nav}</nav></header><main>{body}</main></body></html>')
+            f'<header class="top"><b>Agent tickets</b><nav>{nav}</nav>'
+            f'<select id="theme" class="theme" aria-label="Theme" onchange="setTheme(this.value)">'
+            f'<option value="">Auto</option><option value="light">Light</option><option value="dark">Dark</option>'
+            f'<option value="goth">Goth rave</option></select></header><main>{body}</main></body></html>')
 
 
 def card(t):

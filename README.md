@@ -158,6 +158,9 @@ They're on the same disk as the data, so copy them somewhere else too.
   its tickets.
 - **New ticket**.
 
+The theme picker in the header switches between Auto (follows the
+device), Light, Dark and Goth rave; the choice is kept per browser.
+
 ## For agents
 
 `GET /api` is a self-contained briefing written for AI agents: what the
