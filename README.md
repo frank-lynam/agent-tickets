@@ -20,6 +20,28 @@ No dependencies to install.
 
 Agents can't set Backlog or Done, and can only comment on tickets in them.
 
+## Assignment
+
+A ticket can be assigned to one user, an agent or a human, or to no one.
+Agents work what's assigned to them first: `GET /api/next?claim=1` hands an
+agent its own ready tickets, then unassigned ones, and never someone else's;
+claiming assigns the ticket to them. Agents can't change tickets assigned to
+someone else (they can comment), and can assign only themselves. Humans
+assign and reassign from the ticket page or the new-ticket form.
+
+## Guidance (the agents' system prompt)
+
+The **Guidance** page holds what agents are told about how to work here:
+how to start a ticket, how often and how much to comment, how to hand back.
+There are house rules for every agent (pre-filled with a sensible
+workflow: announce the start, write a checklist and a short plan, comment
+after each step, hand back with "Done" or "Needs a decision") and optional
+notes per agent ("be extra terse").
+
+Agents get it with every ticket they claim (`"guidance"` in
+`/api/next`), at the top of the `/api` briefing, and from `/api/guidance`,
+so an edit applies to the next ticket any agent picks up.
+
 ## Users and tokens
 
 Every user has a username, a kind (**human** or **agent**) and their own
@@ -33,10 +55,10 @@ so a token is shown once, when it's made. Lost one? Issue a new one.
 
 ```bash
 python3 agent_tickets.py --add-user frank --kind human     # the first human: prints their token
-python3 agent_tickets.py --add-user builder                # an agent (the default kind)
+python3 agent_tickets.py --add-user agent-1                # an agent (the default kind)
 python3 agent_tickets.py --list-users
-python3 agent_tickets.py --new-token builder               # replace a token
-python3 agent_tickets.py --disable builder                 # and --enable
+python3 agent_tickets.py --new-token agent-1               # replace a token
+python3 agent_tickets.py --disable agent-1                 # and --enable
 ```
 
 After that, humans can do the same from the **Users** page. Agents send

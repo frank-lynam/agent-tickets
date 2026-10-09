@@ -288,7 +288,8 @@ class TicketsTest(unittest.TestCase):
         tok = r["token"]
         self.assertTrue(tok.startswith("at_"))
         me = self.j("GET", "/api/me", role=None, token=tok)[1]
-        self.assertEqual(me, {"username": "builder-2", "kind": "agent"})
+        self.assertEqual((me["username"], me["kind"]), ("builder-2", "agent"))
+        self.assertIn("How we work", me["guidance"])
         # Identity comes from the token: the old X-Agent header changes nothing.
         t = self.j("POST", "/api/tickets", {"title": "from builder-2"}, role=None, token=tok,
                    headers={"X-Agent": "someone-else"})[1]
@@ -364,6 +365,79 @@ class TicketsTest(unittest.TestCase):
         self.assertIn("<html", self.call("GET", "/", role="human")[1].decode())
         # Errors point at the briefing.
         self.assertIn("GET /api", self.j("GET", "/api/tickets", role=None)[1]["error"])
+
+    # --- assignment
+    def test_assignment(self):
+        a1 = self.j("POST", "/api/users", {"username": "agent-a", "kind": "agent"}, role="human")[1]["token"]
+        a2 = self.j("POST", "/api/users", {"username": "agent-b", "kind": "agent"}, role="human")[1]["token"]
+        # Clear the queue so only this test's tickets are ready.
+        for t in self.j("GET", "/api/tickets?status=ready", role="human")[1]["tickets"]:
+            self.j("PATCH", f"/api/tickets/{t['id']}", {"status": "backlog"}, role="human")
+        for_b = self.new("ready", priority=1, title="for b", assignee="agent-b")
+        loose = self.new("ready", priority=3, title="anyone")
+        for_a = self.new("ready", priority=3, title="for a", assignee="AGENT-A")
+        self.assertEqual(for_a["assignee"], "agent-a")  # stored with the user's own spelling
+        self.assertEqual(self.j("POST", "/api/tickets", {"title": "x", "assignee": "nobody"}, role="human")[0], 404)
+        # agent-a gets its own ticket first (despite lower priority), then the unassigned one, never b's.
+        n1 = self.j("GET", "/api/next?claim=1", role=None, token=a1)[1]
+        self.assertEqual(n1["ticket"]["id"], for_a["id"])
+        self.assertIn("How we work", n1["guidance"])
+        n2 = self.j("GET", "/api/next?claim=1", role=None, token=a1)[1]["ticket"]
+        self.assertEqual((n2["id"], n2["assignee"]), (loose["id"], "agent-a"))
+        self.assertIsNone(self.j("GET", "/api/next?claim=1", role=None, token=a1)[1]["ticket"])
+        # Someone else's ticket: comment yes, change no.
+        self.assertEqual(self.j("PATCH", f"/api/tickets/{for_b['id']}", {"status": "in_progress"}, role=None, token=a1)[0], 403)
+        self.assertEqual(self.j("POST", f"/api/tickets/{for_b['id']}/comments", {"body": "fyi"}, role=None, token=a1)[0], 201)
+        # Agents assign only themselves (or no one).
+        self.assertEqual(self.j("PATCH", f"/api/tickets/{n2['id']}", {"assignee": "agent-b"}, role=None, token=a1)[0], 403)
+        self.assertIsNone(self.j("PATCH", f"/api/tickets/{n2['id']}", {"assignee": None}, role=None, token=a1)[1]["assignee"])
+        # Starting an unassigned ticket assigns it.
+        self.assertEqual(self.j("PATCH", f"/api/tickets/{n2['id']}", {"status": "ready"}, role=None, token=a1)[0], 200)
+        started = self.j("PATCH", f"/api/tickets/{n2['id']}", {"status": "in_progress"}, role=None, token=a2)[1]
+        self.assertEqual(started["assignee"], "agent-b")
+        # Filters, the timeline and the briefing.
+        mine = self.j("GET", "/api/tickets?assignee=me", role=None, token=a2)[1]["tickets"]
+        self.assertEqual({t["id"] for t in mine}, {for_b["id"], n2["id"]})
+        self.assertIn("assigned it to <b>agent-b</b>", self.call("GET", f"/t/{for_b['id']}", role="human")[1].decode())
+        brief = self.call("GET", "/api", role=None, token=a2)[1].decode()
+        self.assertIn(f"{for_b['id']}: for b", brief)  # assigned and ready
+        self.assertIn(f"{n2['id']}: anyone", brief)    # in progress
+
+    def test_guidance(self):
+        tok = self.j("POST", "/api/users", {"username": "agent-g", "kind": "agent"}, role="human")[1]["token"]
+        self.assertEqual(self.j("PUT", "/api/guidance", {"guidance": "x"}, role=None, token=tok)[0], 403)
+        self.assertEqual(self.j("PUT", "/api/guidance", {"guidance": "## House\nComment after every step."}, role="human")[0], 200)
+        self.j("PATCH", "/api/users/agent-g", {"guidance": "Be extra terse."}, role="human")
+        g = self.j("GET", "/api/guidance", role=None, token=tok)[1]["guidance"]
+        self.assertIn("Comment after every step.", g)
+        self.assertIn("Be extra terse.", g)
+        # Other agents get the house rules without agent-g's notes.
+        self.assertNotIn("Be extra terse.", self.j("GET", "/api/guidance")[1]["guidance"])
+        brief = self.call("GET", "/api", role=None, token=tok)[1].decode()
+        self.assertLess(brief.index("Be extra terse."), brief.index("## Signing in"))  # up top
+        self.assertIn("Comment after every step.", self.call("GET", "/api", role=None)[1].decode())  # public too
+        html = self.call("GET", "/guidance", role="human")[1].decode()
+        self.assertIn("Be extra terse.", html)
+        self.assertEqual(self.call("GET", "/guidance", role=None, token=tok)[0], 403)
+        # Reset to the default.
+        self.j("PUT", "/api/guidance", {"guidance": None}, role="human")
+        self.assertIn("How we work", self.j("GET", "/api/guidance")[1]["guidance"])
+
+    def test_old_database_upgrades(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp) / "data"
+            data.mkdir()
+            import sqlite3
+            db = sqlite3.connect(data / "tickets.db")
+            db.executescript("""CREATE TABLE tickets (id TEXT PRIMARY KEY, title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+              status TEXT NOT NULL, priority INTEGER NOT NULL DEFAULT 2, checklist_path TEXT, created_by TEXT,
+              created_at REAL NOT NULL, updated_at REAL NOT NULL);
+              INSERT INTO tickets VALUES ('KAMI', 'old', '', 'ready', 2, NULL, 'frank', 1, 1);
+              PRAGMA user_version = 1;""")
+            db.close()
+            store = at.Store(data, [tmp])
+            self.assertIsNone(store.ticket("KAMI")["assignee"])
+            self.assertEqual(store.db().execute("PRAGMA user_version").fetchone()[0], at.SCHEMA_VERSION)
 
     # --- pages
     def test_pages_render(self):

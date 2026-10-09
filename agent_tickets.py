@@ -89,6 +89,7 @@ CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE COLLATE NOCASE,
   kind TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, created_by TEXT, created_at REAL NOT NULL,
   disabled INTEGER NOT NULL DEFAULT 0, last_seen REAL);
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
 CREATE INDEX IF NOT EXISTS tickets_status ON tickets(status, priority, created_at);
 CREATE INDEX IF NOT EXISTS comments_ticket ON comments(ticket_id, created_at);
 CREATE INDEX IF NOT EXISTS attachments_ticket ON attachments(ticket_id);
@@ -97,10 +98,26 @@ CREATE INDEX IF NOT EXISTS events_ticket ON events(ticket_id, at);
 
 
 # Bumped (with a migration in Store.__init__) whenever the tables change.
-SCHEMA_VERSION = 2
-TABLES = ("users", "tickets", "comments", "attachments", "events")
+SCHEMA_VERSION = 3
+TABLES = ("users", "settings", "tickets", "comments", "attachments", "events")
 KINDS = ("human", "agent")
 USERNAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,31}")
+
+
+# The house rules agents get with every ticket they claim and at the top of
+# the /api briefing. Humans edit it on the Guidance page; this is the start.
+DEFAULT_GUIDANCE = """## How we work
+
+1. When you take a ticket, first post a one-line comment: you're starting, and you'll write a checklist.
+2. Write a markdown checklist of the steps ("- [ ] step") in a file, set it as the ticket's checklist_path, and post a short plan: what you'll do, and how you'll know it's done.
+3. After each step, tick it off in the checklist and comment what you did and what happened, including errors and surprises.
+4. When something is visible (a page, a chart, a game), attach a screenshot or a short recording.
+5. Hand back with a comment that starts "Done" or "Needs a decision", then set the status to review.
+
+## How much to write
+
+Progress comments: one to three sentences per step. Save the detail for the hand-off comment. Don't paste long logs; attach them as files.
+"""
 
 
 def new_token():
@@ -131,7 +148,12 @@ class Store:
         self.write_lock = threading.Lock()
         db = self.db()
         db.executescript(SCHEMA)
-        # 1 -> 2 added the users table (created above).
+        # 1 -> 2 added the users table, 2 -> 3 the settings table (both
+        # created above), tickets.assignee and users.guidance (added here).
+        for table, col, decl in (("tickets", "assignee", "TEXT"), ("users", "guidance", "TEXT")):
+            if col not in {r[1] for r in db.execute(f"PRAGMA table_info({table})")}:
+                db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+        db.execute("CREATE INDEX IF NOT EXISTS tickets_assignee ON tickets(assignee, status)")
         if db.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
             db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
@@ -148,10 +170,10 @@ class Store:
     # --- users
     def users(self):
         return [dict(r) for r in self.db().execute(
-            "SELECT id, username, kind, created_by, created_at, disabled, last_seen FROM users ORDER BY kind, username")]
+            "SELECT id, username, kind, created_by, created_at, disabled, last_seen, guidance FROM users ORDER BY kind, username")]
 
     def user(self, username):
-        row = self.db().execute("SELECT id, username, kind, created_by, created_at, disabled, last_seen FROM users "
+        row = self.db().execute("SELECT id, username, kind, created_by, created_at, disabled, last_seen, guidance FROM users "
                                 "WHERE username = ?", (username,)).fetchone()
         if not row:
             raise ApiError(404, f"no user {username}")
@@ -194,6 +216,33 @@ class Store:
             db.execute("UPDATE users SET token_hash = ? WHERE id = ?", (token_hash(token), u["id"]))
         return token
 
+    # --- guidance
+    def setting(self, key, default=None):
+        row = self.db().execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else default
+
+    def set_setting(self, key, value):
+        with self.write_lock, self.db() as db:
+            db.execute("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                       (key, value))
+
+    def house_guidance(self):
+        return self.setting("guidance", DEFAULT_GUIDANCE)
+
+    def guidance_for(self, username):
+        """The house rules, plus this user's own notes if they have any."""
+        text = self.house_guidance().strip()
+        row = self.db().execute("SELECT guidance FROM users WHERE username = ?", (username,)).fetchone()
+        if row and (row["guidance"] or "").strip():
+            text += f"\n\n## Notes for you ({username})\n\n" + row["guidance"].strip()
+        return text
+
+    def set_user_guidance(self, username, text):
+        u = self.user(username)
+        with self.write_lock, self.db() as db:
+            db.execute("UPDATE users SET guidance = ? WHERE id = ?", ((text or "").strip() or None, u["id"]))
+        return self.user(username)
+
     def set_disabled(self, username, disabled):
         u = self.user(username)
         with self.write_lock:
@@ -212,7 +261,7 @@ class Store:
             raise ApiError(404, f"no ticket {tid}")
         return dict(row)
 
-    def tickets(self, statuses=None, q=None, limit=500, recent_first=False):
+    def tickets(self, statuses=None, q=None, limit=500, recent_first=False, assignee=None):
         sql, args = "SELECT t.*, (SELECT COUNT(*) FROM comments c WHERE c.ticket_id = t.id) AS comment_count, " \
                     "(SELECT COUNT(*) FROM attachments a WHERE a.ticket_id = t.id) AS attachment_count FROM tickets t", []
         where = []
@@ -222,6 +271,11 @@ class Store:
         if q:
             where.append("(t.id LIKE ? OR t.title LIKE ? OR t.description LIKE ?)")
             args += [f"%{q}%"] * 3
+        if assignee == "":
+            where.append("t.assignee IS NULL")
+        elif assignee:
+            where.append("t.assignee = ? COLLATE NOCASE")
+            args.append(assignee)
         if where:
             sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY updated_at DESC LIMIT ?" if recent_first else " ORDER BY priority, created_at LIMIT ?"
@@ -293,6 +347,12 @@ class Store:
         db.execute("INSERT INTO events (ticket_id, actor, role, field, old, new, at) VALUES (?,?,?,?,?,?,?)",
                    (tid, actor, role, field, None if old is None else str(old), None if new is None else str(new), now))
 
+    def _check_assignee(self, name):
+        """A real user's exact name, or None for unassigned."""
+        if name in (None, ""):
+            return None
+        return self.user(str(name))["username"]
+
     def create(self, data, actor, role):
         title = str(data.get("title") or "").strip()
         if not title:
@@ -305,31 +365,46 @@ class Store:
         priority = int(data.get("priority") or 2)
         if priority not in PRIORITIES:
             raise ApiError(400, "priority is 1 (high), 2 (normal) or 3 (low)")
+        if role == "agent" and data.get("assignee"):
+            raise ApiError(403, "agents can't assign new tickets; a human assigns them")
+        assignee = self._check_assignee(data.get("assignee"))
         now = time.time()
         with self.write_lock:
             db = self.db()
             tid = new_id(lambda x: db.execute("SELECT 1 FROM tickets WHERE id = ?", (x,)).fetchone())
             with db:
                 db.execute("INSERT INTO tickets (id, title, description, status, priority, checklist_path, created_by, "
-                           "created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                           "created_at, updated_at, assignee) VALUES (?,?,?,?,?,?,?,?,?,?)",
                            (tid, title, str(data.get("description") or ""), status, priority,
-                            data.get("checklist_path") or None, actor, now, now))
+                            data.get("checklist_path") or None, actor, now, now, assignee))
                 self._event(db, tid, actor, role, "created", None, status, now)
+                if assignee:
+                    self._event(db, tid, actor, role, "assignee", None, assignee, now)
         return self.ticket(tid)
 
     def update(self, tid, data, actor, role):
-        fields = {k: data[k] for k in ("title", "description", "status", "priority", "checklist_path") if k in data}
+        fields = {k: data[k] for k in ("title", "description", "status", "priority", "checklist_path", "assignee")
+                  if k in data}
         if not fields:
-            raise ApiError(400, "nothing to change (title, description, status, priority, checklist_path)")
+            raise ApiError(400, "nothing to change (title, description, status, priority, checklist_path, assignee)")
+        if "assignee" in fields:
+            fields["assignee"] = self._check_assignee(fields["assignee"])
         with self.write_lock:
             db = self.db()
             t = self.ticket(tid)
             if role == "agent":
                 if t["status"] in AGENT_LOCKED:
                     raise ApiError(403, f"ticket {t['id']} is {t['status']}: agents can only comment on it")
+                if t["assignee"] and t["assignee"].lower() != actor.lower():
+                    raise ApiError(403, f"ticket {t['id']} is assigned to {t['assignee']}: you can only comment on it")
                 if "status" in fields and fields["status"] not in AGENT_TARGETS:
-                    raise ApiError(403, "agents can set ready, in_progress or review; only the human moves "
+                    raise ApiError(403, "agents can set ready, in_progress or review; only humans move "
                                         "tickets to backlog or done")
+                if "assignee" in fields and fields["assignee"] and fields["assignee"].lower() != actor.lower():
+                    raise ApiError(403, "agents can assign a ticket to themselves or to no one; humans assign it to others")
+                # Starting an unassigned ticket makes it yours.
+                if fields.get("status") == "in_progress" and not t["assignee"] and "assignee" not in fields:
+                    fields["assignee"] = actor
             if "status" in fields and fields["status"] not in STATUSES:
                 raise ApiError(400, f"status must be one of {STATUSES}")
             if "title" in fields and not str(fields["title"]).strip():
@@ -352,18 +427,25 @@ class Store:
         return self.ticket(t["id"])
 
     def claim_next(self, actor, role, claim):
-        """The highest-priority, oldest ready ticket; with claim, moved to
-        in_progress in the same step so two agents never take the same one."""
+        """The next ready ticket for this user: assigned to them first, then
+        unassigned ones (never someone else's), highest priority and oldest
+        first. With claim, it moves to in_progress and is assigned to them in
+        the same step, so two agents never take the same one."""
         with self.write_lock:
             db = self.db()
-            row = db.execute("SELECT id FROM tickets WHERE status = 'ready' ORDER BY priority, created_at LIMIT 1").fetchone()
+            row = db.execute("SELECT id, assignee FROM tickets WHERE status = 'ready' AND "
+                             "(assignee IS NULL OR assignee = ? COLLATE NOCASE) "
+                             "ORDER BY assignee IS NULL, priority, created_at LIMIT 1", (actor,)).fetchone()
             if not row:
                 return None
             if claim:
                 now = time.time()
                 with db:
-                    db.execute("UPDATE tickets SET status = 'in_progress', updated_at = ? WHERE id = ?", (now, row["id"]))
+                    db.execute("UPDATE tickets SET status = 'in_progress', assignee = ?, updated_at = ? WHERE id = ?",
+                               (actor, now, row["id"]))
                     self._event(db, row["id"], actor, role, "status", "ready", "in_progress", now)
+                    if not row["assignee"]:
+                        self._event(db, row["id"], actor, role, "assignee", None, actor, now)
         return self.detail(row["id"])
 
     def comment(self, tid, body, actor, role):
@@ -529,7 +611,8 @@ def import_archive(store, src, replace=False):
                             keep.pop("id", None)
                             if db.execute("SELECT 1 FROM users WHERE username = ?", (keep.get("username"),)).fetchone():
                                 continue
-                        db.execute(f"INSERT INTO {t} ({', '.join(keep)}) VALUES ({', '.join('?' * len(keep))})",
+                        verb = "INSERT OR REPLACE" if t == "settings" else "INSERT"
+                        db.execute(f"{verb} INTO {t} ({', '.join(keep)}) VALUES ({', '.join('?' * len(keep))})",
                                    list(keep.values()))
             # Files: only regular files under files/, never outside the data folder.
             root = store.files.resolve()
@@ -563,7 +646,7 @@ body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-app
 a{color:var(--accent)}
 header.top{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:10px 16px;border-bottom:1px solid var(--line);background:var(--panel)}
 header.top b{margin-right:12px;font-size:15px}
-nav a{padding:6px 10px;border-radius:6px;text-decoration:none;color:var(--ink)}
+nav a{padding:6px 10px;border-radius:6px;text-decoration:none;color:var(--ink);white-space:nowrap;display:inline-block}
 nav a.on{background:var(--bg);font-weight:600}
 nav .n{display:inline-block;min-width:18px;padding:0 5px;margin-left:4px;border-radius:9px;background:var(--review);color:#fff;font-size:12px;text-align:center}
 main{max-width:1100px;margin:0 auto;padding:18px 16px 60px}
@@ -661,7 +744,8 @@ def linkify(text):
 
 
 def page(title, body, active="", review_count=0):
-    tabs = [("/", "Dashboard"), ("/backlog", "Backlog"), ("/done", "Done"), ("/new", "New ticket"), ("/users", "Users")]
+    tabs = [("/", "Dashboard"), ("/backlog", "Backlog"), ("/done", "Done"), ("/new", "New ticket"), ("/users", "Users"),
+            ("/guidance", "Guidance")]
     nav = "".join(f'<a href="{h}" class="{"on" if h == active else ""}">{esc(n)}'
                   f'{f"<span class=n>{review_count}</span>" if h == "/" and review_count else ""}</a>' for h, n in tabs)
     return (f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
@@ -680,6 +764,8 @@ def card(t):
     if t.get("attachment_count"):
         extras.append(f'{t["attachment_count"]} file{"s" if t["attachment_count"] != 1 else ""}')
     pr = '<span class="p1">High · </span>' if t["priority"] == 1 else ""
+    if t.get("assignee"):
+        extras.insert(0, f'<b>{esc(t["assignee"])}</b>')
     return (f'<a class="card" href="/t/{t["id"]}"><div class="row"><span class="id">{t["id"]}</span>'
             f'<span class="t">{esc(t["title"])}</span></div>'
             f'<div class="meta">{pr}updated {ago(t["updated_at"])}{" · " + " · ".join(extras) if extras else ""}</div>{snip}</a>')
@@ -720,19 +806,32 @@ def render_list(store, status, q):
     return page(title, body, "/" + status, len(store.tickets(["review"])))
 
 
+def assignee_options(store, current=None):
+    """<option>s for an assignee picker: no one, then active users."""
+    opts = ['<option value="">No one</option>']
+    for u in store.users():
+        if u["disabled"] and u["username"] != current:
+            continue
+        sel = " selected" if current and u["username"].lower() == current.lower() else ""
+        opts.append(f'<option value="{esc(u["username"])}"{sel}>{esc(u["username"])} ({u["kind"]})</option>')
+    return "".join(opts)
+
+
 def render_new(store):
     opts = "".join(f'<option value="{s}"{" selected" if s == "backlog" else ""}>{LABELS[s]}</option>' for s in STATUSES)
     body = f"""<h1>New ticket</h1><form class="stack box" id="nf">
 <label>Title<input type="text" id="nt-title" required></label>
 <label>Description<textarea id="nt-desc" rows="8"></textarea></label>
 <div class="row"><label>Status <select id="nt-status">{opts}</select></label>
-<label>Priority <select id="nt-prio"><option value="1">High</option><option value="2" selected>Normal</option><option value="3">Low</option></select></label></div>
+<label>Priority <select id="nt-prio"><option value="1">High</option><option value="2" selected>Normal</option><option value="3">Low</option></select></label>
+<label>Assign to <select id="nt-who">{assignee_options(store)}</select></label></div>
 <label>Checklist file (optional, a path on this machine)<input type="text" id="nt-ck" placeholder="/home/.../checklist.md"></label>
 <div><button class="primary">Create</button></div></form>
 <script>const $ = (id) => document.getElementById(id);
 $('nf').onsubmit = async (e) => {{ e.preventDefault();
  try {{ const t = await api('POST', '/api/tickets', {{title: $('nt-title').value, description: $('nt-desc').value,
-   status: $('nt-status').value, priority: +$('nt-prio').value, checklist_path: $('nt-ck').value || null}});
+   status: $('nt-status').value, priority: +$('nt-prio').value, checklist_path: $('nt-ck').value || null,
+   assignee: $('nt-who').value || null}});
    location = '/t/' + t.id; }} catch (err) {{ fail(err); }} }};</script>"""
     return page("New ticket", body, "/new", len(store.tickets(["review"])))
 
@@ -759,7 +858,7 @@ token is shown once, when it's made. Give agents theirs as <code>Authorization: 
 <p class="meta">Copy it now: it won't be shown again.</p><div class="row"><input type="text" id="tokval" readonly>
 <button class="primary" onclick="copyTok()">Copy</button></div></div>
 <div class="list">{"".join(rows)}</div>
-<h2>Add a user</h2><form class="row box" id="uf"><input type="text" id="uname" placeholder="name, e.g. builder"
+<h2>Add a user</h2><form class="row box" id="uf"><input type="text" id="uname" placeholder="name, e.g. agent-1"
  aria-label="Username" style="flex:1;min-width:160px" required><select id="ukind" style="width:auto" aria-label="Kind">
  <option value="agent">Agent</option><option value="human">Human</option></select><button class="primary">Add</button></form>
 <script>
@@ -781,6 +880,36 @@ $('uf').onsubmit = async (e) => {{ e.preventDefault();
     $('tok').appendChild(note); }} catch (err) {{ fail(err); }} }};
 </script>"""
     return page("Users", body, "/users", len(store.tickets(["review"])))
+
+
+def render_guidance(store):
+    agents = [u for u in store.users() if u["kind"] == "agent" and not u["disabled"]]
+    per = "".join(f'''<div class="box" style="margin-bottom:10px"><b>{esc(u["username"])}</b>
+<textarea class="ug" data-user="{esc(u["username"])}" rows="3" aria-label="Notes for {esc(u["username"])}"
+ placeholder="Extra notes just for {esc(u["username"])}, e.g. be extra terse; ask before deleting anything">{esc(u["guidance"] or "")}</textarea></div>'''
+                  for u in agents) or '<p class="empty">No active agents yet. Add them on the Users page.</p>'
+    body = f"""<h1>Guidance</h1>
+<p class="meta">What agents are told about how to work here: how to start a ticket, how often and how much to comment,
+how to hand back. They get it with every ticket they claim and at the top of <a href="/api">/api</a>, so a change
+applies to the next ticket any agent picks up. Markdown is fine.</p>
+<h2>House rules (every agent)</h2><form class="stack box" id="gf">
+<textarea id="house" rows="18" aria-label="House rules">{esc(store.house_guidance())}</textarea>
+<div class="row"><button class="primary">Save</button><button type="button" id="reset">Reset to the default</button>
+<span id="gmsg" class="meta"></span></div></form>
+<h2>Per agent</h2><p class="meta">Added after the house rules for that agent only.</p>{per}
+<div class="row"><button class="primary" id="saveper">Save agent notes</button><span id="pmsg" class="meta"></span></div>
+<script>
+const $ = (id) => document.getElementById(id);
+$('gf').onsubmit = async (e) => {{ e.preventDefault();
+  try {{ await api('PUT', '/api/guidance', {{guidance: $('house').value}}); $('gmsg').textContent = 'Saved.'; }} catch (err) {{ fail(err); }} }};
+$('reset').onclick = async () => {{ if (!confirm('Replace the house rules with the default text?')) return;
+  try {{ await api('PUT', '/api/guidance', {{guidance: null}}); location.reload(); }} catch (err) {{ fail(err); }} }};
+$('saveper').onclick = async () => {{
+  try {{ for (const t of document.querySelectorAll('.ug'))
+      await api('PATCH', '/api/users/' + encodeURIComponent(t.dataset.user), {{guidance: t.value}});
+    $('pmsg').textContent = 'Saved.'; }} catch (err) {{ fail(err); }} }};
+</script>"""
+    return page("Guidance", body, "/guidance", len(store.tickets(["review"])))
 
 
 def render_attachment(a):
@@ -819,6 +948,9 @@ def render_ticket(store, tid):
             text = f'{esc(e["actor"])} created it in {LABELS.get(e["new"], e["new"])}'
         elif e["field"] == "status":
             text = f'{esc(e["actor"])} moved it from {LABELS.get(e["old"], e["old"])} to <b>{LABELS.get(e["new"], e["new"])}</b>'
+        elif e["field"] == "assignee":
+            text = (f'{esc(e["actor"])} assigned it to <b>{esc(e["new"])}</b>' if e["new"]
+                    else f'{esc(e["actor"])} unassigned it')
         elif e["field"] == "description":
             text = f'{esc(e["actor"])} edited the description'
         else:
@@ -852,7 +984,8 @@ def render_ticket(store, tid):
                    for to, lbl, p in actions)
     move_opts = "".join(f'<option value="{x}">{LABELS[x]}</option>' for x in STATUSES if x != s)
     body = f"""<div class="row" style="margin-bottom:6px"><span class="id">{t['id']}</span>
-<span class="chip s-{s}">{LABELS[s]}</span>{'<span class="p1">High priority</span>' if t['priority'] == 1 else ''}</div>
+<span class="chip s-{s}">{LABELS[s]}</span>{'<span class="p1">High priority</span>' if t['priority'] == 1 else ''}
+<span class="meta">{'assigned to <b>' + esc(t['assignee']) + '</b>' if t['assignee'] else 'unassigned'}</span></div>
 <h1>{esc(t['title'])}</h1>
 <div class="row" style="margin-bottom:16px">{btns}</div>
 <div class="detail"><div>
@@ -865,6 +998,8 @@ def render_ticket(store, tid):
   <button class="primary" id="csend">Post</button></div></form>
 </div><aside>
  <h2 style="margin-top:0">Checklist</h2><div class="box">{ckhtml}</div>
+ <h2>Assigned to</h2><div class="box"><select id="who" aria-label="Assigned to"
+  onchange="assign(this.value)">{assignee_options(store, t['assignee'])}</select></div>
  <h2>Details</h2><div class="box"><dl class="kv"><dt>Priority</dt><dd>{PRIORITIES[t['priority']]}</dd>
   <dt>Created</dt><dd>{when(t['created_at'])} by {esc(t['created_by'])}</dd><dt>Updated</dt><dd>{ago(t['updated_at'])}</dd></dl>
   <details style="margin-top:10px"><summary>Edit</summary><form class="stack" id="ef" style="margin-top:8px">
@@ -887,6 +1022,8 @@ document.getElementById('cf').onsubmit = async (e) => {{
     location.reload();
   }} catch (err) {{ fail(err); btn.disabled = false; btn.textContent = 'Post'; }}
 }};
+async function assign(name) {{ try {{ await api('PATCH', '/api/tickets/' + TID, {{assignee: name || null}}); location.reload(); }}
+  catch (err) {{ fail(err); }} }}
 document.getElementById('ef').onsubmit = async (e) => {{
   e.preventDefault();
   try {{ await api('PATCH', '/api/tickets/' + TID, {{title: $('etitle').value, description: $('edesc').value,
@@ -925,16 +1062,23 @@ put it in comments or files.
   when you need a decision before you can go on.
 - **done**: a human approved it. Only humans set this.
 
+Tickets can be assigned to one user (an agent or a human). Work on tickets
+assigned to you; you may also take unassigned ready ones.
+
 Rules the server enforces: you can set ready, in_progress and review; you
-can't set backlog or done; you can't change backlog or done tickets except
-by commenting. You can always comment.
+can't set backlog or done; you can't change backlog or done tickets, or
+tickets assigned to someone else, except by commenting. You can assign a
+ticket to yourself or to no one, never to someone else. Starting an
+unassigned ticket assigns it to you. You can always comment.
 
 ## How to work a ticket
 
-1. `GET /api/next?claim=1`: takes the most important ready ticket (high
-   priority first, then oldest) and moves it to in_progress in the same
-   step, so two agents never get the same one. `{"ticket": null}` means
-   there's nothing to do.
+1. `GET /api/next?claim=1`: takes your next ready ticket (ones assigned
+   to you first, then unassigned ones; high priority first, then oldest),
+   moves it to in_progress and assigns it to you in the same step, so two
+   agents never get the same one. `{"ticket": null}` means there's nothing
+   to do. The response also has `"guidance"`: the current house rules for
+   you. Read it every time; humans change it.
 2. Read the whole ticket: `GET /api/tickets/ID` has the description, every
    comment (humans' replies included: they're instructions), the status
    history and the checklist.
@@ -962,14 +1106,16 @@ All JSON in and out, except file uploads (raw bytes) and this page.
 Ticket ids are four or five letters, like `KAMI`, in any case.
 
     GET   /api                       this briefing (no token needed)
-    GET   /api/me                    {"username", "kind"}
-    GET   /api/next                  next ready ticket, or {"ticket": null}
-    GET   /api/next?claim=1          ...and move it to in_progress
+    GET   /api/me                    {"username", "kind", "guidance"}
+    GET   /api/guidance              {"guidance": the house rules and any notes for you}
+    GET   /api/next                  your next ready ticket, or {"ticket": null}; plus "guidance"
+    GET   /api/next?claim=1          ...and move it to in_progress, assigned to you
     GET   /api/tickets               {"tickets": [...]}; filters: ?status=ready,in_progress  ?q=text
+                                     ?assignee=me (or a name, or "none")
     GET   /api/tickets/ID            one ticket, with comments, attachments, events, checklist
     POST  /api/tickets               {"title", "description", "priority": 1|2|3, "checklist_path"}
                                      -> the new ticket (always in backlog)
-    PATCH /api/tickets/ID            any of {"status", "title", "description", "priority", "checklist_path"}
+    PATCH /api/tickets/ID            any of {"status", "title", "description", "priority", "checklist_path", "assignee"}
     POST  /api/tickets/ID/comments   {"body": "..."} -> the comment, with its "id"
     POST  /api/tickets/ID/attachments?filename=demo.mp4&comment_id=N
                                      the file's raw bytes as the body, with its Content-Type;
@@ -981,13 +1127,13 @@ server's limit (1 GB by default).
 
 A ticket looks like:
 
-    {"id": "KAMI", "title": "...", "description": "...", "status": "in_progress",
+    {"id": "KAMI", "title": "...", "description": "...", "status": "in_progress", "assignee": "agent-1",
      "priority": 2, "checklist_path": "/home/me/work/plan.md", "created_by": "frank",
      "created_at": 1760000000.0, "updated_at": 1760000300.0,
      "comments": [{"id": 12, "author": "frank", "role": "human", "body": "...", "created_at": ...}],
      "attachments": [{"id": 3, "comment_id": 12, "filename": "demo.mp4", "mime": "video/mp4",
                       "size": 123456, "url": "/files/3/demo.mp4", ...}],
-     "events": [{"field": "status", "old": "ready", "new": "in_progress", "actor": "builder", "at": ...}],
+     "events": [{"field": "status", "old": "ready", "new": "in_progress", "actor": "agent-1", "at": ...}],
      "checklist": {"path": "...", "readable": true, "done": 2, "total": 5, "items": [...]}}
 
 Times are Unix seconds. Errors are `{"error": "what went wrong"}` with an
@@ -1015,22 +1161,32 @@ who you are and what's ready. You're set.
 def docs_for(store, actor, role):
     """The briefing, plus who's asking and what's waiting for them."""
     if not actor:
-        return API_DOCS
+        head = API_DOCS.split("\n## Signing in", 1)
+        return (head[0] + "\n## Guidance from your humans\n\nFollow this; it overrides the general advice below.\n\n"
+                + store.house_guidance().strip() + "\n\n## Signing in" + head[1])
     counts = {st: n for st, n in store.db().execute("SELECT status, COUNT(*) FROM tickets GROUP BY status")}
     # Tickets this user moved to in_progress most recently, and still in progress.
     mine = [dict(r) for r in store.db().execute(
-        "SELECT t.id, t.title FROM tickets t WHERE t.status = 'in_progress' AND "
-        "(SELECT e.actor FROM events e WHERE e.ticket_id = t.id AND e.field = 'status' AND e.new = 'in_progress' "
-        " ORDER BY e.at DESC, e.id DESC LIMIT 1) = ? ORDER BY t.priority, t.created_at", (actor,))]
+        "SELECT id, title FROM tickets WHERE status = 'in_progress' AND assignee = ? COLLATE NOCASE "
+        "ORDER BY priority, created_at", (actor,))]
+    queue = [dict(r) for r in store.db().execute(
+        "SELECT id, title FROM tickets WHERE status = 'ready' AND assignee = ? COLLATE NOCASE "
+        "ORDER BY priority, created_at", (actor,))]
     lines = [f"\n## Right now\n", f"You're signed in as **{actor}** ({role}).",
              f"Tickets: {counts.get('ready', 0)} ready, {counts.get('in_progress', 0)} in progress, "
              f"{counts.get('review', 0)} waiting for review, {counts.get('backlog', 0)} in the backlog."]
     if mine:
         lines.append("You have these in progress (start here):")
         lines += [f"- {t['id']}: {t['title']}" for t in mine]
-    elif role == "agent":
-        lines.append("You have nothing in progress. `GET /api/next?claim=1` takes the next ready ticket.")
-    return API_DOCS + "\n".join(lines) + "\n"
+    if queue:
+        lines.append("Assigned to you and ready:")
+        lines += [f"- {t['id']}: {t['title']}" for t in queue]
+    if not mine and not queue and role == "agent":
+        lines.append("Nothing is assigned to you. `GET /api/next?claim=1` takes the next unassigned ready ticket.")
+    guidance = store.guidance_for(actor)
+    head = API_DOCS.split("\n## Signing in", 1)
+    return (head[0] + "\n## Guidance from your humans\n\nFollow this; it overrides the general advice below.\n\n"
+            + guidance + "\n\n## Signing in" + head[1] + "\n".join(lines) + "\n")
 
 
 # --------------------------------------------------------------------------- HTTP
@@ -1109,6 +1265,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_PATCH(self):
         self.route("PATCH")
 
+    def do_PUT(self):
+        self.route("PUT")
+
     def route(self, method):
         url = urlsplit(self.path)
         query = parse_qs(url.query)
@@ -1159,7 +1318,24 @@ class Handler(BaseHTTPRequestHandler):
                     raise ApiError(403, "only humans manage users")
                 return self.html(render_users(store, actor))
             if method == "GET" and path == "/api/me":
-                return self.json(200, {"username": actor, "kind": role})
+                return self.json(200, {"username": actor, "kind": role, "guidance": store.guidance_for(actor)})
+            if path == "/api/guidance":
+                if method == "GET":
+                    return self.json(200, {"guidance": store.guidance_for(actor)})
+                if method == "PUT":
+                    if role != "human":
+                        raise ApiError(403, "only humans set the guidance")
+                    text = self.body_json().get("guidance")
+                    if text is None:
+                        store.db().execute("DELETE FROM settings WHERE key = 'guidance'")
+                        store.db().commit()
+                    else:
+                        store.set_setting("guidance", str(text))
+                    return self.json(200, {"guidance": store.house_guidance()})
+            if method == "GET" and path == "/guidance":
+                if role != "human":
+                    raise ApiError(403, "only humans set the guidance")
+                return self.html(render_guidance(store))
             if um:
                 if role != "human":
                     raise ApiError(403, "only humans manage users")
@@ -1174,9 +1350,13 @@ class Handler(BaseHTTPRequestHandler):
                     return self.json(200, {"user": store.user(name), "token": store.new_user_token(name)})
                 if name and not tok and method == "PATCH":
                     d = self.body_json()
-                    if "disabled" not in d:
-                        raise ApiError(400, 'send {"disabled": true} or {"disabled": false}')
-                    return self.json(200, store.set_disabled(name, bool(d["disabled"])))
+                    if "disabled" not in d and "guidance" not in d:
+                        raise ApiError(400, 'send {"disabled": true|false} and/or {"guidance": "notes for this user"}')
+                    if "guidance" in d:
+                        store.set_user_guidance(name, d["guidance"])
+                    if "disabled" in d:
+                        store.set_disabled(name, bool(d["disabled"]))
+                    return self.json(200, store.user(name))
                 if name and not tok and method == "GET":
                     return self.json(200, store.user(name))
             if method == "GET" and path == "/api/export":
@@ -1185,14 +1365,20 @@ class Handler(BaseHTTPRequestHandler):
                 return self.serve_export()
             if method == "GET" and path == "/api/next":
                 t = store.claim_next(actor, role, bool((query.get("claim") or [""])[0]))
-                return self.json(200, {"ticket": t})
+                return self.json(200, {"ticket": t, "guidance": store.guidance_for(actor)})
             if path == "/api/tickets":
                 if method == "GET":
                     st = [s for s in (query.get("status") or [""])[0].split(",") if s]
                     bad = [s for s in st if s not in STATUSES]
                     if bad:
                         raise ApiError(400, f"unknown status {bad}; statuses: {STATUSES}")
-                    return self.json(200, {"tickets": store.tickets(st or None, (query.get("q") or [""])[0] or None)})
+                    who = (query.get("assignee") or [None])[0]
+                    if who == "me":
+                        who = actor
+                    elif who == "none":
+                        who = ""
+                    return self.json(200, {"tickets": store.tickets(st or None, (query.get("q") or [""])[0] or None,
+                                                                    assignee=who)})
                 if method == "POST":
                     return self.json(201, store.create(self.body_json(), actor, role))
             if m:
