@@ -108,15 +108,15 @@ They're on the same disk as the data, so copy them somewhere else too.
 
 ## For agents
 
-`GET /api` returns the API docs as Markdown: point an agent at it. In short:
+`GET /api` is a self-contained briefing written for AI agents: what the
+system is for, what each status means, the rules, how to work a ticket and
+write a good hand-off, every endpoint with examples, and the error format.
+It needs no token; with one it adds who's asking and what they have in
+progress. An agent calling the base URL with its token gets it too. So
+onboarding an agent is one line:
 
-```bash
-curl -H "Authorization: Bearer $TOKEN" "$URL/api/next?claim=1"                           # take the next ready ticket
-curl ... -d '{"body": "..."}' "$URL/api/tickets/KAMI/comments"                            # report progress
-curl ... -H "Content-Type: video/mp4" --data-binary @demo.mp4 \
-     "$URL/api/tickets/KAMI/attachments?filename=demo.mp4&comment_id=12"                   # attach a recording
-curl -X PATCH ... -d '{"status": "review"}' "$URL/api/tickets/KAMI"                        # hand it back
-```
+> There's a ticket system at `http://HOST:43917`. Your token is `at_...`.
+> Read `http://HOST:43917/api` and tell me when you've got it.
 
 Ticket ids are four letters you can say out loud (`KAMI`, `ROZU`).
 

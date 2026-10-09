@@ -896,59 +896,141 @@ document.getElementById('ef').onsubmit = async (e) => {{
     return page(f"{t['id']} {t['title']}", body, "", len(store.tickets(["review"])))
 
 
-API_DOCS = """# Agent tickets API
+API_DOCS = """# Agent tickets: a briefing for AI agents
 
-Send your token with every request: `Authorization: Bearer <token>`.
-The token is who you are: your username goes on your comments and
-changes (`GET /api/me` shows it). JSON in, JSON out. Ticket ids are four or five letters, like `KAMI`
-(any case).
+This is a ticket tracker shared between you (an AI agent) and the humans you
+work for. Humans put work here; you pick it up, do it, report what you did
+with comments and files (screenshots, recordings, audio), and hand it back
+for review. Humans read it later, usually at the end of the day, and reply
+on the ticket. Treat it as your asynchronous channel to them: anything they
+should know goes in a comment on the ticket it's about.
 
-## Statuses
-backlog -> ready -> in_progress -> review -> done
+## Signing in
 
-- ready: cleared for you to work on.
-- in_progress: you're on it (partial progress counts; leave a comment).
-- review: you're done, or you need a decision. Say which in a comment.
-- backlog and done belong to the human: you can't set them, and you can
-  only comment on tickets in them.
+Every request needs your token: `Authorization: Bearer <token>`. A human
+gives it to you. The token is who you are: your username goes on your
+comments and changes. Check with `GET /api/me`. Don't share your token or
+put it in comments or files.
+
+## Statuses, and what each one means for you
+
+    backlog -> ready -> in_progress -> review -> done
+
+- **backlog**: ideas, not cleared for work. Don't work on these. You may
+  *file* new tickets here (things you noticed that need doing).
+- **ready**: cleared for work. Pick these up when you have time.
+- **in_progress**: someone is working on it. Move a ticket here when you
+  start it, so no one else takes it.
+- **review**: the humans' turn. Move a ticket here when it's finished, or
+  when you need a decision before you can go on.
+- **done**: a human approved it. Only humans set this.
+
+Rules the server enforces: you can set ready, in_progress and review; you
+can't set backlog or done; you can't change backlog or done tickets except
+by commenting. You can always comment.
+
+## How to work a ticket
+
+1. `GET /api/next?claim=1`: takes the most important ready ticket (high
+   priority first, then oldest) and moves it to in_progress in the same
+   step, so two agents never get the same one. `{"ticket": null}` means
+   there's nothing to do.
+2. Read the whole ticket: `GET /api/tickets/ID` has the description, every
+   comment (humans' replies included: they're instructions), the status
+   history and the checklist.
+3. Work. Comment at milestones and attach evidence (screenshots, short
+   recordings, logs).
+4. Optional: keep a markdown checklist file ("- [ ] step" / "- [x] step")
+   and point the ticket at it (`checklist_path`). Humans see it with a
+   progress bar.
+5. Hand back: post a comment, then `PATCH` the status to review. A good
+   hand-off comment says:
+   - **Done** or **Needs a decision** (first line, so it's clear which).
+   - What you did, and where (files, branches, commits).
+   - How to check it (what to open, run or look at; attach a screenshot
+     or recording).
+   - For a decision: the question, the options, and what you'd recommend.
+6. Stopping before you're finished: leave it in_progress with a comment
+   saying where you got to and what's next, or release it (`ready`) if
+   someone else should take it.
+7. After review a human may move it back to in_progress or ready with a
+   comment saying what to change. Read their comment first.
 
 ## Endpoints
-GET   /api/next                 next ready ticket (high priority, oldest first), or {"ticket": null}
-GET   /api/next?claim=1         ...and move it to in_progress in the same step
-GET   /api/tickets?status=ready,in_progress&q=text    list
-GET   /api/tickets/ID           ticket with comments, attachments, events, checklist
-POST  /api/tickets              {"title", "description", "priority": 1|2|3, "checklist_path"}  (lands in backlog)
-PATCH /api/tickets/ID           any of {"status", "title", "description", "priority", "checklist_path"}
-POST  /api/tickets/ID/comments  {"body": "..."}  -> {"id": comment id, ...}
-GET   /api/me                   {"username", "kind"}
-GET   /api/export               (humans only) a backup: .tar.gz of export.json + files
-GET   /api/users                (humans only) list users
-POST  /api/users                (humans only) {"username", "kind": "agent"|"human"} -> {"user", "token"}
-POST  /api/users/NAME/token     (humans only) a new token; the old one stops working
-PATCH /api/users/NAME           (humans only) {"disabled": true|false}
-POST  /api/tickets/ID/attachments?filename=demo.mp4[&comment_id=N]
-                                raw file bytes as the body, with its Content-Type
-                                (images, audio and video play in the page)
 
-## A work session
-1. `GET /api/next?claim=1` (or pick a ready ticket and PATCH it to in_progress).
-2. Read the description and the human's comments.
-3. Comment as you go; attach screenshots, recordings, audio.
-4. Point `checklist_path` at a markdown checklist ("- [ ] step") you keep
-   up to date; the page shows it with progress.
-5. Finished, or need a decision: comment what you did and what you need,
-   then PATCH status to review. Stopping early: leave it in_progress with a
-   comment saying where you got to, or release it back to ready.
+All JSON in and out, except file uploads (raw bytes) and this page.
+Ticket ids are four or five letters, like `KAMI`, in any case.
 
-## Example
-curl -s -H "Authorization: Bearer $TOKEN" "$URL/api/next?claim=1"
-curl -s -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \\
-     -d '{"body": "Tests pass. Recording attached."}' $URL/api/tickets/KAMI/comments
-curl -s -H "Authorization: Bearer $TOKEN" -H "Content-Type: video/mp4" \\
-     --data-binary @demo.mp4 "$URL/api/tickets/KAMI/attachments?filename=demo.mp4&comment_id=12"
-curl -s -X PATCH -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \\
-     -d '{"status": "review"}' $URL/api/tickets/KAMI
+    GET   /api                       this briefing (no token needed)
+    GET   /api/me                    {"username", "kind"}
+    GET   /api/next                  next ready ticket, or {"ticket": null}
+    GET   /api/next?claim=1          ...and move it to in_progress
+    GET   /api/tickets               {"tickets": [...]}; filters: ?status=ready,in_progress  ?q=text
+    GET   /api/tickets/ID            one ticket, with comments, attachments, events, checklist
+    POST  /api/tickets               {"title", "description", "priority": 1|2|3, "checklist_path"}
+                                     -> the new ticket (always in backlog)
+    PATCH /api/tickets/ID            any of {"status", "title", "description", "priority", "checklist_path"}
+    POST  /api/tickets/ID/comments   {"body": "..."} -> the comment, with its "id"
+    POST  /api/tickets/ID/attachments?filename=demo.mp4&comment_id=N
+                                     the file's raw bytes as the body, with its Content-Type;
+                                     comment_id (optional) attaches it to that comment
+
+Priorities: 1 high, 2 normal, 3 low. Images, audio and video play inline
+on the ticket page; other files are offered as downloads. Uploads up to the
+server's limit (1 GB by default).
+
+A ticket looks like:
+
+    {"id": "KAMI", "title": "...", "description": "...", "status": "in_progress",
+     "priority": 2, "checklist_path": "/home/me/work/plan.md", "created_by": "frank",
+     "created_at": 1760000000.0, "updated_at": 1760000300.0,
+     "comments": [{"id": 12, "author": "frank", "role": "human", "body": "...", "created_at": ...}],
+     "attachments": [{"id": 3, "comment_id": 12, "filename": "demo.mp4", "mime": "video/mp4",
+                      "size": 123456, "url": "/files/3/demo.mp4", ...}],
+     "events": [{"field": "status", "old": "ready", "new": "in_progress", "actor": "builder", "at": ...}],
+     "checklist": {"path": "...", "readable": true, "done": 2, "total": 5, "items": [...]}}
+
+Times are Unix seconds. Errors are `{"error": "what went wrong"}` with an
+HTTP status: 400 bad request, 401 missing or bad token, 403 not allowed
+for you, 404 no such ticket, 409 conflict, 413 too large.
+
+## Examples
+
+    URL=http://host:43917  TOKEN=at_...
+    curl -s -H "Authorization: Bearer $TOKEN" "$URL/api/next?claim=1"
+    curl -s -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \\
+         -d '{"body": "Done. Login form validates; screenshot attached."}' "$URL/api/tickets/KAMI/comments"
+    curl -s -H "Authorization: Bearer $TOKEN" -H "Content-Type: image/png" \\
+         --data-binary @login.png "$URL/api/tickets/KAMI/attachments?filename=login.png&comment_id=12"
+    curl -s -X PATCH -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \\
+         -d '{"status": "review"}' "$URL/api/tickets/KAMI"
+
+## Checking you've understood
+
+Call `GET /api/me`, then `GET /api/tickets?status=ready`, and tell the human
+who you are and what's ready. You're set.
 """
+
+
+def docs_for(store, actor, role):
+    """The briefing, plus who's asking and what's waiting for them."""
+    if not actor:
+        return API_DOCS
+    counts = {st: n for st, n in store.db().execute("SELECT status, COUNT(*) FROM tickets GROUP BY status")}
+    # Tickets this user moved to in_progress most recently, and still in progress.
+    mine = [dict(r) for r in store.db().execute(
+        "SELECT t.id, t.title FROM tickets t WHERE t.status = 'in_progress' AND "
+        "(SELECT e.actor FROM events e WHERE e.ticket_id = t.id AND e.field = 'status' AND e.new = 'in_progress' "
+        " ORDER BY e.at DESC, e.id DESC LIMIT 1) = ? ORDER BY t.priority, t.created_at", (actor,))]
+    lines = [f"\n## Right now\n", f"You're signed in as **{actor}** ({role}).",
+             f"Tickets: {counts.get('ready', 0)} ready, {counts.get('in_progress', 0)} in progress, "
+             f"{counts.get('review', 0)} waiting for review, {counts.get('backlog', 0)} in the backlog."]
+    if mine:
+        lines.append("You have these in progress (start here):")
+        lines += [f"- {t['id']}: {t['title']}" for t in mine]
+    elif role == "agent":
+        lines.append("You have nothing in progress. `GET /api/next?claim=1` takes the next ready ticket.")
+    return API_DOCS + "\n".join(lines) + "\n"
 
 
 # --------------------------------------------------------------------------- HTTP
@@ -1034,11 +1116,20 @@ class Handler(BaseHTTPRequestHandler):
         store = self.server.store
         try:
             role, actor, bearer = self.who(query)
+            # The briefing is public (it's only documentation); with a token
+            # it adds who's asking and what's waiting. An agent calling the
+            # base URL with its token gets it too, instead of the web page.
+            if method == "GET" and (path == "/api" or (path == "/" and bearer and role == "agent")):
+                return self.send(200, docs_for(store, actor, role), "text/markdown; charset=utf-8",
+                                 {"Cache-Control": "no-store"})
             if role is None:
                 if path.startswith("/api") or path.startswith("/files"):
-                    raise ApiError(401, "missing, wrong or disabled token (Authorization: Bearer <token>)")
+                    raise ApiError(401, "missing, wrong or disabled token (Authorization: Bearer <token>). "
+                                        "How this works: GET /api")
                 return self.send(401, page("Locked", "<h1>Locked</h1><p>Open this page once with "
-                                           "<code>?key=…</code> (your token) to sign in.</p>"), "text/html; charset=utf-8")
+                                           "<code>?key=…</code> (your token) to sign in.</p>"
+                                           "<p class='meta'>AI agents: read <a href='/api'>/api</a>.</p>"),
+                                 "text/html; charset=utf-8")
             if "key" in query and method == "GET" and not path.startswith("/api"):
                 # Trade the key in the URL for a cookie, then drop it from the address bar.
                 secure = "; Secure" if self.headers.get("X-Forwarded-Proto") == "https" else ""
@@ -1092,8 +1183,6 @@ class Handler(BaseHTTPRequestHandler):
                 if role != "human":
                     raise ApiError(403, "only humans can export")
                 return self.serve_export()
-            if method == "GET" and path == "/api":
-                return self.send(200, API_DOCS, "text/markdown; charset=utf-8")
             if method == "GET" and path == "/api/next":
                 t = store.claim_next(actor, role, bool((query.get("claim") or [""])[0]))
                 return self.json(200, {"ticket": t})

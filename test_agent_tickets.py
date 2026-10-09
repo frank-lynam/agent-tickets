@@ -343,6 +343,28 @@ class TicketsTest(unittest.TestCase):
             finally:
                 srv.server_close()
 
+    def test_briefing(self):
+        # Public: no token needed, and it explains the workflow.
+        code, body, h = self.call("GET", "/api", role=None)
+        self.assertEqual(code, 200)
+        text = body.decode()
+        self.assertIn("text/markdown", h["Content-Type"])
+        for must in ("backlog -> ready -> in_progress -> review -> done", "/api/next?claim=1", "Needs a decision",
+                     "Authorization: Bearer"):
+            self.assertIn(must, text)
+        self.assertNotIn("Right now", text)
+        # With a token: who's asking and what's theirs.
+        t = self.new("ready", priority=1, title="Briefing example")
+        self.j("PATCH", f"/api/tickets/{t['id']}", {"status": "in_progress"})
+        mine = self.call("GET", "/api")[1].decode()
+        self.assertIn("signed in as **tester** (agent)", mine)
+        self.assertIn(f"{t['id']}: Briefing example", mine)
+        # An agent calling the base URL gets the briefing, not the web page; a human gets the page.
+        self.assertIn("# Agent tickets: a briefing", self.call("GET", "/")[1].decode())
+        self.assertIn("<html", self.call("GET", "/", role="human")[1].decode())
+        # Errors point at the briefing.
+        self.assertIn("GET /api", self.j("GET", "/api/tickets", role=None)[1]["error"])
+
     # --- pages
     def test_pages_render(self):
         t = self.new("review", title="Check <b>escaping</b>", description="See https://example.com")
@@ -355,7 +377,6 @@ class TicketsTest(unittest.TestCase):
         self.assertIn("Approve", html)
         self.assertIn("Needs your review", self.call("GET", "/", role="human")[1].decode())
         self.assertEqual(self.call("GET", "/t/ZZZZ", role="human")[0], 404)
-        self.assertIn(b"# Agent tickets API", self.call("GET", "/api")[1])
 
 
 if __name__ == "__main__":
