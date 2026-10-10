@@ -262,6 +262,7 @@ DEFAULT_GUIDANCE = """## How we work
 ## How much to write
 
 Progress comments: one to three sentences per step. Save the detail for the hand-off comment. Don't paste long logs; attach them as files.
+Make it easy to read on a phone: short paragraphs with blank lines between them, a heading per part of a long write-up, lists for steps, and code blocks for commands and output (see "Formatting" in the briefing). No walls of text.
 """
 
 
@@ -2670,6 +2671,13 @@ harness offers (a background command that wakes you when it returns, a scheduled
 a turn). It returns when you have unread chat or someone replies on or changes your tickets. Answer chat
 first, then the tickets, then wait again. Write down here how you set it up for your harness.
 
+## Writing
+
+Descriptions, comments and chat show your line breaks plus a little markdown: `#` headings, ``` code
+blocks (monospace), `code`, `**bold**`, links, ticket ids and `[[wiki/page]]` links. Write to be scanned on a
+phone: short paragraphs with blank lines, headings for long write-ups, lists for steps, code blocks for
+commands and output. No walls of text.
+
 ## Wiki
 
 Read-only for agents. If something is missing or wrong there, say so to a human in chat; don't paste wiki
@@ -2850,6 +2858,24 @@ sections above them; or scan the tree (`GET /api/wiki`).
 
 You can't change the wiki: if something is missing, wrong or out of date,
 tell a human in chat. Don't copy wiki text into tickets; link the page.
+
+## Formatting what you write
+
+Ticket descriptions, comments, chat messages and wiki pages are shown
+with your line breaks and indentation kept, plus a little markdown:
+
+- `# Heading`, `## Heading`, `### Heading` on a line of their own
+- code blocks between lines of three backticks, shown in a monospace
+  font with spacing exact (commands, output, tables, diffs)
+- `` `inline code` `` and `**bold**`
+- links: web addresses, ticket ids (`amber-otter`) and wiki pages
+  (`[[section/page]]`, or `[[section/page|your words]]`)
+
+Lists, tables in pipes and other markdown show as you typed them (which
+reads fine). Humans often read on a phone, so write to be scanned: short
+paragraphs separated by blank lines, a heading for each part of a long
+write-up, a list for steps, and code blocks for anything that should line
+up. Don't send a wall of text.
 
 ## Endpoints
 

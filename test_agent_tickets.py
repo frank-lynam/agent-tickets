@@ -919,6 +919,9 @@ class TicketsTest(unittest.TestCase):
             self.assertNotIn("<script>x</script>", html, path)
             self.assertNotIn("<b>y</b>", html, path)
         self.assertEqual(self.call("GET", f"/t/{t['id']}", role="human")[1].decode().count("<h3>Plan</h3>"), 2)
+        # Agents are told about it, and to write legibly.
+        self.assertIn("## Formatting what you write", self.call("GET", "/api", role=None)[1].decode())
+        self.assertIn("No walls of text", self.call("GET", "/api/skill", role="agent")[1].decode())
 
     def test_skill(self):
         code, body, h = self.call("GET", "/api/skill", role="agent", headers={"Host": "tickets.example:43917"})
