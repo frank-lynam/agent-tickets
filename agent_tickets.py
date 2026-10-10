@@ -52,25 +52,87 @@ PRIORITIES = {1: "High", 2: "Normal", 3: "Low"}
 COOKIE = "at_key"
 CHUNK = 1 << 16
 
-# Ticket ids: easy to say out loud. Consonant-vowel pairs ("KAMI", "ROZU"),
-# from letters that don't sound alike; five letters if four get crowded.
-ID_CONSONANTS = "BDFGHKLMNPRSTVZ"
-ID_VOWELS = "AEIOU"
-
-
-# Ids that spell something nobody wants on a ticket (only words the pattern above can make).
-ID_BLOCKED = frozenset("""
-DAGO DAGOS DIKE DIKES FAGOT HOMO HOMOS KIKE KIKES LOSER MORON NAZI NAZIS NIGA NIGER PAKI PAKIS PEDO PEDOS
-PENIS PUBES PUTA PUTAS PUTO RAPE RAPED RAPES SEMEN SUKA
+# Ticket ids are two words, "amber-otter": one from each of these hand-picked
+# lists. Easy to say, hear and spell (no homophones, nothing spelled two ways,
+# no word in both lists), nothing offensive, and 400 x 482 = 192,800 of them.
+# Vet any word you add. Tickets made before this have four or five letters
+# ("KAMI") and keep them; both kinds work everywhere.
+ID_ADJECTIVES = tuple("""
+able active agile airy alert alpine amber ample ancient arctic ardent artful astral atomic autumn avid azure balmy
+bold bouncy brainy brassy brave breezy bright brisk bronze bubbly busy calm candid carefree casual catchy cheery
+chief chipper choice chummy civil classic clean clear clever cloudy coastal cobalt comfy cool copper cordial cosmic
+crafty crimson crisp cubic curious curly cyan dainty dandy dapper daring dazzling decent deep deft devoted dewy
+direct distant docile dotted dreamy driven dusty dynamic eager early earnest earthy easy eastern elated electric
+elegant eminent emerald endless epic equal even exact expert fabled famous fancy far fast fearless festive fierce
+final fine first fleet floral fluent fluffy flying fond formal fresh friendly frosty frugal funky fuzzy gallant
+gentle genuine giant gifted giddy glad gleaming gleeful glossy glowing golden good graceful grand grassy green
+groovy grounded handy happy hardy hazel hearty helpful heroic hidden honest hopeful humble hushed icy ideal indigo
+inner intent iron ivory jade jaunty jazzy jolly jovial joyful jumbo junior keen kind kindly kinetic large lasting
+latest lavish lawful leafy lean level light lilac limber linear liquid little lively local lofty logical loyal lucid
+lucky lunar lush lyric magic magnetic majestic major mammoth marine mellow mighty mild mindful minty misty mobile
+modern modest molten mossy mystic narrow natural navy neat nifty nimble noble nordic normal northern notable novel
+oaken olive open optimal orange orbital organic ornate outer pacific painted pastel patient peaceful pearly perky
+placid playful pleasant plucky plush poetic polar polished polite popular precise premium pretty primal prime
+pristine prompt proper proud prudent pure purple quaint quick quiet quirky radiant rainy rapid rare ready regal
+relaxed reliable remote rich ripe robust rocky roomy rosy round royal rugged rural rustic safe sandy satin savvy
+scarlet scenic secret secure serene shiny short silent silky silver simple sincere sleek sleepy slender smart
+smiling smooth snowy snug social soft solar solid sonic southern sparkling speedy spirited splendid sporty spotted
+spry stable stark starry steady steep stellar sterling still stoic stony stout striped strong sturdy sublime subtle
+sunlit sunny super supreme sure swift tactful talented tall tame tangy tawny teal tender thankful thrifty tidal tidy
+timely tiny tranquil trendy trim tropical true trusty twin ultra unique united upbeat upper urban useful valiant
+valid vast velvet verdant vernal vintage violet visual vital vivid vocal warm wavy western wild windy winged wiry
+witty wondrous wooden worthy young youthful zany zealous zesty zippy
 """.split())
+ID_NOUNS = tuple("""
+acorn agate albatross alder almond alpaca anchor antelope anvil apple apricot arrow aspen atlas atoll aurora badge
+bagel ballad bamboo banjo banner barrel basil basin basket bay beacon beagle beetle beryl bicycle birch biscuit
+bison blanket blizzard bluff bobcat bonnet bottle bramble breeze brook bucket buffalo bugle bumblebee butter
+butterfly button cabin cactus camel canary candle canoe canvas canyon cape cardinal caribou cashew castle cavern
+cedar cello chalice chariot cheetah chestnut chimney chipmunk chorus cicada citrine clam cliff cloud clover coast
+collie comet compass condor cookie corgi cosmos cove crab crane crater crayon cricket crown crow crystal cupcake
+cushion custard cypress daisy delta diamond dolphin dragonfly drum dumpling dune dusk eagle easel eclipse egret
+elephant elk elm ember engine ermine estuary falcon ferret fern fiddle fig finch firefly flag flamingo flounder
+flute forest fountain fox frost gadget gale galaxy gannet garden gardenia garnet gazebo gazelle gecko gerbil geyser
+giraffe glacier glade glen glove goblet gondola goose gopher gorge granola grape grotto grouse grove guava guitar
+gulch gull guppy halibut halo hammer hammock hamster harmony harp hawk heather hedgehog helmet heron herring hill
+hippo holly honey hornet horizon hut ibex ibis igloo iguana impala iris island ivy jacket jackal jaguar jasmine
+jasper jay jellyfish jigsaw juniper kangaroo kayak kestrel kettle kingfisher kite kiwi koala krill ladder ladybug
+lagoon lake lantern larch lark lasso laurel lavender lemon leopard lightning lily lime linden lion llama lobster
+locket lotus macaw magnet magnolia magpie mallard mallet mango mantis maple marble marigold marlin marmot marsh
+martin meadow meerkat melody merlin mesa meteor minnow mink mitten mongoose monsoon moon mosaic moss moth mountain
+mural myrtle narwhal nebula nectar needle nettle noodle notebook nova nutmeg oak oasis oatmeal oboe ocean ocelot
+octopus onyx opal orbit orca orchard orchid oriole osprey ostrich otter owl oyster paddle palm pancake panda panther
+papaya parcel parrot pasta pasture pebble pecan pelican pencil penguin peony pepper perch pheasant piano pickle pie
+pigeon pike pillow pine pinwheel pitcher planet plankton plateau plaza pony poplar popcorn poppy porcupine potato
+prairie prawn pretzel prism pudding puffin pulsar puma pumpkin puzzle quail quartz quasar quill quilt quince quokka
+rabbit radar radish raft rainbow raisin raspberry raven redwood reef reindeer rhino rhubarb ribbon ridge river robin
+rocket rook rowan saddle saffron salmon sandpiper sapphire sardine satchel scallop scarf scone scroll seahorse seal
+sequoia sesame shark sheep shore shovel shrimp sled slipper sloth sonata sorbet sorrel soup sparrow spinach spindle
+spoon spring spruce squid stamp star starfish starling statue stoat stork storm stream strudel sturgeon sugar sumac
+summit sunrise sunset swallow swamp swan sycamore tapir teapot telescope tent thimble thistle thrush thunder tiger
+toast toffee tomato topaz tortoise toucan tower trolley trout truffle trumpet tuba tulip tuna tundra tunnel turnip
+turtle twilight ukulele umbrella urchin valley vanilla vase violin volcano waffle wagon walnut walrus waltz wand
+warbler waterfall whistle willow windmill wisteria wolf wombat wren yak yarrow zebra zenith zephyr zinnia
+""".split())
+OLD_ID = re.compile(r"[A-Za-z]{4,5}")
+WORD_ID = re.compile(r"([A-Za-z]+)[-_ ]+([A-Za-z]+)")
+ID_PATH = r"[A-Za-z]{4,5}|[A-Za-z]+-[A-Za-z]+"  # a ticket id in a URL
+
+
+def norm_id(tid):
+    """A ticket id as stored: "amber-otter" (from any case, with a hyphen or a space), or "KAMI"."""
+    tid = str(tid or "").strip()
+    if OLD_ID.fullmatch(tid):
+        return tid.upper()
+    m = WORD_ID.fullmatch(tid)
+    return f"{m[1].lower()}-{m[2].lower()}" if m else tid
 
 
 def new_id(taken, pick=random.choice):
-    for length in (4, 4, 4, 5):
-        for _ in range(200):
-            tid = "".join(pick(ID_CONSONANTS if i % 2 == 0 else ID_VOWELS) for i in range(length))
-            if tid not in ID_BLOCKED and not taken(tid):
-                return tid
+    for _ in range(5000):
+        tid = f"{pick(ID_ADJECTIVES)}-{pick(ID_NOUNS)}"
+        if not taken(tid):
+            return tid
     raise RuntimeError("no free ticket id")
 
 
@@ -290,7 +352,7 @@ class Store:
 
     # --- reads
     def ticket(self, tid):
-        row = self.db().execute("SELECT * FROM tickets WHERE id = ?", ((tid or "").upper(),)).fetchone()
+        row = self.db().execute("SELECT * FROM tickets WHERE id = ?", (norm_id(tid),)).fetchone()
         if not row:
             raise ApiError(404, f"no ticket {tid}")
         return dict(row)
@@ -311,7 +373,7 @@ class Store:
             args.append(kind)
         if epic:
             where.append("t.epic_id = ?")
-            args.append(epic.upper())
+            args.append(norm_id(epic))
         if proposed is not None:
             where.append("t.proposed = ?")
             args.append(1 if proposed else 0)
@@ -470,7 +532,12 @@ class Store:
             raise ApiError(400, "epics can't belong to another epic")
         deps = data.get("depends_on") or []
         if isinstance(deps, str):
-            deps = [d for d in re.split(r"[\s,]+", deps) if d]
+            # "amber-otter, quiet falcon" or "KAMI ROZU": commas, or spaces between ids
+            # ("quiet falcon" is one id when that ticket exists).
+            def ids_in(chunk):
+                one = self.db().execute("SELECT 1 FROM tickets WHERE id = ?", (norm_id(chunk),)).fetchone()
+                return [chunk] if one else chunk.split()
+            deps = [d for chunk in deps.split(",") if chunk.strip() for d in ids_in(chunk.strip())]
         deps = [self.ticket(d)["id"] for d in deps]
         if kind == "epic" and deps:
             raise ApiError(400, "epics don't have predecessors; put them on the epic's tickets")
@@ -607,8 +674,8 @@ class Store:
             if role == "agent":
                 self._check_agent_may_change(t, actor)
             with db:
-                if db.execute("DELETE FROM deps WHERE ticket_id = ? AND depends_on = ?", (t["id"], dep.upper())).rowcount:
-                    self._event(db, t["id"], actor, role, "depends_on", dep.upper(), None, time.time())
+                if db.execute("DELETE FROM deps WHERE ticket_id = ? AND depends_on = ?", (t["id"], norm_id(dep))).rowcount:
+                    self._event(db, t["id"], actor, role, "depends_on", norm_id(dep), None, time.time())
         return self.detail(t["id"])
 
     def claim_next(self, actor, role, claim):
@@ -1359,7 +1426,7 @@ def assignee_options(store, current=None):
 def epic_options(store, current=None):
     opts = ['<option value="">None</option>']
     for e in store.tickets(["backlog", "ready", "in_progress", "review"], kind="epic"):
-        sel = " selected" if current and e["id"] == current.upper() else ""
+        sel = " selected" if current and e["id"] == norm_id(current) else ""
         opts.append(f'<option value="{e["id"]}"{sel}>{e["id"]} · {esc(e["title"])}</option>')
     return "".join(opts)
 
@@ -1374,7 +1441,7 @@ def render_new(store, epic=None, prefill=("", "")):
 <label>Assign to <select id="nt-who">{assignee_options(store)}</select></label></div>
 <div class="row"><label>Kind <select id="nt-kind"><option value="task">Ticket</option><option value="epic">Epic (a plan that groups tickets)</option></select></label>
 <label>Epic <select id="nt-epic">{epic_options(store, epic)}</select></label></div>
-<label>Must be done first (ticket ids, optional)<input type="text" id="nt-deps" placeholder="KAMI, ROZU"></label>
+<label>Must be done first (ticket ids, optional)<input type="text" id="nt-deps" placeholder="amber-otter, quiet-falcon"></label>
 <label>Checklist file (optional, a path on this machine)<input type="text" id="nt-ck" placeholder="/home/.../checklist.md"></label>
 <div><button class="primary">Create</button></div></form>
 <script>const $ = (id) => document.getElementById(id);
@@ -1687,13 +1754,13 @@ document.getElementById('ef').onsubmit = async (e) => {{
     return page(f"{t['id']} {t['title']}", body, "", len(store.tickets(["review"])))
 
 
-TICKET_WORD = re.compile(r"\b[A-Z]{4,5}\b")
+TICKET_WORD = re.compile(r"\b(?:[A-Za-z]+-[A-Za-z]+|[A-Z]{4,5})\b")
 
 
 def chat_text(store, body):
     """A message's text: escaped, with links, and ticket ids that exist linked to their tickets."""
     parts = re.split(r"(https?://[^\s<]+)", esc(body))
-    ids = set(TICKET_WORD.findall(" ".join(parts[::2])))
+    ids = {norm_id(w) for w in TICKET_WORD.findall(" ".join(parts[::2]))}
     known = {r[0] for r in store.db().execute(
         f"SELECT id FROM tickets WHERE id IN ({','.join('?' * len(ids))})", list(ids))} if ids else set()
     out = []
@@ -1701,7 +1768,8 @@ def chat_text(store, body):
         if i % 2:
             out.append(f'<a href="{p}" target="_blank" rel="noopener">{p}</a>')
         else:
-            out.append(TICKET_WORD.sub(lambda m: f'<a href="/t/{m[0]}">{m[0]}</a>' if m[0] in known else m[0], p))
+            out.append(TICKET_WORD.sub(
+                lambda m: f'<a href="/t/{norm_id(m[0])}">{m[0]}</a>' if norm_id(m[0]) in known else m[0], p))
     return "".join(out)
 
 
@@ -1954,7 +2022,8 @@ discussed in comments on the ticket, where the humans review it.
 ## Endpoints
 
 All JSON in and out, except file uploads (raw bytes) and this page.
-Ticket ids are four or five letters, like `KAMI`, in any case.
+Ticket ids are two words, like `amber-otter` (older tickets have four or five
+letters, like `KAMI`). Any case works, and a space for the hyphen in JSON.
 
     GET   /api                       this briefing (no token needed)
     GET   /api/me                    {"username", "kind", "guidance"}
@@ -1965,10 +2034,10 @@ Ticket ids are four or five letters, like `KAMI`, in any case.
                                      ?assignee=me (or a name, or "none")  ?epic=ID  ?kind=epic  ?proposed=1
     GET   /api/tickets/ID            one ticket, with comments, attachments, events, checklist
     POST  /api/tickets               {"title", "description", "priority": 1|2|3, "checklist_path",
-                                      "kind": "task"|"epic", "epic_id", "depends_on": ["KAMI", ...]}
+                                      "kind": "task"|"epic", "epic_id", "depends_on": ["amber-otter", ...]}
                                      -> the new ticket (a proposal, in the backlog)
-    POST  /api/tickets/ID/deps       {"depends_on": "KAMI"}: KAMI must be done before ID
-    DELETE /api/tickets/ID/deps/KAMI remove that dependency
+    POST  /api/tickets/ID/deps       {"depends_on": "amber-otter"}: amber-otter must be done before ID
+    DELETE /api/tickets/ID/deps/amber-otter   remove that dependency
     PATCH /api/tickets/ID            any of {"status", "title", "description", "priority", "checklist_path", "assignee",
                                       "epic_id"}
     POST  /api/tickets/ID/comments   {"body": "..."} -> the comment, with its "id"
@@ -2000,9 +2069,9 @@ default). Prefer one tarball over dozens of loose files.
 
 A ticket looks like:
 
-    {"id": "KAMI", "title": "...", "description": "...", "status": "in_progress", "assignee": "agent-1",
-     "kind": "task", "epic_id": "ROZU", "epic_title": "...", "proposed": 0, "declined": 0,
-     "blocked_by": [], "depends_on": [{"id": "BEDO", "title": "...", "status": "done"}], "unblocks": [...],
+    {"id": "amber-otter", "title": "...", "description": "...", "status": "in_progress", "assignee": "agent-1",
+     "kind": "task", "epic_id": "quiet-falcon", "epic_title": "...", "proposed": 0, "declined": 0,
+     "blocked_by": [], "depends_on": [{"id": "stony-brook", "title": "...", "status": "done"}], "unblocks": [...],
      "priority": 2, "checklist_path": "/home/me/work/plan.md", "created_by": "frank",
      "created_at": 1760000000.0, "updated_at": 1760000300.0,
      "comments": [{"id": 12, "author": "frank", "role": "human", "body": "...", "created_at": ...}],
@@ -2020,14 +2089,14 @@ for you, 404 no such ticket, 409 conflict, 413 too large.
     URL=http://host:43917  TOKEN=at_...
     curl -s -H "Authorization: Bearer $TOKEN" "$URL/api/next?claim=1"
     curl -s -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \\
-         -d '{"body": "Done. Login form validates; screenshot attached."}' "$URL/api/tickets/KAMI/comments"
+         -d '{"body": "Done. Login form validates; screenshot attached."}' "$URL/api/tickets/amber-otter/comments"
     curl -s -H "Authorization: Bearer $TOKEN" -H "Content-Type: image/png" \\
-         --data-binary @login.png "$URL/api/tickets/KAMI/attachments?filename=login.png&comment_id=12"
+         --data-binary @login.png "$URL/api/tickets/amber-otter/attachments?filename=login.png&comment_id=12"
     tar czf build.tar.gz dist/ && curl -s -H "Authorization: Bearer $TOKEN" \\
-         --data-binary @build.tar.gz "$URL/api/tickets/KAMI/attachments?filename=build.tar.gz"
+         --data-binary @build.tar.gz "$URL/api/tickets/amber-otter/attachments?filename=build.tar.gz"
     curl -s -H "Authorization: Bearer $TOKEN" -o build.tar.gz "$URL/files/7/build.tar.gz"
     curl -s -X PATCH -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \\
-         -d '{"status": "review"}' "$URL/api/tickets/KAMI"
+         -d '{"status": "review"}' "$URL/api/tickets/amber-otter"
 
 ## Checking you've understood
 
@@ -2200,7 +2269,7 @@ class Handler(BaseHTTPRequestHandler):
             if method != "GET" and not bearer and self.headers.get("X-Tickets") != "1":
                 raise ApiError(403, "missing X-Tickets header")
 
-            m = re.fullmatch(r"/api/tickets/([A-Za-z]{4,5})(/comments|/attachments|/deps|/accept|/decline)?(?:/([A-Za-z]{4,5}))?",
+            m = re.fullmatch(rf"/api/tickets/({ID_PATH})(/comments|/attachments|/deps|/accept|/decline)?(?:/({ID_PATH}))?",
                              path)
             if method == "GET" and path == "/":
                 return self.html(render_dashboard(store))
@@ -2210,7 +2279,7 @@ class Handler(BaseHTTPRequestHandler):
                 mid = (query.get("from_message") or [""])[0]
                 return self.html(render_new(store, (query.get("epic") or [None])[0],
                                             ticket_from_message(store, int(mid)) if mid.isdigit() else ("", "")))
-            if method == "GET" and (tm := re.fullmatch(r"/t/([A-Za-z]{4,5})", path)):
+            if method == "GET" and (tm := re.fullmatch(rf"/t/({ID_PATH})", path)):
                 return self.html(render_ticket(store, tm.group(1)))
             if method == "GET" and (fm := re.fullmatch(r"/files/(\d+)/[^/]*", path)):
                 return self.serve_file(store.attachment(int(fm.group(1))))

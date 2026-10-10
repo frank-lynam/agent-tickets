@@ -18,7 +18,10 @@ read `GET /api` on the running server instead.
   anyone, and is never claimed; comments are always allowed; dependency
   loops are refused. Agents with unread chat get the `chat` notice on every
   ticket response. `/api/next?claim=1` must never give one ticket to two
-  agents. Ticket ids never spell a word on the `ID_BLOCKED` list. Checklist files are read only from the allowed roots. Only
+  agents. New ticket ids come only from `ID_ADJECTIVES` and `ID_NOUNS`: vet
+  every word you add (nothing offensive alone or in a pair, no homophones,
+  one obvious spelling, never in both lists). Old four- and five-letter ids
+  must keep working. Checklist files are read only from the allowed roots. Only
   humans manage users or export; the last active human can't be disabled.
   Tokens are stored only as hashes and never appear in logs or backups.
 - **Data** lives in `data/` (gitignored): `tickets.db` (tickets and

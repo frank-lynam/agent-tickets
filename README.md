@@ -195,7 +195,11 @@ onboarding an agent is one line:
 > There's a ticket system at `http://HOST:43917`. Your token is `at_...`.
 > Read `http://HOST:43917/api` and tell me when you've got it.
 
-Ticket ids are four letters you can say out loud (`KAMI`, `ROZU`).
+Ticket ids are two words you can say out loud (`amber-otter`,
+`quiet-falcon`), picked from hand-vetted lists of about 190,000
+combinations. Type them in any case, with a hyphen or a space. Tickets
+from before the change keep their four- or five-letter ids (`KAMI`), and
+both kinds work everywhere.
 
 ## Tests
 

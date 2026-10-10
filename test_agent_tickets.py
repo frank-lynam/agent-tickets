@@ -5,6 +5,7 @@ import json
 import re
 import tarfile
 import tempfile
+import time
 import threading
 import unittest
 import urllib.error
@@ -88,15 +89,48 @@ class TicketsTest(unittest.TestCase):
                                    headers={"Cookie": value, "X-Tickets": "1"})[0], 201)
 
     # --- tickets and the rules
-    def test_ids_are_sayable(self):
+    def test_ids_are_two_words(self):
         t = self.new()
-        self.assertRegex(t["id"], r"^([BDFGHKLMNPRSTVZ][AEIOU]){2}[BDFGHKLMNPRSTVZ]?$")
-        self.assertEqual(self.j("GET", "/api/tickets/" + t["id"].lower())[1]["id"], t["id"])
-        # Words nobody wants as an id are skipped.
-        letters = iter("NAZI" + "BADU")
-        self.assertEqual(at.new_id(lambda tid: False, pick=lambda pool: next(letters)), "BADU")
-        for word in at.ID_BLOCKED:  # every entry is one the generator could make
-            self.assertRegex(word, r"^([BDFGHKLMNPRSTVZ][AEIOU]){2}[BDFGHKLMNPRSTVZ]?$")
+        adj, noun = t["id"].split("-")
+        self.assertIn(adj, at.ID_ADJECTIVES)
+        self.assertIn(noun, at.ID_NOUNS)
+        # Any case, a hyphen or a space.
+        self.assertEqual(self.j("GET", "/api/tickets/" + t["id"].upper())[1]["id"], t["id"])
+        self.assertEqual(at.norm_id(f" {adj.title()} {noun.upper()} "), t["id"])
+        self.assertEqual(self.call("GET", f"/t/{t['id']}", role="human")[0], 200)
+        # The lists: clean words, no repeats, none in both (so an id reads one way), and room for 100,000+ tickets.
+        for ws in (at.ID_ADJECTIVES, at.ID_NOUNS):
+            self.assertEqual(len(ws), len(set(ws)))
+            for w in ws:
+                self.assertRegex(w, r"^[a-z]{3,10}$")
+        self.assertFalse(set(at.ID_ADJECTIVES) & set(at.ID_NOUNS))
+        self.assertGreater(len(at.ID_ADJECTIVES) * len(at.ID_NOUNS), 150_000)
+        # A taken id is skipped.
+        picks = iter([adj, noun, "amber", "otter"])
+        self.assertEqual(at.new_id(lambda tid: tid == t["id"], pick=lambda pool: next(picks)), "amber-otter")
+
+    def test_old_ids_keep_working(self):
+        store = self.srv.store
+        now = time.time()
+        with store.db() as db:
+            db.execute("INSERT INTO tickets (id, title, status, created_at, updated_at) VALUES ('KAMO', 'old one', 'done', ?, ?)",
+                       (now, now))
+        self.assertEqual(self.j("GET", "/api/tickets/kamo")[1]["title"], "old one")
+        self.assertEqual(self.call("GET", "/t/KAMO", role="human")[0], 200)
+        # Old and new ids together, as dependencies, in a string with commas and spaces.
+        a = self.new("backlog", title="new one")
+        spaced = a["id"].replace("-", " ").title()
+        b = self.new("backlog", title="after both", depends_on=f"kamo, {spaced}")
+        self.assertEqual(sorted(d["id"] for d in self.j("GET", f"/api/tickets/{b['id']}")[1]["depends_on"]),
+                         sorted(["KAMO", a["id"]]))
+        self.assertEqual(self.j("DELETE", f"/api/tickets/{b['id']}/deps/{a['id']}", role="human")[0], 200)
+        # Both kinds link from chat; look-alike hyphenated words don't.
+        c = self.j("POST", "/api/chat", {"title": "ids", "body": f"see KAMO and {a['id']}, not well-known"},
+                   role="human")[1]
+        html = self.call("GET", f"/chat/{c['id']}", role="human")[1].decode()
+        self.assertIn('<a href="/t/KAMO">KAMO</a>', html)
+        self.assertIn(f'<a href="/t/{a["id"]}">{a["id"]}</a>', html)
+        self.assertNotIn("/t/well-known", html)
 
     def test_agents_file_into_the_backlog_only(self):
         code, t = self.j("POST", "/api/tickets", {"title": "Idea from an agent"})
