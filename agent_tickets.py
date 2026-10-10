@@ -257,6 +257,7 @@ DEFAULT_GUIDANCE = """## How we work
 3. After each step, tick it off in your file, upload it again, and comment what you did and what happened, including errors and surprises.
 4. When something is visible (a page, a chart, a game), attach a screenshot or a short recording.
 5. Hand back with a comment that starts "Done" or "Needs a decision", then set the status to review.
+6. When you've nothing to do, stay reachable: keep GET /api/wait running in the background (however your harness allows) so chat and replies on your tickets wake you.
 
 ## How much to write
 
@@ -289,6 +290,7 @@ class Store:
         self.db_path = self.dir / "tickets.db"
         self.local = threading.local()
         self.write_lock = threading.Lock()
+        self.changed = threading.Condition()  # notified after every change; /api/wait sleeps on it
         db = self.db()
         db.executescript(SCHEMA)
         # 1 -> 2 added the users table, 2 -> 3 the settings table, 3 -> 4 the
@@ -1010,6 +1012,64 @@ class Store:
             raise ApiError(404, "no such version")
         return dict(row)
 
+    # --- waiting: an idle agent holds GET /api/wait open until there's something for it
+    def bump(self):
+        with self.changed:
+            self.changed.notify_all()
+
+    def _marks(self):
+        db = self.db()
+        return (db.execute("SELECT COALESCE(MAX(id), 0) FROM comments").fetchone()[0],
+                db.execute("SELECT COALESCE(MAX(id), 0) FROM events").fetchone()[0])
+
+    def news_for(self, user, marks, queue=False):
+        """Tickets someone else commented on or changed since `marks` (that are now assigned to `user`,
+        including ones just assigned to them), and with `queue`, unassigned tickets made ready since."""
+        c0, e0 = marks
+        db, out = self.db(), {}
+        for r in db.execute(
+                "SELECT t.id, t.title, t.status, c.author FROM comments c JOIN tickets t ON t.id = c.ticket_id "
+                "WHERE c.id > ? AND t.assignee = ? COLLATE NOCASE AND c.author != ? COLLATE NOCASE ORDER BY c.id",
+                (c0, user, user)):
+            out[r["id"]] = {"id": r["id"], "title": r["title"], "status": r["status"], "why": f"{r['author']} commented"}
+        for r in db.execute(
+                "SELECT t.id, t.title, t.status, e.actor, e.field, e.new FROM events e JOIN tickets t ON t.id = e.ticket_id "
+                "WHERE e.id > ? AND e.actor != ? COLLATE NOCASE AND (t.assignee = ? COLLATE NOCASE OR (? AND "
+                "t.assignee IS NULL AND t.status = 'ready' AND t.kind = 'task' AND t.proposed = 0 AND e.new = 'ready')) "
+                "ORDER BY e.id", (e0, user, user, 1 if queue else 0)):
+            if r["id"] in out:
+                continue
+            if r["field"] == "assignee" and (r["new"] or "").lower() == user.lower():
+                why = f"{r['actor']} assigned it to you"
+            elif r["new"] == "ready" and r["field"] in ("status", "created", "accepted"):
+                why = f"{r['actor']} made it ready"
+            else:
+                why = f"{r['actor']} changed {r['field'].replace('_', ' ')}"
+            out[r["id"]] = {"id": r["id"], "title": r["title"], "status": r["status"], "why": why}
+        return list(out.values())
+
+    def wait_for(self, user, timeout, queue=False):
+        """Return as soon as `user` has unread chat, or (since the call began) a ticket of theirs was
+        commented on or changed by someone else; otherwise after `timeout` seconds."""
+        marks, end = self._marks(), time.time() + timeout
+        while True:
+            notice = self.chat_notice(user)
+            if notice:
+                return {"reason": "chat", "chat": notice, "tickets": []}
+            news = self.news_for(user, marks, queue)
+            if news:
+                return {"reason": "tickets", "chat": None, "tickets": news}
+            left = end - time.time()
+            if left <= 0:
+                return {"reason": "timeout", "chat": None, "tickets": []}
+            with self.changed:
+                self.changed.wait(min(left, 5))
+
+    def read_up_to(self, cid):
+        """Each member's last read message id in a conversation."""
+        return {r[0]: r[1] for r in self.db().execute(
+            "SELECT username, last_read FROM chat_members WHERE conversation_id = ? ORDER BY username COLLATE NOCASE", (cid,))}
+
     # --- chat: conversations anyone can read and post in; members are the
     # people who get told about new messages.
     def conversation(self, cid, viewer=None):
@@ -1025,6 +1085,7 @@ class Store:
             "SELECT username FROM chat_members WHERE conversation_id = ? ORDER BY username COLLATE NOCASE", (cid,))]
         others = [m for m in c["members"] if not viewer or m.lower() != viewer.lower()]
         c["name"] = c["title"] or ", ".join(others or c["members"]) or f"Conversation {cid}"
+        c["read_up_to"] = self.read_up_to(cid)
         if viewer:
             c["unread"] = self._unread_in(cid, viewer)
         return c
@@ -1482,6 +1543,7 @@ a.wl.missing{color:var(--review);text-decoration-style:dashed}
 .msg .who{font-weight:600}.msg .who.agent{color:var(--agent)}
 .msg .body{white-space:pre-wrap;overflow-wrap:anywhere;margin-top:2px}
 .msg .mk{margin-left:6px;text-decoration:none;font-size:12px;opacity:.75}
+.receipt{margin:6px 2px 0;text-align:right}.receipt .unseen{color:var(--review)}
 .composer{position:sticky;bottom:0;margin-top:14px;padding:10px 0 4px;background:var(--bg)}
 .composer textarea{min-height:64px}
 .clist .item.unread b{color:var(--accent)}
@@ -2235,6 +2297,23 @@ document.getElementById('sf').onsubmit = async (e) => {
 """
 
 
+def receipt_html(store, cid):
+    """Under the latest message: who has read it, and who hasn't yet (and for how long)."""
+    last = store.messages(cid, limit=1)
+    if not last:
+        return ""
+    m, reads = last[-1], store.read_up_to(cid)
+    others = [u for u in reads if u.lower() != m["author"].lower()]
+    seen = [u for u in others if reads[u] >= m["id"]]
+    unseen = [u for u in others if reads[u] < m["id"]]
+    parts = []
+    if seen:
+        parts.append("Read by " + esc(", ".join(seen)))
+    if unseen:
+        parts.append(f'<span class="unseen">Not read yet by {esc(", ".join(unseen))}</span> (sent {ago(m["created_at"])})')
+    return " · ".join(parts)
+
+
 def render_chat_list(store, viewer):
     rows = []
     for c in store.conversations(viewer):
@@ -2273,7 +2352,8 @@ async function poll(force){
   try {
     const r = await fetch('/chat/' + CID + '/since/' + LAST, {credentials: 'same-origin'});
     if (r.ok) {
-      const html = await r.text(), last = +r.headers.get('X-Last-Id');
+      const d = await r.json(), html = d.html, last = d.last;
+      document.getElementById('receipt').innerHTML = d.receipt;
       if (html.trim()) {
         const stick = force || nearBottom();
         document.getElementById('none')?.remove();
@@ -2332,6 +2412,7 @@ def render_chat(store, cid, viewer):
 <div class="meta">With {esc(", ".join(c["members"]) or "no one yet")}. Anyone can read and post here.</div>{add}
 <div id="chatroom" data-cid="{c["id"]}" data-last="{last}" style="margin-top:14px">
 <div class="chat" id="msgs">{shown or '<p class="empty" id="none">No messages yet. Say hello.</p>'}</div>
+<p class="meta receipt" id="receipt">{receipt_html(store, c["id"])}</p>
 <form class="stack composer" id="mf"><textarea id="mbody" placeholder="Message (Enter sends, Shift+Enter for a new line)" aria-label="Message"></textarea>
 <div class="row"><input type="file" id="mfiles" multiple aria-label="Attach files">
 <button class="primary" id="msend" style="margin-left:auto">Send</button></div></form></div>
@@ -2560,6 +2641,13 @@ enough, or a request fails in a way you don't understand. Errors come back as `{
   tickets: comment only. Blocked tickets (predecessors not done) can't start; comment instead.
 - New ideas: `POST /api/tickets` `{{"title", "description"}}` makes a proposal a human accepts or declines.
 
+## When you're idle
+
+Stay reachable: keep `GET /api/wait?timeout=50` running in the background, in a loop, using whatever your
+harness offers (a background command that wakes you when it returns, a scheduled check, a hook before you end
+a turn). It returns when you have unread chat or someone replies on or changes your tickets. Answer chat
+first, then the tickets, then wait again. Write down here how you set it up for your harness.
+
 ## Wiki
 
 Read-only for agents. If something is missing or wrong there, say so to a human in chat; don't paste wiki
@@ -2692,6 +2780,37 @@ Reading a conversation (`GET /api/chat/ID`) or posting in it also marks it read.
 Keep chat for things that aren't about one ticket. Work on a ticket is
 discussed in comments on the ticket, where the humans review it.
 
+## Staying reachable when you're idle
+
+Humans expect an answer to chat, and to their replies on your tickets,
+even when you're between tasks. This server can't reach into your
+session: **you set up your own listener, once, with whatever your harness
+offers, and write down how in your skill.**
+
+- `GET /api/wait?timeout=50` holds the request open until there's
+  something for you, then returns it right away:
+  - `{"reason": "chat", "chat": {...}}`: you have unread chat (this
+    returns at once while any is unread, so answer or mark it read before
+    waiting again, or you'll spin);
+  - `{"reason": "tickets", "tickets": [{"id", "title", "status", "why"}]}`:
+    since you started waiting, someone else commented on or changed a
+    ticket assigned to you, or assigned you one;
+  - `{"reason": "timeout"}`: nothing yet. Call it again.
+  Add `&queue=1` to also wake for new unassigned ready tickets. The longest
+  timeout is 300 seconds; keep it under 100 if a proxy sits in front of this
+  server (many cut long requests), and loop.
+- Run it whenever you'd otherwise sit idle, so that its returning wakes you:
+  for example a background command your harness tells you about when it
+  finishes, a scheduled wake-up that calls it, or a hook that checks before
+  you end a turn. Use whatever your harness supports; there's no one way.
+- When it returns: answer chat first, then deal with the tickets, then go
+  back to waiting.
+- If your harness can't run anything while you're idle, tell a human in
+  chat, so they know to nudge you when they write.
+
+Humans see read receipts in chat ("Not read yet by agent-1"), so they can
+tell when you're not listening.
+
 ## Wiki (read-only for you)
 
 The humans keep shared knowledge here: project onboarding, where the repos
@@ -2721,6 +2840,8 @@ letters, like `KAMI`). Any case works, and a space for the hyphen in JSON.
     GET   /api/guidance              {"guidance": the house rules and any notes for you}
     GET   /api/next                  your next ready ticket, or {"ticket": null}; plus "guidance"
     GET   /api/next?claim=1          ...and move it to in_progress, assigned to you
+    GET   /api/wait?timeout=50       wait (up to 300 s) until you have unread chat, or a ticket of yours gets a
+                                     reply or change; &queue=1 also wakes for new unassigned ready tickets
     GET   /api/tickets               {"tickets": [...]}; filters: ?status=ready,in_progress  ?q=text
                                      ?assignee=me (or a name, or "none")  ?epic=ID  ?kind=epic  ?proposed=1
     GET   /api/tickets/ID            one ticket, with comments, attachments, events, checklist
@@ -2737,7 +2858,8 @@ letters, like `KAMI`). Any case works, and a space for the hyphen in JSON.
     GET   /api/chat                  {"conversations": [{"id", "name", "members", "unread", "last_message"}]}
     POST  /api/chat                  {"members": ["frank"], "title" (optional), "body" (optional first message)}
                                      -> the conversation (with one person and no title: your existing one)
-    GET   /api/chat/ID               the conversation and its messages (?after=MESSAGE_ID for newer ones);
+    GET   /api/chat/ID               the conversation, its messages (?after=MESSAGE_ID for newer ones) and
+                                     "read_up_to": each member's last read message id;
                                      marks it read (?peek=1 doesn't)
     POST  /api/chat/ID/messages      {"body": "..."} -> the message, with its "id"
     POST  /api/chat/ID/files?filename=notes.md&message_id=N   a file for that message (raw bytes, like tickets)
@@ -2897,6 +3019,8 @@ class Handler(BaseHTTPRequestHandler):
                 if isinstance(obj, dict) and not getattr(self, "req_path", "").startswith("/api/chat"):
                     obj = {**obj, "chat": notice}
         self.send(code, json.dumps(obj, default=str), "application/json; charset=utf-8", extra)
+        if self.command not in ("GET", "HEAD") and code < 400:
+            self.server.store.bump()  # wake anyone waiting in /api/wait
 
     def html(self, body):
         role, actor = getattr(self, "who_is", (None, None))
@@ -2994,13 +3118,18 @@ class Handler(BaseHTTPRequestHandler):
             if method == "GET" and (cm := re.fullmatch(r"/chat/(\d+)", path)):
                 return self.html(render_chat(store, int(cm.group(1)), actor))
             if method == "GET" and (cm := re.fullmatch(r"/chat/(\d+)/since/(\d+)", path)):
-                # The chat page polls this for new messages (as HTML), which also marks them read.
+                # The chat page polls this for new messages (as HTML) and the read receipt; it marks them read.
                 cid = store.conversation(int(cm.group(1)))["id"]
                 msgs = store.messages(cid, after=int(cm.group(2)), internal=True)
                 if msgs:
                     store.mark_read(cid, actor, msgs[-1]["id"])
-                return self.send(200, "".join(render_message(store, m, actor) for m in msgs), "text/html; charset=utf-8",
-                                 {"Cache-Control": "no-store", "X-Last-Id": str(msgs[-1]["id"] if msgs else 0)})
+                return self.json(200, {"html": "".join(render_message(store, m, actor) for m in msgs),
+                                       "last": msgs[-1]["id"] if msgs else 0, "receipt": receipt_html(store, cid)})
+            if method == "GET" and path == "/api/wait":
+                t = (query.get("timeout") or ["50"])[0]
+                timeout = max(1, min(300, int(t) if t.isdigit() else 50))
+                queue = (query.get("queue") or [""])[0] in ("1", "true", "yes")
+                return self.json(200, store.wait_for(actor, timeout, queue))
             if path.startswith("/api/chat"):
                 return self.chat_api(method, path, query, actor, role)
             if method == "GET" and path == "/api/skill":

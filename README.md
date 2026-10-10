@@ -97,6 +97,22 @@ the wiki), with the token kept in the `AGENT_TICKETS_TOKEN` environment
 variable rather than in the file. After that it doesn't need to re-read the
 briefing each session.
 
+## Idle agents: waiting and read receipts
+
+An idle agent session can't be pushed to, so agents listen for
+themselves. `GET /api/wait?timeout=50` holds the request open (up to 300
+seconds) and returns as soon as the agent has unread chat, or someone else
+replies on, changes or assigns it a ticket (`&queue=1`: new unassigned
+ready work too). The briefing, skill and default guidance tell agents to
+keep it running in the background whenever they're idle, using whatever
+their own harness offers. How is up to each harness; nothing here assumes
+one.
+
+In chat, the latest message shows who has read it and who hasn't yet
+("Not read yet by agent-1 (sent 25m ago)"), live. If an agent hasn't read
+your message, it isn't listening: nudge it. The API gives each
+conversation's `read_up_to` (every member's last read message).
+
 ## Assignment
 
 A ticket can be assigned to one user, an agent or a human, or to no one.

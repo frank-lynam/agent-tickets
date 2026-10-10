@@ -660,9 +660,10 @@ class TicketsTest(unittest.TestCase):
         self.j("POST", f"/api/chat/{c['id']}/messages", {"body": f"See {t['id']}"}, role="human")
         self.assertIn(f'<a href="/t/{t["id"]}">', self.call("GET", f"/chat/{c['id']}", role="human")[1].decode())
         # Polling fragment: only newer messages.
-        _, frag, h = self.call("GET", f"/chat/{c['id']}/since/{m['id']}", role="human")
-        self.assertIn(f'See <a href="/t/{t["id"]}">', frag.decode())
-        self.assertNotIn("ZZZZ. Notes", frag.decode())
+        poll = self.j("GET", f"/chat/{c['id']}/since/{m['id']}", role="human")[1]
+        self.assertIn(f'See <a href="/t/{t["id"]}">', poll["html"])
+        self.assertNotIn("ZZZZ. Notes", poll["html"])
+        self.assertIn("Not read yet by agent-c", poll["receipt"])
         # One conversation per pair; groups need a title or more people.
         self.assertEqual(self.j("POST", "/api/chat", {"members": ["Frank"]}, role=None, token=tok)[1]["id"], c["id"])
         self.assertEqual(self.j("POST", "/api/chat", {"members": []}, role=None, token=tok)[0], 400)
@@ -841,6 +842,66 @@ class TicketsTest(unittest.TestCase):
         self.assertIn('<div id="dash">', dash)
         self.assertIn("10000", dash)
         self.assertNotIn("location.reload(); }, 60000", dash)
+
+    def test_wait(self):
+        tok = self.j("POST", "/api/users", {"username": "agent-z", "kind": "agent"}, role="human")[1]["token"]
+        mine = self.new("in_progress", assignee="agent-z", title="mine")
+        # Nothing for it: times out.
+        started = time.time()
+        got = self.j("GET", "/api/wait?timeout=1", role=None, token=tok)[1]
+        self.assertEqual(got["reason"], "timeout")
+        self.assertLess(time.time() - started, 4)
+
+        def later(fn, delay=0.4):
+            threading.Timer(delay, fn).start()
+
+        def waited(path="/api/wait?timeout=20"):
+            t0 = time.time()
+            r = self.j("GET", path, role=None, token=tok)[1]
+            return r, time.time() - t0
+        # A human replies on its ticket: wakes at once (well before the timeout).
+        later(lambda: self.j("POST", f"/api/tickets/{mine['id']}/comments", {"body": "use plan B"}, role="human"))
+        got, took = waited()
+        self.assertEqual((got["reason"], got["tickets"][0]["id"], got["tickets"][0]["why"]),
+                         ("tickets", mine["id"], "Frank commented"))
+        self.assertLess(took, 5)
+        # Its own changes don't wake it; being assigned a ticket does.
+        other = self.new("ready", title="next one")
+        later(lambda: self.j("POST", f"/api/tickets/{mine['id']}/comments", {"body": "on it"}, role=None, token=tok))
+        later(lambda: self.j("PATCH", f"/api/tickets/{other['id']}", {"assignee": "agent-z"}, role="human"), 1.2)
+        got, took = waited()
+        self.assertEqual([x["id"] for x in got["tickets"]], [other["id"]])
+        self.assertEqual(got["tickets"][0]["why"], "Frank assigned it to you")
+        self.assertGreater(took, 1)
+        # A chat message wakes it, and keeps returning at once until it's read.
+        later(lambda: self.j("POST", "/api/chat", {"members": ["agent-z"], "body": "got a sec?"}, role="human"))
+        got, took = waited()
+        self.assertEqual((got["reason"], got["chat"]["unread"]), ("chat", 1))
+        self.assertEqual(self.j("GET", "/api/wait?timeout=20", role=None, token=tok)[1]["reason"], "chat")
+        for c in self.j("GET", "/api/chat/unread", role=None, token=tok)[1]["conversations"]:
+            self.j("POST", f"/api/chat/{c['id']}/read", {}, role=None, token=tok)
+        # With queue=1, new unassigned ready work wakes it too.
+        later(lambda: self.new("ready", title="anyone's"))
+        got, _ = waited("/api/wait?timeout=20&queue=1")
+        self.assertEqual((got["reason"], got["tickets"][0]["title"], got["tickets"][0]["why"]),
+                         ("tickets", "anyone's", "Frank made it ready"))
+        # The briefing and skill teach it.
+        brief = self.call("GET", "/api", role=None)[1].decode()
+        self.assertIn("## Staying reachable when you're idle", brief)
+        self.assertIn("/api/wait", self.call("GET", "/api/skill", role=None, token=tok)[1].decode())
+
+    def test_read_receipts(self):
+        tok = self.j("POST", "/api/users", {"username": "agent-rr", "kind": "agent"}, role="human")[1]["token"]
+        c = self.j("POST", "/api/chat", {"members": ["agent-rr"], "body": "ping"}, role="human")[1]
+        html = self.call("GET", f"/chat/{c['id']}", role="human")[1].decode()
+        self.assertIn("Not read yet by agent-rr", html)
+        conv = self.j("GET", f"/api/chat/{c['id']}", role=None, token=tok)[1]  # reading it marks it read
+        self.assertEqual(conv["read_up_to"]["Frank"], conv["messages"][-1]["id"])
+        html = self.call("GET", f"/chat/{c['id']}", role="human")[1].decode()
+        self.assertIn("Read by agent-rr", html)
+        self.assertNotIn("Not read yet", html)
+        self.assertEqual(self.j("GET", f"/api/chat/{c['id']}", role="human")[1]["read_up_to"]["agent-rr"],
+                         conv["messages"][-1]["id"])
 
     def test_skill(self):
         code, body, h = self.call("GET", "/api/skill", role="agent", headers={"Host": "tickets.example:43917"})
