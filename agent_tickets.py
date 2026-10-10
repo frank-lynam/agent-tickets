@@ -119,6 +119,10 @@ WORD_ID = re.compile(r"([A-Za-z]+)[-_ ]+([A-Za-z]+)")
 ID_PATH = r"[A-Za-z]{4,5}|[A-Za-z]+-[A-Za-z]+"  # a ticket id in a URL
 
 
+def norm_wiki_path(path):
+    return "/".join(p for p in str(path or "").strip("/").lower().split("/") if p)
+
+
 def norm_id(tid):
     """A ticket id as stored: "amber-otter" (from any case, with a hyphen or a space), or "KAMI"."""
     tid = str(tid or "").strip()
@@ -175,6 +179,15 @@ CREATE TABLE IF NOT EXISTS chat_files (
   id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id INTEGER NOT NULL REFERENCES conversations(id),
   message_id INTEGER REFERENCES messages(id), filename TEXT NOT NULL, path TEXT NOT NULL, mime TEXT NOT NULL,
   size INTEGER NOT NULL, author TEXT NOT NULL, role TEXT NOT NULL, created_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS wiki_pages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, parent_id INTEGER REFERENCES wiki_pages(id), slug TEXT NOT NULL,
+  title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '', created_by TEXT NOT NULL, created_at REAL NOT NULL,
+  updated_by TEXT NOT NULL, updated_at REAL NOT NULL);
+CREATE UNIQUE INDEX IF NOT EXISTS wiki_sibling_slug ON wiki_pages(COALESCE(parent_id, 0), slug);
+CREATE TABLE IF NOT EXISTS wiki_revisions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, page_id INTEGER NOT NULL REFERENCES wiki_pages(id),
+  title TEXT NOT NULL, body TEXT NOT NULL, edited_by TEXT NOT NULL, edited_at REAL NOT NULL);
+CREATE INDEX IF NOT EXISTS wiki_revisions_page ON wiki_revisions(page_id, id);
 CREATE INDEX IF NOT EXISTS messages_conv ON messages(conversation_id, id);
 CREATE INDEX IF NOT EXISTS chat_members_user ON chat_members(username);
 CREATE INDEX IF NOT EXISTS chat_files_message ON chat_files(message_id);
@@ -186,9 +199,9 @@ CREATE INDEX IF NOT EXISTS events_ticket ON events(ticket_id, at);
 
 
 # Bumped (with a migration in Store.__init__) whenever the tables change.
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 TABLES = ("users", "settings", "tickets", "deps", "comments", "attachments", "events",
-          "conversations", "chat_members", "messages", "chat_files")
+          "conversations", "chat_members", "messages", "chat_files", "wiki_pages", "wiki_revisions")
 KINDS = ("human", "agent")
 USERNAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,31}")
 
@@ -239,8 +252,8 @@ class Store:
         db = self.db()
         db.executescript(SCHEMA)
         # 1 -> 2 added the users table, 2 -> 3 the settings table, 3 -> 4 the
-        # deps table, 4 -> 5 the chat tables (all created above); the columns
-        # are added here.
+        # deps table, 4 -> 5 the chat tables, 5 -> 6 the wiki tables (all
+        # created above); the columns are added here.
         for table, col, decl in (("tickets", "assignee", "TEXT"), ("users", "guidance", "TEXT"),
                                  ("tickets", "kind", "TEXT NOT NULL DEFAULT 'task'"), ("tickets", "epic_id", "TEXT"),
                                  ("tickets", "proposed", "INTEGER NOT NULL DEFAULT 0"),
@@ -758,6 +771,174 @@ class Store:
             raise ApiError(400, "the upload ended early")
         return name, mime, dest
 
+    # --- wiki: text pages in one tree. Every page has a place: a top-level
+    # section, or under another page. Humans write; agents read (for now).
+    def _wiki_human(self, role):
+        if role != "human":
+            raise ApiError(403, "the wiki is read-only for agents for now; if something is missing or wrong, "
+                                "tell a human in chat")
+
+    def _wiki_row(self, pid):
+        row = self.db().execute("SELECT * FROM wiki_pages WHERE id = ?", (pid,)).fetchone()
+        if not row:
+            raise ApiError(404, "no such wiki page")
+        return dict(row)
+
+    def wiki_resolve(self, path):
+        """The page at "section/page/subpage"."""
+        parts = [p for p in str(path or "").strip("/").lower().split("/") if p]
+        if not parts:
+            raise ApiError(404, "no wiki page there")
+        row, parent = None, None
+        for part in parts:
+            row = self.db().execute("SELECT * FROM wiki_pages WHERE COALESCE(parent_id, 0) = ? AND slug = ?",
+                                    (parent or 0, part)).fetchone()
+            if not row:
+                raise ApiError(404, f"no wiki page {'/'.join(parts)}")
+            parent = row["id"]
+        return dict(row)
+
+    def wiki_crumbs(self, page):
+        """[(title, path), ...] from the top-level section down to `page`."""
+        chain, cur = [], page
+        while cur:
+            chain.append(cur)
+            cur = self._wiki_row(cur["parent_id"]) if cur["parent_id"] else None
+        chain.reverse()
+        out, path = [], ""
+        for c in chain:
+            path = f"{path}/{c['slug']}" if path else c["slug"]
+            out.append((c["title"], path))
+        return out
+
+    def wiki_path(self, page):
+        return self.wiki_crumbs(page)[-1][1]
+
+    def wiki_children(self, pid):
+        rows = self.db().execute("SELECT * FROM wiki_pages WHERE COALESCE(parent_id, 0) = ? ORDER BY title COLLATE NOCASE",
+                                 (pid or 0,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def wiki_page(self, path):
+        p = self.wiki_resolve(path)
+        p["path"] = self.wiki_path(p)
+        p["breadcrumbs"] = [{"title": t, "path": x} for t, x in self.wiki_crumbs(p)]
+        p["children"] = [{"title": c["title"], "path": f'{p["path"]}/{c["slug"]}'} for c in self.wiki_children(p["id"])]
+        return p
+
+    def wiki_tree(self):
+        """Every page, as nested {"title", "path", "children"}."""
+        rows = [dict(r) for r in self.db().execute("SELECT id, parent_id, slug, title FROM wiki_pages")]
+        kids = {}
+        for r in rows:
+            kids.setdefault(r["parent_id"], []).append(r)
+
+        def build(pid, prefix):
+            out = []
+            for r in sorted(kids.get(pid, []), key=lambda r: r["title"].lower()):
+                path = f"{prefix}/{r['slug']}" if prefix else r["slug"]
+                out.append({"title": r["title"], "path": path, "children": build(r["id"], path)})
+            return out
+        return build(None, "")
+
+    def wiki_search(self, q):
+        like = f"%{q}%"
+        rows = self.db().execute("SELECT * FROM wiki_pages WHERE title LIKE ? OR body LIKE ? "
+                                 "ORDER BY title LIKE ? DESC, updated_at DESC LIMIT 50", (like, like, like)).fetchall()
+        out = []
+        for r in rows:
+            r = dict(r)
+            body = r["body"]
+            at = body.lower().find(q.lower())
+            snip = body[max(0, at - 60): at + 120] if at >= 0 else body[:180]
+            out.append({"title": r["title"], "path": self.wiki_path(r), "snippet": snip.strip()})
+        return out
+
+    @staticmethod
+    def _wiki_slug(slug, title):
+        slug = re.sub(r"[^a-z0-9]+", "-", str(slug or title or "").lower()).strip("-")[:60].strip("-")
+        if not slug:
+            raise ApiError(400, "a page needs a title (and a slug of letters, digits and hyphens)")
+        return slug
+
+    def _wiki_save(self, db, pid, title, body, actor, now):
+        db.execute("INSERT INTO wiki_revisions (page_id, title, body, edited_by, edited_at) VALUES (?,?,?,?,?)",
+                   (pid, title, body, actor, now))
+
+    def wiki_create(self, data, actor, role):
+        self._wiki_human(role)
+        title = str(data.get("title") or "").strip()[:200]
+        if not title:
+            raise ApiError(400, "a page needs a title")
+        parent = self.wiki_resolve(data["parent"]) if data.get("parent") else None
+        slug = self._wiki_slug(data.get("slug"), title)
+        body = str(data.get("body") or "")
+        now = time.time()
+        with self.write_lock:
+            db = self.db()
+            try:
+                with db:
+                    pid = db.execute("INSERT INTO wiki_pages (parent_id, slug, title, body, created_by, created_at, "
+                                     "updated_by, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+                                     (parent["id"] if parent else None, slug, title, body, actor, now, actor, now)).lastrowid
+                    self._wiki_save(db, pid, title, body, actor, now)
+            except sqlite3.IntegrityError:
+                raise ApiError(409, f"there's already a page called {slug} there")
+        return self.wiki_page(self.wiki_path(self._wiki_row(pid)))
+
+    def wiki_update(self, path, data, actor, role):
+        """Edit the title or text, rename (slug), or move it (parent: a path, or "" for a top-level section)."""
+        self._wiki_human(role)
+        p = self.wiki_resolve(path)
+        title = str(data["title"]).strip()[:200] if "title" in data else p["title"]
+        if not title:
+            raise ApiError(400, "a page needs a title")
+        body = str(data["body"]) if "body" in data else p["body"]
+        slug = self._wiki_slug(data["slug"], title) if data.get("slug") else p["slug"]
+        parent_id = p["parent_id"]
+        if "parent" in data:
+            parent_id = self.wiki_resolve(data["parent"])["id"] if data["parent"] else None
+            cur = parent_id
+            while cur:  # not under itself
+                if cur == p["id"]:
+                    raise ApiError(409, "a page can't go under itself or one of its own pages")
+                cur = self._wiki_row(cur)["parent_id"]
+        now = time.time()
+        with self.write_lock:
+            db = self.db()
+            try:
+                with db:
+                    db.execute("UPDATE wiki_pages SET parent_id = ?, slug = ?, title = ?, body = ?, updated_by = ?, "
+                               "updated_at = ? WHERE id = ?", (parent_id, slug, title, body, actor, now, p["id"]))
+                    if (title, body) != (p["title"], p["body"]):
+                        self._wiki_save(db, p["id"], title, body, actor, now)
+            except sqlite3.IntegrityError:
+                raise ApiError(409, f"there's already a page called {slug} there")
+        return self.wiki_page(self.wiki_path(self._wiki_row(p["id"])))
+
+    def wiki_delete(self, path, actor, role):
+        self._wiki_human(role)
+        p = self.wiki_resolve(path)
+        if self.wiki_children(p["id"]):
+            raise ApiError(409, "move or delete the pages under it first")
+        with self.write_lock:
+            db = self.db()
+            with db:
+                db.execute("DELETE FROM wiki_revisions WHERE page_id = ?", (p["id"],))
+                db.execute("DELETE FROM wiki_pages WHERE id = ?", (p["id"],))
+        return {"deleted": norm_wiki_path(path)}
+
+    def wiki_revisions(self, pid):
+        return [dict(r) for r in self.db().execute(
+            "SELECT id, title, edited_by, edited_at, length(body) AS size FROM wiki_revisions WHERE page_id = ? "
+            "ORDER BY id DESC", (pid,))]
+
+    def wiki_revision(self, pid, rid):
+        row = self.db().execute("SELECT * FROM wiki_revisions WHERE page_id = ? AND id = ?", (pid, rid)).fetchone()
+        if not row:
+            raise ApiError(404, "no such version")
+        return dict(row)
+
     # --- chat: conversations anyone can read and post in; members are the
     # people who get told about new messages.
     def conversation(self, cid, viewer=None):
@@ -1046,6 +1227,19 @@ def export_to(store, target, keep=30):
     return target, export_archive(store, target), 0
 
 
+def parents_first(pages):
+    """Wiki page rows ordered so every parent comes before its children."""
+    by_parent = {}
+    for p in pages:
+        by_parent.setdefault(p.get("parent_id"), []).append(p)
+    out, todo = [], list(by_parent.get(None, []))
+    while todo:
+        p = todo.pop(0)
+        out.append(p)
+        todo += by_parent.get(p["id"], [])
+    return out
+
+
 def import_archive(store, src, replace=False):
     """Restore a backup. Ids are kept, so links, ticket names and comment
     numbers stay the same. Refuses a data folder that already has tickets
@@ -1073,7 +1267,10 @@ def import_archive(store, src, replace=False):
                             db.execute(f"DELETE FROM {t}")
                 for t in TABLES:
                     cols = {r[1] for r in db.execute(f"PRAGMA table_info({t})")}
-                    for row in doc["tables"].get(t, []):
+                    rows = doc["tables"].get(t, [])
+                    if t == "wiki_pages":
+                        rows = parents_first(rows)
+                    for row in rows:
                         keep = {k: v for k, v in row.items() if k in cols}
                         if t == "users":
                             keep.pop("id", None)
@@ -1218,6 +1415,15 @@ dl.kv dt{color:var(--dim)}dl.kv dd{margin:0;overflow-wrap:anywhere}
 .who-pick{display:flex;flex-wrap:wrap;gap:6px 14px}.who-pick label{white-space:nowrap}
 :root[data-theme=goth] .msg.mine{background:#24113a;border-color:#4a2370}
 :root[data-theme=goth] .clist .count{box-shadow:var(--glow)}
+.wk{line-height:1.6}
+.wk h2,.wk h3,.wk h4{text-transform:none;letter-spacing:0;color:var(--ink);margin:18px 0 6px}
+.wk>:first-child{margin-top:0}.wk h2{font-size:19px}.wk h3{font-size:16px}.wk h4{font-size:15px}
+.wk p{white-space:pre-wrap;overflow-wrap:anywhere;margin:0 0 10px}
+.wk pre{white-space:pre;overflow:auto;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:8px 10px;font-size:13px}
+.wk code{font:13px ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--bg);padding:1px 4px;border-radius:4px}
+.crumbs{font-size:13px;color:var(--dim);margin-bottom:4px}.crumbs a{text-decoration:none}
+.tree,.tree ul{list-style:none;margin:0;padding:0}.tree ul{margin-left:16px;border-left:1px solid var(--line);padding-left:10px}
+.tree li{margin:3px 0}.tree a{text-decoration:none}.tree>li>a{font-weight:600}
 .list .item.prop{flex-wrap:wrap}.list .item.prop>a{flex:1 1 240px;min-width:0}.list .item.prop>.row{flex-wrap:wrap}
 .sub{margin-left:18px;border-left:2px solid var(--line);padding-left:10px}
 .deps li{margin:2px 0}
@@ -1281,7 +1487,7 @@ CHAT_BADGE = "<!--chat-badge-->"
 
 
 def page(title, body, active="", review_count=0):
-    tabs = [("/", "Dashboard"), ("/chat", "Chat"), ("/backlog", "Backlog"), ("/done", "Done"), ("/new", "New ticket"),
+    tabs = [("/", "Dashboard"), ("/chat", "Chat"), ("/wiki", "Wiki"), ("/backlog", "Backlog"), ("/done", "Done"), ("/new", "New ticket"),
             ("/users", "Users"), ("/guidance", "Guidance")]
     # The chat badge is per viewer: Handler.html() fills in CHAT_BADGE.
     nav = "".join(f'<a href="{h}" class="{"on" if h == active else ""}">{esc(n)}'
@@ -1908,6 +2114,213 @@ def render_chat(store, cid, viewer):
     return page(c["name"], body, "/chat", len(store.tickets(["review"])))
 
 
+WIKI_LINK = re.compile(r"\[\[([a-z0-9/-]+)(?:\|([^\]\n]+))?\]\]")
+
+
+def wiki_inline(store, text):
+    """One run of text: escaped, links, ticket ids, `code` and [[wiki/links]]."""
+    out = []
+    for i, part in enumerate(re.split(r"(`[^`\n]+`)", text)):
+        if i % 2:
+            out.append(f"<code>{esc(part[1:-1])}</code>")
+        else:
+            out.append(WIKI_LINK.sub(lambda m: f'<a href="/wiki/{m[1].strip("/")}">{m[2] or m[1]}</a>',
+                                     chat_text(store, part)))
+    return "".join(out)
+
+
+def wiki_html(store, text):
+    """Plain text with a little structure: # headings, ``` code blocks; blank lines split paragraphs."""
+    out, para, code = [], [], None
+
+    def flush():
+        if para:
+            out.append(f"<p>{wiki_inline(store, chr(10).join(para))}</p>")
+            para.clear()
+    for line in text.splitlines():
+        if line.strip().startswith("```"):
+            if code is None:
+                flush()
+                code = []
+            else:
+                out.append(f"<pre>{esc(chr(10).join(code))}</pre>")
+                code = None
+            continue
+        if code is not None:
+            code.append(line)
+        elif m := re.match(r"(#{1,3})\s+(.*)", line):
+            flush()
+            n = len(m[1]) + 1
+            out.append(f"<h{n}>{wiki_inline(store, m[2])}</h{n}>")
+        elif not line.strip():
+            flush()
+        else:
+            para.append(line)
+    if code is not None:
+        out.append(f"<pre>{esc(chr(10).join(code))}</pre>")
+    flush()
+    return "".join(out)
+
+
+def wiki_tree_html(nodes):
+    if not nodes:
+        return ""
+    return "<ul class=tree>" + "".join(
+        f'<li><a href="/wiki/{n["path"]}">{esc(n["title"])}</a>{wiki_tree_html(n["children"])}</li>' for n in nodes) + "</ul>"
+
+
+def wiki_parent_options(store, exclude=None, current=None):
+    """Every page as a <select> option (indented), except `exclude` and what's under it."""
+    opts = ['<option value="">(top level: a new section)</option>']
+
+    def walk(nodes, depth):
+        for n in nodes:
+            if exclude and (n["path"] == exclude or n["path"].startswith(exclude + "/")):
+                continue
+            sel = " selected" if current and n["path"] == current else ""
+            opts.append(f'<option value="{esc(n["path"])}"{sel}>{"— " * depth}{esc(n["title"])}</option>')
+            walk(n["children"], depth + 1)
+    walk(store.wiki_tree(), 0)
+    return "".join(opts)
+
+
+WIKI_INTRO = ("Shared knowledge for humans and agents: onboarding, repos, conventions, key details. "
+              "Every page lives in a section or under another page. Plain text; <code># Heading</code>, "
+              "<code>```</code> code blocks, <code>`code`</code>, and <code>[[section/page]]</code> links. "
+              "Agents can read it but not change it.")
+
+
+def render_wiki_index(store, role, q):
+    if q:
+        hits = store.wiki_search(q)
+        rows = "".join(f'<div class="item"><a href="/wiki/{h["path"]}"><b>{esc(h["title"])}</b>'
+                       f'<div class="meta">{esc(h["path"])}</div><div class="snip">{esc(h["snippet"])}</div></a></div>'
+                       for h in hits)
+        listing = f'<h2>Results for “{esc(q)}”</h2><div class="list">{rows or "<p class=empty>Nothing found.</p>"}</div>'
+    else:
+        tree = wiki_tree_html(store.wiki_tree())
+        listing = f'<div class="box">{tree or "<p class=empty>No pages yet.</p>"}</div>'
+    new = ('<p><a class="btn" href="/wiki-new" style="text-decoration:none;display:inline-block">New section</a></p>'
+           if role == "human" else "")
+    body = (f'<h1>Wiki</h1><p class="meta">{WIKI_INTRO}</p>'
+            f'<form class="row" method="get" action="/wiki" style="margin-bottom:12px"><input type="search" name="q" '
+            f'value="{esc(q)}" placeholder="Search the wiki" aria-label="Search the wiki" style="flex:1;min-width:0">'
+            f'<button>Search</button></form>{new}{listing}')
+    return page("Wiki", body, "/wiki", len(store.tickets(["review"])))
+
+
+WIKI_EDIT_JS = """
+const $ = (id) => document.getElementById(id);
+const wf = $('wf');
+if (wf) wf.onsubmit = async (e) => {
+  e.preventDefault();
+  const data = {title: $('wtitle').value, body: $('wbody').value};
+  if ($('wslug')) data.slug = $('wslug').value;
+  if ($('wparent')) data.parent = $('wparent').value;
+  try {
+    const p = WPATH ? await api('PUT', '/api/wiki/' + WPATH, data) : await api('POST', '/api/wiki', data);
+    location.href = '/wiki/' + p.path;
+  } catch (err) { fail(err); }
+};
+async function wdel(){
+  if (!confirm('Delete this page?')) return;
+  try { await api('DELETE', '/api/wiki/' + WPATH); location.href = '/wiki'; } catch (err) { fail(err); }
+}
+"""
+
+
+def wiki_form(store, page_=None, parent=None):
+    """The new-page or edit form (humans only)."""
+    p = page_ or {}
+    here = p.get("path")
+    parent_path = here.rsplit("/", 1)[0] if here and "/" in here else (parent if not here else "")
+    return f"""<form class="stack box" id="wf">
+<label>Title<input type="text" id="wtitle" required value="{esc(p.get('title', ''))}"></label>
+<div class="row"><label style="flex:1;min-width:180px">Under<select id="wparent">{wiki_parent_options(store, here, parent_path)}</select></label>
+<label style="flex:1;min-width:140px">Address (optional)<input type="text" id="wslug" value="{esc(p.get('slug', ''))}"
+ placeholder="from the title"></label></div>
+<label>Text<textarea id="wbody" rows="18" style="font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace">{esc(p.get('body', ''))}</textarea></label>
+<div class="row"><button class="primary">Save</button>{'<button type="button" onclick="wdel()">Delete page</button>' if here and not p.get('children') else ''}</div>
+</form><script>const WPATH = {json.dumps(here or "")};{WIKI_EDIT_JS}</script>"""
+
+
+def render_wiki_new(store, parent):
+    parent = norm_wiki_path(parent)
+    where = f" under {esc(store.wiki_page(parent)['title'])}" if parent else " (a new top-level section)"
+    body = f'<p class="crumbs"><a href="/wiki">Wiki</a></p><h1>New page{where}</h1>{wiki_form(store, parent=parent)}'
+    return page("New wiki page", body, "/wiki", len(store.tickets(["review"])))
+
+
+def render_wiki_page(store, path, role, history=False, rev=None, edit=False):
+    p = store.wiki_page(path)
+    crumbs = " / ".join([f'<a href="/wiki">Wiki</a>'] + [f'<a href="/wiki/{c["path"]}">{esc(c["title"])}</a>'
+                                                          for c in p["breadcrumbs"][:-1]])
+    meta = f'Updated {ago(p["updated_at"])} by {esc(p["updated_by"])} · <a href="/wiki/{p["path"]}?history=1">History</a>'
+    if edit and role == "human":
+        main = wiki_form(store, p)
+    elif rev:
+        r = store.wiki_revision(p["id"], int(rev))
+        main = (f'<p class="banner prop">The version {esc(r["edited_by"])} saved {when(r["edited_at"])}. '
+                f'<a href="/wiki/{p["path"]}">Current version</a></p><div class="box wk">{wiki_html(store, r["body"])}</div>')
+    elif history:
+        rows = "".join(f'<div class="item"><a href="/wiki/{p["path"]}?rev={r["id"]}"><b>{esc(r["title"])}</b>'
+                       f'<div class="meta">{esc(r["edited_by"])} · {when(r["edited_at"])} · {r["size"]} characters</div></a></div>'
+                       for r in store.wiki_revisions(p["id"]))
+        main = f'<h2>History</h2><div class="list">{rows}</div>'
+    else:
+        main = f'<div class="box wk">{wiki_html(store, p["body"]) or "<p class=meta>No text yet.</p>"}</div>'
+    kids = "".join(f'<li><a href="/wiki/{c["path"]}">{esc(c["title"])}</a></li>' for c in p["children"])
+    actions = ""
+    if role == "human" and not edit:
+        actions = (f'<div class="row" style="margin:8px 0 14px"><a class="btn" href="/wiki/{p["path"]}?edit=1" '
+                   f'style="text-decoration:none">Edit</a><a class="btn" href="/wiki-new?parent={p["path"]}" '
+                   f'style="text-decoration:none">Add a page under this</a></div>')
+    body = (f'<p class="crumbs">{crumbs}</p><h1>{esc(p["title"])}</h1><div class="meta">{meta}</div>{actions}{main}'
+            + (f'<h2>Pages under this</h2><ul class="tree box" style="padding:12px 16px">{kids}</ul>' if kids else ""))
+    return page(p["title"], body, "/wiki", len(store.tickets(["review"])))
+
+
+def skill_md(base):
+    """A ready-made Claude Code style skill for this server, for an agent to save."""
+    return f"""---
+name: agent-tickets
+description: Work with the agent-tickets server at {base} - take tickets, comment, hand work back for review, upload files, answer chat from humans, and read the team wiki. Use whenever a task mentions tickets (ids like amber-otter), the tracker, chat, or the wiki.
+---
+
+# Agent tickets ({base})
+
+Every request: `Authorization: Bearer $AGENT_TICKETS_TOKEN`. Keep the token in that environment variable (or
+your harness's secret store); never write it into files, comments, chat or this skill.
+
+The full briefing, with every rule and endpoint: `GET {base}/api`. Re-read it when something here isn't
+enough, or a request fails in a way you don't understand. Errors come back as `{{"error": "..."}}`.
+
+## Each session
+
+1. `GET /api/me`: who you are, your humans' current guidance (follow it; it changes), unread chat count.
+2. Unread chat? Answer it before anything else: `GET /api/chat/unread`, then `POST /api/chat/ID/messages`
+   `{{"body": "..."}}` (or `POST /api/chat/ID/read` if no reply is needed). Any response with a `"chat"`
+   field means the same: stop, answer chat, then carry on.
+3. `GET /api/next?claim=1` takes the next ready ticket (yours first). `{{"ticket": null}}`: nothing to do.
+4. Read the whole ticket (`GET /api/tickets/ID`): description, every comment, checklist.
+5. Unfamiliar project? Check the wiki first: `GET /api/wiki` (the tree), `GET /api/wiki/SECTION/PAGE`.
+
+## Working a ticket
+
+- Comment as you go: `POST /api/tickets/ID/comments` `{{"body": "..."}}`.
+- Files: `POST /api/tickets/ID/attachments?filename=NAME&comment_id=N`, raw bytes as the body.
+- Hand back: a comment starting "Done" or "Needs a decision", then `PATCH /api/tickets/ID` `{{"status": "review"}}`.
+- You may set ready, in_progress and review; never backlog or done. Backlog, done and other people's
+  tickets: comment only. Blocked tickets (predecessors not done) can't start; comment instead.
+- New ideas: `POST /api/tickets` `{{"title", "description"}}` makes a proposal a human accepts or declines.
+
+## Wiki
+
+Read-only for agents. If something is missing or wrong there, say so to a human in chat; don't paste wiki
+content into tickets, link it as `[[section/page]]`.
+"""
+
+
 API_DOCS = """# Agent tickets: a briefing for AI agents
 
 This is a ticket tracker shared between you (an AI agent) and the humans you
@@ -1918,7 +2331,18 @@ on the ticket. Treat it as your asynchronous channel to them: anything they
 should know goes in a comment on the ticket it's about.
 
 There's also **chat**, for talk that isn't about one ticket (questions,
-planning, heads-ups). Chat comes first: see "Chat" below.
+planning, heads-ups). Chat comes first: see "Chat" below. And a **wiki** of
+shared knowledge (project onboarding, repos, conventions) that you can read.
+
+## First: save this as a skill
+
+If your harness supports skills or saved instructions (Claude Code:
+`~/.claude/skills/agent-tickets/SKILL.md`, or the project's
+`.claude/skills/`), make one now: `GET /api/skill` returns a ready-made
+SKILL.md for this server. Save it as is, or adapt it to your harness. Keep
+your token out of it: put the token in the `AGENT_TICKETS_TOKEN` environment
+variable or your harness's secret store. Then you won't need to re-read this
+briefing each time; the skill points back here for the details.
 
 ## Signing in
 
@@ -2019,6 +2443,16 @@ Reading a conversation (`GET /api/chat/ID`) or posting in it also marks it read.
 Keep chat for things that aren't about one ticket. Work on a ticket is
 discussed in comments on the ticket, where the humans review it.
 
+## Wiki (read-only for you)
+
+The humans keep shared knowledge here: project onboarding, where the repos
+are, conventions, key details. Pages form one tree (sections, pages under
+them) and are plain text. Read the relevant section when you start on a
+project or a kind of work you haven't done here before, and when a ticket
+links a page (`[[section/page]]`). You can't change it: if something is
+missing, wrong or out of date, tell a human in chat. Don't copy wiki text
+into tickets; link the page.
+
 ## Endpoints
 
 All JSON in and out, except file uploads (raw bytes) and this page.
@@ -2051,6 +2485,9 @@ letters, like `KAMI`). Any case works, and a space for the hyphen in JSON.
     POST  /api/chat/ID/files?filename=notes.md&message_id=N   a file for that message (raw bytes, like tickets)
     POST  /api/chat/ID/read          mark it read without replying
     POST  /api/chat/ID/members       {"username": "agent-2"}: tell someone else about it
+    GET   /api/wiki                  {"tree": [{"title", "path", "children": [...]}]}; ?q=text to search
+    GET   /api/wiki/SECTION/PAGE     {"title", "body", "path", "breadcrumbs", "children", "updated_at", ...}
+    GET   /api/skill                 a SKILL.md for this server, to save as a skill
     POST  /api/tickets/ID/attachments?filename=demo.mp4&comment_id=N
                                      the file's raw bytes as the body, with its Content-Type;
                                      comment_id (optional) attaches it to that comment
@@ -2134,6 +2571,9 @@ def docs_for(store, actor, role):
         lines += [f"- {t['id']}: {t['title']}" for t in queue]
     if not mine and not queue and role == "agent":
         lines.append("Nothing is assigned to you. `GET /api/next?claim=1` takes the next unassigned ready ticket.")
+    sections = store.wiki_tree()
+    if sections:
+        lines.append("Wiki sections: " + ", ".join(f"{n['title']} (`{n['path']}`)" for n in sections) + ".")
     guidance = store.guidance_for(actor)
     head = API_DOCS.split("\n## Signing in", 1)
     return (head[0] + "\n## Guidance from your humans\n\nFollow this; it overrides the general advice below.\n\n"
@@ -2299,6 +2739,33 @@ class Handler(BaseHTTPRequestHandler):
                                  {"Cache-Control": "no-store", "X-Last-Id": str(msgs[-1]["id"] if msgs else 0)})
             if path.startswith("/api/chat"):
                 return self.chat_api(method, path, query, actor, role)
+            if method == "GET" and path == "/api/skill":
+                proto = "https" if self.headers.get("X-Forwarded-Proto") == "https" else "http"
+                base = f"{proto}://{self.headers.get('Host') or 'localhost'}"
+                return self.send(200, skill_md(base), "text/markdown; charset=utf-8", {"Cache-Control": "no-store"})
+            if method == "GET" and path == "/wiki":
+                return self.html(render_wiki_index(store, role, (query.get("q") or [""])[0].strip()))
+            if method == "GET" and path == "/wiki-new":
+                if role != "human":
+                    raise ApiError(403, "the wiki is read-only for agents for now")
+                return self.html(render_wiki_new(store, (query.get("parent") or [""])[0]))
+            if method == "GET" and path.startswith("/wiki/"):
+                return self.html(render_wiki_page(store, path[6:], role, bool(query.get("history")),
+                                                  (query.get("rev") or [""])[0] if (query.get("rev") or [""])[0].isdigit()
+                                                  else None, bool(query.get("edit"))))
+            if path == "/api/wiki" or path.startswith("/api/wiki/"):
+                sub = path[len("/api/wiki/"):] if path.startswith("/api/wiki/") else ""
+                if method == "GET" and not sub:
+                    q = (query.get("q") or [""])[0].strip()
+                    return self.json(200, {"results": store.wiki_search(q)} if q else {"tree": store.wiki_tree()})
+                if method == "GET":
+                    return self.json(200, store.wiki_page(sub))
+                if method == "POST" and not sub:
+                    return self.json(201, store.wiki_create(self.body_json(), actor, role))
+                if method in ("PUT", "PATCH") and sub:
+                    return self.json(200, store.wiki_update(sub, self.body_json(), actor, role))
+                if method == "DELETE" and sub:
+                    return self.json(200, store.wiki_delete(sub, actor, role))
             um = re.fullmatch(r"/api/users(?:/([^/]+))?(/token)?", path)
             if method == "GET" and path == "/users":
                 if role != "human":

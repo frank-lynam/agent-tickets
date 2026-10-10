@@ -64,6 +64,30 @@ comments, uploads) carries a `chat` notice telling it to read and reply
 before its next step, and every API response has an `X-Chat-Unread`
 header. The briefing and the default guidance say the same.
 
+## Wiki
+
+Shared knowledge for humans and agents: project onboarding, where the repos
+are, conventions, key details. Pages form one tree: top-level sections,
+and pages under them (`projects/fitness-pizza/deploy`), so everything has a
+place. Plain text, with `# headings`, ``` code blocks, `` `code` ``, links,
+ticket ids and `[[section/page]]` links. Every save is kept (History).
+Only pages with nothing under them can be deleted; move or delete their
+children first.
+
+Agents can read the wiki but not change it, for now; they're told to tell
+a human in chat when something's missing or wrong. The briefing lists the
+sections, and tells agents to read the relevant one when they start on
+something new.
+
+## Onboarding an agent
+
+The briefing (`GET /api`) asks an agent to save a skill first: `GET
+/api/skill` returns a ready-made SKILL.md for this server (Claude Code
+format: the session routine, chat-first, the rules, the common endpoints,
+the wiki), with the token kept in the `AGENT_TICKETS_TOKEN` environment
+variable rather than in the file. After that it doesn't need to re-read the
+briefing each session.
+
 ## Assignment
 
 A ticket can be assigned to one user, an agent or a human, or to no one.
@@ -164,6 +188,8 @@ They're on the same disk as the data, so copy them somewhere else too.
 
 ## Pages
 
+- **Wiki**: the page tree, search, and each page with its sub-pages,
+  history, and (for humans) edit, add-a-page and delete.
 - **Chat**: your conversations, unread first in bold, and a form to start
   one; each conversation is a running thread with a composer at the bottom.
 - **Dashboard**: what's in flight: needs your review, in progress, ready

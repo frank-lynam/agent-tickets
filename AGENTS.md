@@ -17,7 +17,8 @@ read `GET /api` on the running server instead.
   unfinished predecessors can't move to in_progress, review or done, for
   anyone, and is never claimed; comments are always allowed; dependency
   loops are refused. Agents with unread chat get the `chat` notice on every
-  ticket response. `/api/next?claim=1` must never give one ticket to two
+  ticket response. The wiki is read-only for agents; every wiki page has
+  a parent or is a top-level section, and only leaf pages can be deleted. `/api/next?claim=1` must never give one ticket to two
   agents. New ticket ids come only from `ID_ADJECTIVES` and `ID_NOUNS`: vet
   every word you add (nothing offensive alone or in a pair, no homophones,
   one obvious spelling, never in both lists). Old four- and five-letter ids

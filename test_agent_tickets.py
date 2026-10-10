@@ -667,6 +667,77 @@ class TicketsTest(unittest.TestCase):
             self.assertEqual(msgs[1]["files"][0]["filename"], "notes.md")
             self.assertTrue((restored.files / msgs[1]["files"][0]["_path"]).is_file())
 
+    # --- wiki
+    def test_wiki(self):
+        tok = self.j("POST", "/api/users", {"username": "agent-w", "kind": "agent"}, role="human")[1]["token"]
+        mk = lambda **d: self.j("POST", "/api/wiki", d, role="human")
+        code, sec = mk(title="Projects", body="Everything per project.")
+        self.assertEqual((code, sec["path"]), (201, "projects"))
+        fp = mk(title="Fitness Pizza", parent="projects", body="# Repo\nSee `~/workspace/fitness-pizza` and [[projects/fitness-pizza/deploy|deploy notes]].\n\n<script>x</script>")[1]
+        self.assertEqual(fp["path"], "projects/fitness-pizza")
+        dep = mk(title="Deploy", parent="projects/fitness-pizza", body="```\n./deploy.sh <prod>\n```")[1]
+        self.assertEqual([c["path"] for c in dep["breadcrumbs"]], ["projects", "projects/fitness-pizza", "projects/fitness-pizza/deploy"])
+        # Structure: siblings need distinct names (the same name elsewhere is fine); a parent must exist.
+        self.assertEqual(mk(title="Deploy", parent="projects/fitness-pizza")[0], 409)
+        self.assertEqual(mk(title="Deploy", parent="projects")[0], 201)
+        self.assertEqual(mk(title="Orphan", parent="nowhere")[0], 404)
+        self.assertEqual(mk(title="  ")[0], 400)
+        # Agents read, and can't write.
+        got = self.j("GET", "/api/wiki/Projects/fitness-pizza", role=None, token=tok)[1]
+        self.assertEqual((got["title"], [c["path"] for c in got["children"]]), ("Fitness Pizza", ["projects/fitness-pizza/deploy"]))
+        tree = self.j("GET", "/api/wiki", role=None, token=tok)[1]["tree"]
+        self.assertIn("projects/fitness-pizza/deploy", json.dumps(tree))
+        self.assertEqual(self.j("GET", "/api/wiki?q=deploy.sh", role=None, token=tok)[1]["results"][0]["path"],
+                         "projects/fitness-pizza/deploy")
+        for method, path, body in (("POST", "/api/wiki", {"title": "x"}), ("PUT", "/api/wiki/projects", {"body": "x"}),
+                                   ("DELETE", "/api/wiki/projects/deploy", None)):
+            self.assertEqual(self.j(method, path, body, role=None, token=tok)[0], 403, path)
+        self.assertEqual(self.call("GET", "/wiki-new", role=None, token=tok)[0], 403)
+        # Edits keep history; rename and move change the path; no moving under itself.
+        self.j("PUT", "/api/wiki/projects/fitness-pizza", {"body": fp["body"] + "\nMore."}, role="human")
+        moved = self.j("PUT", "/api/wiki/projects/deploy", {"parent": "", "slug": "deploying"}, role="human")[1]
+        self.assertEqual(moved["path"], "deploying")
+        self.assertEqual(self.j("PUT", "/api/wiki/projects", {"parent": "projects/fitness-pizza"}, role="human")[0], 409)
+        self.assertEqual(len(self.srv.store.wiki_revisions(fp["id"])), 2)
+        # Only leaf pages can be deleted.
+        self.assertEqual(self.j("DELETE", "/api/wiki/projects/fitness-pizza", role="human")[0], 409)
+        self.assertEqual(self.j("DELETE", "/api/wiki/deploying", role="human")[0], 200)
+        self.assertEqual(self.j("GET", "/api/wiki/deploying", role="human")[0], 404)
+        # Pages: text with headings, code, links; escaped; agents see no edit buttons.
+        html = self.call("GET", "/wiki/projects/fitness-pizza", role="human")[1].decode()
+        self.assertIn("<h2>Repo</h2>", html)
+        self.assertIn("<code>~/workspace/fitness-pizza</code>", html)
+        self.assertIn('<a href="/wiki/projects/fitness-pizza/deploy">deploy notes</a>', html)
+        self.assertNotIn("<script>x</script>", html)
+        self.assertIn("Add a page under this", html)
+        self.assertNotIn("?edit=1", self.call("GET", "/wiki/projects/fitness-pizza", role=None, token=tok)[1].decode())
+        self.assertIn("&lt;prod&gt;", self.call("GET", "/wiki/projects/fitness-pizza/deploy", role="human")[1].decode())
+        for path in ("/wiki", "/wiki?q=pizza", "/wiki-new", "/wiki-new?parent=projects", "/wiki/projects?history=1",
+                     "/wiki/projects/fitness-pizza?edit=1"):
+            self.assertEqual(self.call("GET", path, role="human")[0], 200, path)
+        rev = self.srv.store.wiki_revisions(fp["id"])[-1]["id"]
+        self.assertIn("The version", self.call("GET", f"/wiki/projects/fitness-pizza?rev={rev}", role="human")[1].decode())
+        # The briefing names the sections; backups restore a page moved under a newer one.
+        self.assertIn("Wiki sections: Projects (`projects`)", self.call("GET", "/api", role=None, token=tok)[1].decode())
+        late = mk(title="Later section")[1]
+        self.j("PUT", "/api/wiki/projects", {"parent": late["path"]}, role="human")
+        with tempfile.TemporaryDirectory() as tmp:
+            at.export_archive(self.srv.store, Path(tmp) / "b.tar.gz")
+            restored = at.Store(Path(tmp) / "data", [tmp])
+            at.import_archive(restored, Path(tmp) / "b.tar.gz")
+            self.assertEqual(restored.wiki_page("later-section/projects/fitness-pizza/deploy")["title"], "Deploy")
+
+    def test_skill(self):
+        code, body, h = self.call("GET", "/api/skill", role="agent", headers={"Host": "tickets.example:43917"})
+        text = body.decode()
+        self.assertEqual(code, 200)
+        self.assertTrue(text.startswith("---\nname: agent-tickets\ndescription: "))
+        self.assertIn("http://tickets.example:43917", text)
+        self.assertIn("$AGENT_TICKETS_TOKEN", text)
+        self.assertNotIn(self.keys["agent"], text)
+        brief = self.call("GET", "/api", role=None)[1].decode()
+        self.assertLess(brief.index("GET /api/skill"), brief.index("## Signing in"))  # up front
+
     def test_old_database_upgrades(self):
         with tempfile.TemporaryDirectory() as tmp:
             data = Path(tmp) / "data"
