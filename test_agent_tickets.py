@@ -1101,6 +1101,29 @@ class TicketsTest(unittest.TestCase):
                    role="human")[1]
         self.assertEqual((e["status"], e["assignee"]), ("backlog", None))
 
+    def test_what_now(self):
+        a1 = self.j("POST", "/api/users", {"username": "agent-w1", "kind": "agent"}, role="human")[1]["token"]
+        a2 = self.j("POST", "/api/users", {"username": "agent-w2", "kind": "agent"}, role="human")[1]["token"]
+        t = self.new("ready", title="clear it up", assignee="agent-w1", priority=1)
+        say = lambda tok: self.j("GET", f"/api/tickets/{t['id']}", role=None, token=tok)[1]["what_now"]
+        self.assertTrue(say(a1).startswith("Assigned to you and ready: start it"))
+        self.assertTrue(say(a2).startswith("Ready, but assigned to agent-w1"))
+        # Claiming: the ticket that comes back says it's yours to work, now.
+        got = self.j("GET", "/api/next?claim=1", role=None, token=a1)[1]["ticket"]
+        self.assertEqual(got["id"], t["id"])
+        self.assertTrue(got["what_now"].startswith("This ticket is yours and in progress: you are working on it now"))
+        self.assertEqual(say(a2), "agent-w1 is working on this: you can only comment.")
+        # Lists, updates and other states.
+        listed = [x for x in self.j("GET", "/api/tickets?status=in_progress", role=None, token=a1)[1]["tickets"] if x["id"] == t["id"]]
+        self.assertIn("yours and in progress", listed[0]["what_now"])
+        self.assertIn("waiting for a human", self.j("PATCH", f"/api/tickets/{t['id']}", {"status": "review"}, role=None, token=a1)[1]["what_now"])
+        waiting = self.new("ready", title="after it", depends_on=t["id"])
+        self.assertTrue(self.j("GET", f"/api/tickets/{waiting['id']}", role=None, token=a2)[1]["what_now"].startswith(f"Blocked until {t['id']} is done"))
+        self.assertNotIn("what_now", self.j("GET", f"/api/tickets/{t['id']}", role="human")[1])  # only agents get it
+        brief = self.call("GET", "/api", role=None)[1].decode()
+        self.assertIn('**Never stop because a ticket is "already in progress".**', brief)
+        self.assertIn("If it's\n  assigned to you, that's you", brief)
+
     def test_skill(self):
         code, body, h = self.call("GET", "/api/skill", role="agent", headers={"Host": "tickets.example:43917"})
         text = body.decode()

@@ -265,7 +265,7 @@ GONE = ("checklist_path is gone: keep your checklist on your machine and upload 
 DEFAULT_GUIDANCE = """## How we work
 
 0. Chat comes first. When a response carries a "chat" notice, read your unread messages and answer them before your next step on the ticket. Chat is for questions and planning that aren't about one ticket; anything about a ticket goes in a comment on that ticket.
-1. When you take a ticket, first post a one-line comment: you're starting, and you'll write a checklist.
+1. When you take a ticket, it's in progress and assigned to you: that means you are working on it now. First post a one-line comment: you're starting, and you'll write a checklist.
 2. Write a markdown checklist of the steps ("- [ ] step") in a file on your machine, upload it (PUT /api/tickets/ID/checklist), and post a short plan: what you'll do, and how you'll know it's done.
 3. After each step, tick it off in your file, upload it again, and comment what you did and what happened, including errors and surprises.
 4. When something is visible (a page, a chart, a game), attach a screenshot or a short recording.
@@ -3020,12 +3020,16 @@ enough, or a request fails in a way you don't understand. Errors come back as `{
    `{{"body": "..."}}` (or `POST /api/chat/ID/read` if no reply is needed). Any response with a `"chat"`
    field means the same: stop, answer chat, then carry on.
 3. `GET /api/next?claim=1` takes the next ready ticket (yours first). `{{"ticket": null}}`: nothing to do.
+   The ticket you get is now in progress and assigned to you: that means you work on it, now.
 4. Read the whole ticket (`GET /api/tickets/ID`): description, every comment, checklist, and every page
    in its `wiki_links` (`GET /api/wiki/PATH`).
 5. Unfamiliar project? Check the wiki first: `GET /api/wiki` (the tree), `GET /api/wiki?q=a+few+words`.
 
 ## Working a ticket
 
+- A ticket that's in progress and assigned to you is yours to work: do it, and don't stop because it's
+  "already in progress" (you put it there). Only other people's in-progress tickets are comment-only. Each
+  ticket from the API has a `what_now` line saying what it means for you; follow it.
 - Comment as you go: `POST /api/tickets/ID/comments` `{{"body": "..."}}`.
 - Checklist: keep it in a markdown file on your machine ("- [ ] step"); after each step upload the whole
   file: `PUT /api/tickets/ID/checklist` (body: the file's text, `Content-Type: text/markdown`). Each upload
@@ -3098,14 +3102,25 @@ put it in comments or files.
   *propose* new tickets here (things you noticed that need doing); a human
   accepts or declines them.
 - **ready**: cleared for work. Pick these up when you have time.
-- **in_progress**: someone is working on it. Move a ticket here when you
-  start it, so no one else takes it.
+- **in_progress**: its assignee is working on it right now. **If it's
+  assigned to you, that's you: do the work, and comment on the ticket as
+  you go.** Claiming a ticket (`/api/next?claim=1`) or starting it puts it
+  here, assigned to you; that's the signal to begin, not a sign that it's
+  taken. Only someone *else's* in-progress ticket is hands-off (comment
+  only). Check `assignee` against your username (`GET /api/me`).
 - **review**: the humans' turn. Move a ticket here when it's finished, or
   when you need a decision before you can go on.
 - **done**: a human approved it. Only humans set this.
 
 Tickets can be assigned to one user (an agent or a human). Work on tickets
 assigned to you; you may also take unassigned ready ones.
+
+**Never stop because a ticket is "already in progress".** If it's assigned
+to you, you put it there (or a human gave it to you): it's yours to work,
+now. Every ticket the API returns to you also has `"what_now"`, one line
+saying what it means for you (for example "This ticket is yours and in
+progress: you are working on it now...", or "agent-2 is working on this:
+you can only comment"). When in doubt, follow it.
 
 **Epics** group the tickets of one plan (`"kind": "epic"`). They aren't
 worked directly: you'll never get one from /api/next, and you can only
@@ -3149,8 +3164,10 @@ proposed tickets, in one step.
 1. `GET /api/next?claim=1`: takes your next ready ticket (ones assigned
    to you first, then unassigned ones; high priority first, then oldest),
    moves it to in_progress and assigns it to you in the same step, so two
-   agents never get the same one. `{"ticket": null}` means there's nothing
-   to do. The response also has `"guidance"`: the current house rules for
+   agents never get the same one. **The ticket you get back is yours, in
+   progress: you're working on it from this moment.** Start the work; don't
+   look for another ticket or wait for permission. `{"ticket": null}`
+   means there's nothing to do. The response also has `"guidance"`: the current house rules for
    you. Read it every time; humans change it.
 2. Read the whole ticket: `GET /api/tickets/ID` has the description, every
    comment (humans' replies included: they're instructions), the status
@@ -3319,6 +3336,7 @@ default). Prefer one tarball over dozens of loose files.
 A ticket looks like:
 
     {"id": "amber-otter", "title": "...", "description": "...", "status": "in_progress", "assignee": "agent-1",
+     "what_now": "This ticket is yours and in progress: you are working on it now. ...",
      "kind": "task", "epic_id": "quiet-falcon", "epic_title": "...", "proposed": 0, "declined": 0, "cancelled": 0,
      "blocked_by": [], "depends_on": [{"id": "stony-brook", "title": "...", "status": "done"}], "unblocks": [...],
      "priority": 2, "created_by": "frank",
@@ -3397,6 +3415,41 @@ def docs_for(store, actor, role):
 
 # --------------------------------------------------------------------------- HTTP
 
+def what_now(t, me):
+    """One line telling an agent what a ticket means for it, right now."""
+    mine = bool(t.get("assignee")) and t["assignee"].lower() == me.lower()
+    who, st = t.get("assignee"), t["status"]
+    blocked = t.get("blocked_by") or []
+    if t.get("kind") == "epic":
+        return "An epic (a plan that groups tickets): it isn't worked directly. Work its tickets; you can comment here."
+    if t.get("proposed"):
+        return "A proposal waiting for a human to accept or decline it: comment only for now."
+    if st == "done":
+        if t.get("cancelled"):
+            return "Cancelled by a human: stop any work on it. You can still comment."
+        return "Done (approved or declined): nothing to do. You can still comment."
+    if st == "review":
+        return ("You handed this back; it's waiting for a human. Don't keep working on it unless they move it back "
+                "to in progress." if mine else "Waiting for a human's review: comment only.")
+    if st == "in_progress":
+        if mine:
+            return ("This ticket is yours and in progress: you are working on it now. Do the work, comment on the "
+                    "ticket as you go, upload your checklist after each step, and hand back with a comment and "
+                    "status review (or release it to ready if someone else should take it).")
+        if who:
+            return f"{who} is working on this: you can only comment."
+        return "In progress with no one assigned: you can take it by assigning it to yourself, then work on it."
+    if blocked:
+        return f"Blocked until {', '.join(blocked)} {'is' if len(blocked) == 1 else 'are'} done: it can't start yet. Comment if you have ideas."
+    if st == "ready":
+        if mine:
+            return "Assigned to you and ready: start it (PATCH status in_progress, or GET /api/next?claim=1), then work on it."
+        if who:
+            return f"Ready, but assigned to {who}: leave it for them; you can comment."
+        return "Ready for anyone: start it (PATCH status in_progress) to take it, then work on it."
+    return "In the backlog: not cleared for work yet. Don't work on it; you can comment."
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "agent-tickets"
     sys_version = ""
@@ -3442,6 +3495,11 @@ class Handler(BaseHTTPRequestHandler):
     def json(self, code, obj):
         extra = {"Cache-Control": "no-store"}
         role, actor = getattr(self, "who_is", (None, None))
+        if role == "agent" and code < 400 and isinstance(obj, dict):
+            # Every ticket an agent gets says, in one line, what it means for that agent.
+            for t in [obj, obj.get("ticket")] + list(obj.get("tickets") or []):
+                if isinstance(t, dict) and "status" in t and "id" in t and "kind" in t:
+                    t["what_now"] = what_now(t, actor)
         if role == "agent" and code < 400:
             # Agents are told about unread chat on every response, and asked to answer it first.
             notice = self.server.store.chat_notice(actor)
