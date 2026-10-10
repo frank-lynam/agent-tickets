@@ -483,6 +483,8 @@ class Store:
         t["events"] = [dict(r) for r in db.execute(
             "SELECT * FROM events WHERE ticket_id = ? ORDER BY at, id", (t["id"],))]
         t["checklist"] = checklist_summary(t, items=True)
+        refs = wiki_refs(t["description"]) + [p for c in t["comments"] for p in wiki_refs(c["body"])]
+        t["wiki_links"] = [self.wiki_link_info(p) for p in dict.fromkeys(refs)]
         t["depends_on"] = [dict(r) for r in db.execute(
             "SELECT p.id, p.title, p.status, p.declined FROM deps d JOIN tickets p ON p.id = d.depends_on "
             "WHERE d.ticket_id = ? ORDER BY p.id", (t["id"],))]
@@ -882,17 +884,40 @@ class Store:
         return build(None, "")
 
     def wiki_search(self, q):
-        like = f"%{q}%"
-        rows = self.db().execute("SELECT * FROM wiki_pages WHERE title LIKE ? OR body LIKE ? "
-                                 "ORDER BY title LIKE ? DESC, updated_at DESC LIMIT 50", (like, like, like)).fetchall()
-        out = []
+        """Pages with every word of `q` (any order) in their title, their text, or the titles and
+        addresses of the pages above them. Title matches rank first, then the path, then the text."""
+        words = [w for w in re.split(r"\W+", q.lower()) if w]
+        if not words:
+            return []
+        rows = [dict(r) for r in self.db().execute("SELECT id, parent_id, slug, title, body, updated_at FROM wiki_pages")]
+        by_id = {r["id"]: r for r in rows}
+
+        def place(r):  # this page's and its ancestors' titles and slugs
+            parts, cur = [], r
+            while cur:
+                parts += [cur["title"], cur["slug"]]
+                cur = by_id.get(cur["parent_id"])
+            return " ".join(parts).lower()
+        hits = []
         for r in rows:
-            r = dict(r)
-            body = r["body"]
-            at = body.lower().find(q.lower())
-            snip = body[max(0, at - 60): at + 120] if at >= 0 else body[:180]
+            title, where, body = r["title"].lower(), place(r), r["body"].lower()
+            if all(w in where or w in body for w in words):
+                score = sum(3 * (w in title) + 2 * (w in where) + (w in body) for w in words)
+                hits.append((-score, -r["updated_at"], r["id"], r))
+        out = []
+        for *_, r in sorted(hits)[:50]:
+            low = r["body"].lower()
+            at = min([low.find(w) for w in words if w in low] or [-1])
+            snip = r["body"][max(0, at - 60): at + 120] if at >= 0 else r["body"][:180]
             out.append({"title": r["title"], "path": self.wiki_path(r), "snippet": snip.strip()})
         return out
+
+    def wiki_link_info(self, path):
+        """{"path", "title"} for a linked page, or {"path", "title": None, "missing": True}."""
+        try:
+            return {"path": path, "title": self.wiki_resolve(path)["title"]}
+        except ApiError:
+            return {"path": path, "title": None, "missing": True}
 
     @staticmethod
     def _wiki_slug(slug, title):
@@ -1436,6 +1461,9 @@ form.stack{display:grid;gap:8px}
 dl.kv{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;margin:0;font-size:14px}
 dl.kv dt{color:var(--dim)}dl.kv dd{margin:0;overflow-wrap:anywhere}
 .err{color:var(--review)}
+a.wl.missing{color:var(--review);text-decoration-style:dashed}
+.wlink{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:4px 0 0}
+.wlink code{font:13px ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--panel);border:1px solid var(--line);padding:3px 7px;border-radius:5px;overflow-wrap:anywhere}
 .tag{display:inline-block;font-size:12px;padding:1px 7px;border-radius:5px;background:var(--back-bg);color:var(--back);font-weight:600}
 .tag.blocked{background:var(--review-bg);color:var(--review)}
 .tag.epic{background:var(--prog-bg);color:var(--agent)}
@@ -1518,9 +1546,26 @@ def when(ts):
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
 
 
+# [[section/page]] or [[section/page|label]]: a link to a wiki page, from anywhere.
+WIKI_LINK = re.compile(r"\[\[([A-Za-z0-9/-]+)(?:\|([^\]\n]+))?\]\]")
+LINKABLE = re.compile(r"(https?://[^\s<]+|\[\[[A-Za-z0-9/-]+(?:\|[^\]\n]+)?\]\])")
+
+
+def wiki_refs(text):
+    """The wiki paths a text links to, in order."""
+    return [norm_wiki_path(m[1]) for m in WIKI_LINK.finditer(text or "")]
+
+
+def link_part(part):
+    """One escaped URL or [[wiki link]] as HTML."""
+    if part.startswith("[["):
+        m = WIKI_LINK.fullmatch(part)
+        return f'<a class="wl" href="/wiki/{norm_wiki_path(m[1])}">{m[2] or m[1]}</a>'
+    return f'<a href="{part}" target="_blank" rel="noopener">{part}</a>'
+
+
 def linkify(text):
-    out = esc(text)
-    return re.sub(r"(https?://[^\s<]+)", r'<a href="\1" target="_blank" rel="noopener">\1</a>', out)
+    return "".join(link_part(p) if i % 2 else p for i, p in enumerate(LINKABLE.split(esc(text))))
 
 
 CHAT_BADGE = "<!--chat-badge-->"
@@ -1684,6 +1729,7 @@ def render_new(store, epic=None, prefill=("", "")):
     body = f"""<h1>New ticket</h1><form class="stack box" id="nf">
 <label>Title<input type="text" id="nt-title" required value="{esc(prefill[0])}"></label>
 <label>Description<textarea id="nt-desc" rows="8">{esc(prefill[1])}</textarea></label>
+<p class="meta" style="margin:-4px 0 0">Link wiki pages with <code>[[section/page]]</code>: every wiki page has a Copy link button.</p>
 <div class="row"><label>Status <select id="nt-status">{opts}</select></label>
 <label>Priority <select id="nt-prio"><option value="1">High</option><option value="2" selected>Normal</option><option value="3">Low</option></select></label>
 <label>Assign to <select id="nt-who">{assignee_options(store)}</select></label></div>
@@ -1873,6 +1919,12 @@ def render_ticket(store, tid):
     items.sort(key=lambda x: x[0])
     timeline = "".join(h for _, h in items) or '<p class="empty">No activity yet.</p>'
 
+    wiki_box = ""
+    if t["wiki_links"]:
+        lis = "".join(f'<li><a class="wl{" missing" if w.get("missing") else ""}" href="/wiki/{w["path"]}">'
+                      f'{esc(w["title"] or w["path"])}</a>{" <span class=meta>(no such page yet)</span>" if w.get("missing") else ""}'
+                      f'</li>' for w in t["wiki_links"])
+        wiki_box = f'<h2 style="margin-top:0">Wiki pages</h2><div class="box"><ul class="ck">{lis}</ul></div>'
     ck = t["checklist"]
     if ck is None:
         ckhtml = '<p class="meta">None reported yet. The agent working the ticket uploads it as it goes.</p>'
@@ -1956,6 +2008,7 @@ def render_ticket(store, tid):
   <button class="primary" id="csend">Post</button></div></form>
 </div><aside>
  <h2 style="margin-top:0">Checklist</h2><div class="box">{ckhtml}</div>
+ {wiki_box}
  <h2>Assigned to</h2><div class="box"><select id="who" aria-label="Assigned to"
   onchange="assign(this.value)">{assignee_options(store, t['assignee'])}</select></div>
  {side_links}
@@ -2005,14 +2058,14 @@ TICKET_WORD = re.compile(r"\b(?:[A-Za-z]+-[A-Za-z]+|[A-Z]{4,5})\b")
 
 def chat_text(store, body):
     """A message's text: escaped, with links, and ticket ids that exist linked to their tickets."""
-    parts = re.split(r"(https?://[^\s<]+)", esc(body))
+    parts = LINKABLE.split(esc(body))
     ids = {norm_id(w) for w in TICKET_WORD.findall(" ".join(parts[::2]))}
     known = {r[0] for r in store.db().execute(
         f"SELECT id FROM tickets WHERE id IN ({','.join('?' * len(ids))})", list(ids))} if ids else set()
     out = []
     for i, p in enumerate(parts):
         if i % 2:
-            out.append(f'<a href="{p}" target="_blank" rel="noopener">{p}</a>')
+            out.append(link_part(p))
         else:
             out.append(TICKET_WORD.sub(
                 lambda m: f'<a href="/t/{norm_id(m[0])}">{m[0]}</a>' if norm_id(m[0]) in known else m[0], p))
@@ -2154,18 +2207,14 @@ def render_chat(store, cid, viewer):
     return page(c["name"], body, "/chat", len(store.tickets(["review"])))
 
 
-WIKI_LINK = re.compile(r"\[\[([a-z0-9/-]+)(?:\|([^\]\n]+))?\]\]")
-
-
 def wiki_inline(store, text):
-    """One run of text: escaped, links, ticket ids, `code` and [[wiki/links]]."""
+    """One run of text: escaped, with `code`, links, ticket ids and [[wiki/links]]."""
     out = []
     for i, part in enumerate(re.split(r"(`[^`\n]+`)", text)):
         if i % 2:
             out.append(f"<code>{esc(part[1:-1])}</code>")
         else:
-            out.append(WIKI_LINK.sub(lambda m: f'<a href="/wiki/{m[1].strip("/")}">{m[2] or m[1]}</a>',
-                                     chat_text(store, part)))
+            out.append(chat_text(store, part))
     return "".join(out)
 
 
@@ -2291,11 +2340,31 @@ def render_wiki_new(store, parent):
     return page("New wiki page", body, "/wiki", len(store.tickets(["review"])))
 
 
+COPY_JS = """
+async function copyWikiLink(btn){
+  const text = document.getElementById('wlink').textContent;
+  let ok = false;
+  try { await navigator.clipboard.writeText(text); ok = true; } catch (e) {
+    // No clipboard API (plain http on a LAN address): the old way.
+    const a = document.createElement('textarea'); a.value = text; document.body.appendChild(a); a.select();
+    try { ok = document.execCommand('copy'); } catch (e2) {} a.remove();
+  }
+  if (!ok) { const r = document.createRange(); r.selectNodeContents(document.getElementById('wlink'));
+    getSelection().removeAllRanges(); getSelection().addRange(r); }
+  btn.textContent = ok ? 'Copied' : 'Selected: copy it'; setTimeout(() => { btn.textContent = 'Copy link'; }, 1600);
+}
+"""
+
+
 def render_wiki_page(store, path, role, history=False, rev=None, edit=False):
     p = store.wiki_page(path)
     crumbs = " / ".join([f'<a href="/wiki">Wiki</a>'] + [f'<a href="/wiki/{c["path"]}">{esc(c["title"])}</a>'
                                                           for c in p["breadcrumbs"][:-1]])
     meta = f'Updated {ago(p["updated_at"])} by {esc(p["updated_by"])} · <a href="/wiki/{p["path"]}?history=1">History</a>'
+    copy = (f'<div class="wlink"><code id="wlink">[[{p["path"]}]]</code>'
+            f'<button type="button" onclick="copyWikiLink(this)">Copy link</button>'
+            f'<span class="meta">Paste it into a ticket, comment or chat message.</span></div>'
+            f'<script>{COPY_JS}</script>')
     if edit and role == "human":
         main = wiki_form(store, p)
     elif rev:
@@ -2315,7 +2384,8 @@ def render_wiki_page(store, path, role, history=False, rev=None, edit=False):
         actions = (f'<div class="row" style="margin:8px 0 14px"><a class="btn" href="/wiki/{p["path"]}?edit=1" '
                    f'style="text-decoration:none">Edit</a><a class="btn" href="/wiki-new?parent={p["path"]}" '
                    f'style="text-decoration:none">Add a page under this</a></div>')
-    body = (f'<p class="crumbs">{crumbs}</p><h1>{esc(p["title"])}</h1><div class="meta">{meta}</div>{actions}{main}'
+    body = (f'<p class="crumbs">{crumbs}</p><h1 style="margin-bottom:6px">{esc(p["title"])}</h1>{copy}'
+            f'<div class="meta" style="margin-top:8px">{meta}</div>{actions}{main}'
             + (f'<h2>Pages under this</h2><ul class="tree box" style="padding:12px 16px">{kids}</ul>' if kids else ""))
     return page(p["title"], body, "/wiki", len(store.tickets(["review"])))
 
@@ -2342,8 +2412,9 @@ enough, or a request fails in a way you don't understand. Errors come back as `{
    `{{"body": "..."}}` (or `POST /api/chat/ID/read` if no reply is needed). Any response with a `"chat"`
    field means the same: stop, answer chat, then carry on.
 3. `GET /api/next?claim=1` takes the next ready ticket (yours first). `{{"ticket": null}}`: nothing to do.
-4. Read the whole ticket (`GET /api/tickets/ID`): description, every comment, checklist.
-5. Unfamiliar project? Check the wiki first: `GET /api/wiki` (the tree), `GET /api/wiki/SECTION/PAGE`.
+4. Read the whole ticket (`GET /api/tickets/ID`): description, every comment, checklist, and every page
+   in its `wiki_links` (`GET /api/wiki/PATH`).
+5. Unfamiliar project? Check the wiki first: `GET /api/wiki` (the tree), `GET /api/wiki?q=a+few+words`.
 
 ## Working a ticket
 
@@ -2494,10 +2565,18 @@ discussed in comments on the ticket, where the humans review it.
 The humans keep shared knowledge here: project onboarding, where the repos
 are, conventions, key details. Pages form one tree (sections, pages under
 them) and are plain text. Read the relevant section when you start on a
-project or a kind of work you haven't done here before, and when a ticket
-links a page (`[[section/page]]`). You can't change it: if something is
-missing, wrong or out of date, tell a human in chat. Don't copy wiki text
-into tickets; link the page.
+project or a kind of work you haven't done here before.
+
+Humans point you at pages with `[[section/page]]` links in tickets,
+comments and chat. A ticket's `wiki_links` lists the pages its description
+and comments link to (`{"path", "title"}`, or `"missing": true`): read them
+before you start. Fetch a page with `GET /api/wiki/` plus its path. When
+you're given a title or a few words instead, search: `GET /api/wiki?q=words`
+finds pages with every word, in any order, in their title, text or the
+sections above them; or scan the tree (`GET /api/wiki`).
+
+You can't change the wiki: if something is missing, wrong or out of date,
+tell a human in chat. Don't copy wiki text into tickets; link the page.
 
 ## Endpoints
 
@@ -2532,7 +2611,8 @@ letters, like `KAMI`). Any case works, and a space for the hyphen in JSON.
     POST  /api/chat/ID/files?filename=notes.md&message_id=N   a file for that message (raw bytes, like tickets)
     POST  /api/chat/ID/read          mark it read without replying
     POST  /api/chat/ID/members       {"username": "agent-2"}: tell someone else about it
-    GET   /api/wiki                  {"tree": [{"title", "path", "children": [...]}]}; ?q=text to search
+    GET   /api/wiki                  {"tree": [{"title", "path", "children": [...]}]};
+                                     ?q=some words: {"results": [{"title", "path", "snippet"}]}
     GET   /api/wiki/SECTION/PAGE     {"title", "body", "path", "breadcrumbs", "children", "updated_at", ...}
     GET   /api/skill                 a SKILL.md for this server, to save as a skill
     POST  /api/tickets/ID/attachments?filename=demo.mp4&comment_id=N
@@ -2562,7 +2642,8 @@ A ticket looks like:
      "attachments": [{"id": 3, "comment_id": 12, "filename": "demo.mp4", "mime": "video/mp4",
                       "size": 123456, "url": "/files/3/demo.mp4", ...}],
      "events": [{"field": "status", "old": "ready", "new": "in_progress", "actor": "agent-1", "at": ...}],
-     "checklist": {"done": 2, "total": 5, "items": [...], "text": "...", "updated_by": "agent-1", "updated_at": ...}}
+     "checklist": {"done": 2, "total": 5, "items": [...], "text": "...", "updated_by": "agent-1", "updated_at": ...},
+     "wiki_links": [{"path": "projects/fitness-pizza/deploy", "title": "Deploy"}]}
 
 Times are Unix seconds. Errors are `{"error": "what went wrong"}` with an
 HTTP status: 400 bad request, 401 missing or bad token, 403 not allowed

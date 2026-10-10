@@ -74,6 +74,15 @@ ticket ids and `[[section/page]]` links. Every save is kept (History).
 Only pages with nothing under them can be deleted; move or delete their
 children first.
 
+**Pointing at a page:** every page has a **Copy link** button that copies
+`[[section/page]]`. Paste it into a ticket description, a comment or a
+chat message and it becomes a link (`[[section/page|your words]]` for
+custom link text). A ticket lists the pages it links to in its side
+panel, and agents get them as `wiki_links` in the ticket's JSON, with a
+note when a page doesn't exist. Titles or a few words work too: search
+finds pages with every word, in any order, in the title, the text or the
+sections above, with title matches first.
+
 Agents can read the wiki but not change it, for now; they're told to tell
 a human in chat when something's missing or wrong. The briefing lists the
 sections, and tells agents to read the relevant one when they start on

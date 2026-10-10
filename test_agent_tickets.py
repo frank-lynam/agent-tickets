@@ -730,7 +730,9 @@ class TicketsTest(unittest.TestCase):
         html = self.call("GET", "/wiki/projects/fitness-pizza", role="human")[1].decode()
         self.assertIn("<h2>Repo</h2>", html)
         self.assertIn("<code>~/workspace/fitness-pizza</code>", html)
-        self.assertIn('<a href="/wiki/projects/fitness-pizza/deploy">deploy notes</a>', html)
+        self.assertIn('<a class="wl" href="/wiki/projects/fitness-pizza/deploy">deploy notes</a>', html)
+        self.assertIn('<code id="wlink">[[projects/fitness-pizza]]</code>', html)  # with a Copy link button
+        self.assertIn("copyWikiLink", html)
         self.assertNotIn("<script>x</script>", html)
         self.assertIn("Add a page under this", html)
         self.assertNotIn("?edit=1", self.call("GET", "/wiki/projects/fitness-pizza", role=None, token=tok)[1].decode())
@@ -749,6 +751,40 @@ class TicketsTest(unittest.TestCase):
             restored = at.Store(Path(tmp) / "data", [tmp])
             at.import_archive(restored, Path(tmp) / "b.tar.gz")
             self.assertEqual(restored.wiki_page("later-section/projects/fitness-pizza/deploy")["title"], "Deploy")
+
+    def test_wiki_search_and_links(self):
+        mk = lambda **d: self.j("POST", "/api/wiki", d, role="human")[1]
+        mk(title="Teams", body="Who does what.")
+        mk(title="Kitchen Sink", parent="teams", body="Release notes go out after every deploy.")
+        mk(title="Deploy", parent="teams/kitchen-sink", body="Run the release script, then check the dashboard.")
+        mk(title="Deployment glossary", parent="teams", body="Words we use.")
+        q = lambda words: [r["path"] for r in self.j("GET", "/api/wiki?q=" + words.replace(" ", "+"))[1]["results"]]
+        # Every word, any order, counting the sections above; title matches first.
+        self.assertEqual(q("sink deploy")[0], "teams/kitchen-sink/deploy")
+        self.assertEqual(q("deploy kitchen")[0], "teams/kitchen-sink/deploy")
+        self.assertIn("teams/kitchen-sink", q("release deploy"))
+        self.assertEqual(q("dashboard script"), ["teams/kitchen-sink/deploy"])
+        self.assertEqual(q("deploy zebra"), [])
+        ranked = q("deploy")  # titles with the word come before pages that only mention it
+        self.assertLess(ranked.index("teams/kitchen-sink/deploy"), ranked.index("teams/kitchen-sink"))
+        self.assertLess(ranked.index("teams/deployment-glossary"), ranked.index("teams/kitchen-sink"))
+        # [[links]] work in descriptions, comments and chat; the ticket lists what it links to.
+        t = self.new("ready", description="Ship it. Steps: [[teams/kitchen-sink/deploy|the deploy page]].")
+        self.j("POST", f"/api/tickets/{t['id']}/comments", {"body": "Also [[Teams/Kitchen-Sink]] and [[teams/nope]]"},
+               role="human")
+        links = self.j("GET", f"/api/tickets/{t['id']}")[1]["wiki_links"]
+        self.assertEqual(links, [{"path": "teams/kitchen-sink/deploy", "title": "Deploy"},
+                                 {"path": "teams/kitchen-sink", "title": "Kitchen Sink"},
+                                 {"path": "teams/nope", "title": None, "missing": True}])
+        html = self.call("GET", f"/t/{t['id']}", role="human")[1].decode()
+        self.assertIn('<a class="wl" href="/wiki/teams/kitchen-sink/deploy">the deploy page</a>', html)
+        self.assertIn('<a class="wl" href="/wiki/teams/kitchen-sink">Teams/Kitchen-Sink</a>', html)
+        self.assertIn("(no such page yet)", html)
+        c = self.j("POST", "/api/chat", {"title": "links", "body": "see [[teams]] and https://x.io/[[a]]"}, role="human")[1]
+        chat = self.call("GET", f"/chat/{c['id']}", role="human")[1].decode()
+        self.assertIn('<a class="wl" href="/wiki/teams">teams</a>', chat)
+        t2 = self.new(description="[[teams|<b>x</b>]]")
+        self.assertNotIn("<b>x</b>", self.call("GET", f"/t/{t2['id']}", role="human")[1].decode())
 
     def test_skill(self):
         code, body, h = self.call("GET", "/api/skill", role="agent", headers={"Host": "tickets.example:43917"})
