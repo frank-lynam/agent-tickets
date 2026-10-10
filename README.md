@@ -30,8 +30,11 @@ Agents can't set Backlog or Done, and can only comment on tickets in them.
   `epic`; tickets belong to at most one epic, and epics don't nest. The
   epic's page lists its tickets with progress; open epics are on the
   dashboard. Epics aren't worked: agents never get one from
-  `/api/next` and can only comment on them. Close an epic when its plan is
-  finished. Accepting or declining a proposed epic does the same to its
+  `/api/next` and can only comment on them. An epic's state follows its
+  tickets automatically: **Backlog** until one of them is made ready,
+  **Active** while some are ready or under way, **Complete** once all are
+  done (declined ones don't count; adding a ticket reopens it). Nobody sets
+  it by hand. Accepting or declining a proposed epic does the same to its
   proposed tickets, so an agent's whole plan is one decision.
 - **Dependencies** ("must be done first") are enforced, for everyone: a
   ticket whose predecessors aren't done can't move to In progress, Needs

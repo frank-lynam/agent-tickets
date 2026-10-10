@@ -553,16 +553,17 @@ class TicketsTest(unittest.TestCase):
         self.assertEqual(self.j("POST", "/api/tickets", {"title": "x", "kind": "epic", "epic_id": e["id"]},
                                 role="human")[0], 400)  # no nesting
         self.assertEqual(self.j("POST", "/api/tickets", {"title": "x", "kind": "saga"}, role="human")[0], 400)
-        # Accepting the epic accepts its proposed tickets; "ready" makes the tickets ready, not the epic.
+        # Accepting the epic accepts its proposed tickets; "ready" makes the tickets ready, and so the epic active.
         self.j("POST", f"/api/tickets/{e['id']}/accept", {"ready": True}, role="human")
         got = self.j("GET", f"/api/tickets/{e['id']}", role="human")[1]
-        self.assertEqual((got["status"], got["proposed"]), ("backlog", 0))
+        self.assertEqual((got["status"], got["epic_state"], got["proposed"]), ("in_progress", "active", 0))
         self.assertEqual({t["id"]: (t["status"], t["proposed"]) for t in got["tickets"]},
                          {s1["id"]: ("ready", 0), s2["id"]: ("ready", 0)})
         self.assertEqual(got["progress"]["total"], 2)
         # Epics aren't worked: agents only comment on them, and claims never return one.
-        self.j("PATCH", f"/api/tickets/{e['id']}", {"status": "ready", "assignee": "agent-e"}, role="human")
-        self.assertEqual(self.j("PATCH", f"/api/tickets/{e['id']}", {"status": "in_progress"}, role=None, token=tok)[0], 403)
+        self.j("PATCH", f"/api/tickets/{e['id']}", {"assignee": "agent-e"}, role="human")
+        self.assertEqual(self.j("PATCH", f"/api/tickets/{e['id']}", {"status": "review"}, role=None, token=tok)[0], 403)
+        self.assertEqual(self.j("PATCH", f"/api/tickets/{e['id']}", {"status": "done"}, role="human")[0], 400)
         self.assertEqual(self.j("POST", f"/api/tickets/{e['id']}/comments", {"body": "plan ok"}, role=None, token=tok)[0], 201)
         self.j("PATCH", f"/api/tickets/{s1['id']}", {"assignee": "agent-e"}, role="human")
         n = self.j("GET", "/api/next?claim=1", role=None, token=tok)[1]["ticket"]
@@ -922,6 +923,35 @@ class TicketsTest(unittest.TestCase):
         # Agents are told about it, and to write legibly.
         self.assertIn("## Formatting what you write", self.call("GET", "/api", role=None)[1].decode())
         self.assertIn("No walls of text", self.call("GET", "/api/skill", role="agent")[1].decode())
+
+    def test_epic_lifecycle(self):
+        e = self.new("backlog", title="Lifecycle", kind="epic")
+        a = self.new("backlog", title="part a", epic_id=e["id"])
+        b = self.new("backlog", title="part b", epic_id=e["id"])
+        state = lambda: self.j("GET", f"/api/tickets/{e['id']}", role="human")[1]["epic_state"]
+        self.assertEqual(state(), "backlog")  # nothing made ready yet
+        self.j("PATCH", f"/api/tickets/{a['id']}", {"status": "ready"}, role="human")
+        self.assertEqual(state(), "active")
+        self.assertIn("the epic is now <b>Active</b>", self.call("GET", f"/t/{e['id']}", role="human")[1].decode())
+        for t in (a, b):
+            self.j("PATCH", f"/api/tickets/{t['id']}", {"status": "done"}, role="human")
+        self.assertEqual(state(), "complete")
+        self.assertIn(e["id"], [t["id"] for t in self.j("GET", "/api/tickets?status=done&kind=epic", role="human")[1]["tickets"]])
+        # More work added: active again; declined tickets don't hold it open.
+        c = self.new("ready", title="part c", epic_id=e["id"])
+        self.assertEqual(state(), "active")
+        self.j("PATCH", f"/api/tickets/{c['id']}", {"epic_id": None}, role="human")  # moved out
+        self.assertEqual(state(), "complete")
+        # Its page has no status buttons, and the backlog page no longer lists it.
+        page = self.call("GET", f"/t/{e['id']}", role="human")[1].decode()
+        self.assertNotIn("Close epic", page)
+        self.assertIn(">Complete</span>", page)
+        self.assertNotIn(f"/t/{e['id']}\"", self.call("GET", "/backlog", role="human")[1].decode())
+        # Out-of-step epics (from before this rule) are fixed when the server starts.
+        with self.srv.store.db() as db:
+            db.execute("UPDATE tickets SET status = 'backlog' WHERE id = ?", (e["id"],))
+        at.Store(self.srv.store.dir, [])
+        self.assertEqual(state(), "complete")
 
     def test_skill(self):
         code, body, h = self.call("GET", "/api/skill", role="agent", headers={"Host": "tickets.example:43917"})
