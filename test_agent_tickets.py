@@ -786,6 +786,61 @@ class TicketsTest(unittest.TestCase):
         t2 = self.new(description="[[teams|<b>x</b>]]")
         self.assertNotIn("<b>x</b>", self.call("GET", f"/t/{t2['id']}", role="human")[1].decode())
 
+    def test_assign_while_accepting_or_making_ready(self):
+        tok = self.j("POST", "/api/users", {"username": "agent-r", "kind": "agent"}, role="human")[1]["token"]
+        # A proposal, accepted straight to ready for agent-r.
+        p = self.j("POST", "/api/tickets", {"title": "Idea"}, role=None, token=tok)[1]
+        got = self.j("POST", f"/api/tickets/{p['id']}/accept", {"ready": True, "assignee": "AGENT-R"}, role="human")[1]
+        self.assertEqual((got["status"], got["assignee"]), ("ready", "agent-r"))
+        self.assertEqual(self.j("POST", f"/api/tickets/{self.j('POST', '/api/tickets', {'title': 'x'}, role=None, token=tok)[1]['id']}/accept",
+                                {"assignee": "nobody"}, role="human")[0], 404)
+        # An epic: its tickets get the assignee, the epic doesn't.
+        e = self.j("POST", "/api/tickets", {"title": "Plan", "kind": "epic"}, role=None, token=tok)[1]
+        k = self.j("POST", "/api/tickets", {"title": "Step", "epic_id": e["id"]}, role=None, token=tok)[1]
+        self.j("POST", f"/api/tickets/{e['id']}/accept", {"assignee": "agent-r"}, role="human")
+        self.assertIsNone(self.j("GET", f"/api/tickets/{e['id']}", role="human")[1]["assignee"])
+        self.assertEqual(self.j("GET", f"/api/tickets/{k['id']}", role="human")[1]["assignee"], "agent-r")
+        # Declining ignores it.
+        d = self.j("POST", "/api/tickets", {"title": "Nah"}, role=None, token=tok)[1]
+        self.assertIsNone(self.j("POST", f"/api/tickets/{d['id']}/decline", {"assignee": "agent-r"}, role="human")[1]["assignee"])
+        # Make ready for someone, in one step; the pages offer the picker.
+        b = self.new("backlog", title="Later")
+        got = self.j("PATCH", f"/api/tickets/{b['id']}", {"status": "ready", "assignee": "agent-r"}, role="human")[1]
+        self.assertEqual((got["status"], got["assignee"]), ("ready", "agent-r"))
+        b2 = self.new("backlog", title="Later still")
+        self.assertIn(f'id="as-{b2["id"]}"', self.call("GET", "/backlog", role="human")[1].decode())
+        page = self.call("GET", f"/t/{b2['id']}", role="human")[1].decode()
+        self.assertIn(f'id="as-{b2["id"]}"', page)
+        self.assertIn(f"readyFor('{b2['id']}')", page)
+
+    def test_live_ticket_page(self):
+        tok = self.j("POST", "/api/users", {"username": "agent-l", "kind": "agent"}, role="human")[1]["token"]
+        t = self.new("in_progress", assignee="agent-l")
+        first = self.j("GET", f"/t/{t['id']}/live", role="human")[1]
+        page = self.call("GET", f"/t/{t['id']}", role="human")[1].decode()
+        self.assertIn(f'SIG = "{first["sig"]}"', page)
+        self.assertIn('id="changed" hidden', page)
+        self.assertIn("at-draft:", page)  # unsent comments are kept
+        # A comment and a file arrive: new entries with ids; the ticket's own state hasn't changed.
+        c = self.j("POST", f"/api/tickets/{t['id']}/comments", {"body": "progress"}, role=None, token=tok)[1]
+        self.j("POST", f"/api/tickets/{t['id']}/attachments?filename=x.txt&comment_id={c['id']}", raw=b"hi",
+               role=None, token=tok)
+        self.j("PUT", f"/api/tickets/{t['id']}/checklist", role=None, token=tok, raw=b"- [x] a",
+               headers={"Content-Type": "text/markdown"})
+        now = self.j("GET", f"/t/{t['id']}/live", role="human")[1]
+        self.assertIn(f'id="c{c["id"]}" data-v="1"', now["timeline"])
+        self.assertEqual(now["sig"], first["sig"])
+        self.assertNotEqual(now["checklist_v"], first["checklist_v"])
+        self.assertIn("1 of 1 done", now["checklist"])
+        # A status change does change it (the page shows "refresh").
+        self.j("PATCH", f"/api/tickets/{t['id']}", {"status": "review"}, role=None, token=tok)
+        self.assertNotEqual(self.j("GET", f"/t/{t['id']}/live", role="human")[1]["sig"], first["sig"])
+        # The dashboard checks every 10 seconds, swapping in place.
+        dash = self.call("GET", "/", role="human")[1].decode()
+        self.assertIn('<div id="dash">', dash)
+        self.assertIn("10000", dash)
+        self.assertNotIn("location.reload(); }, 60000", dash)
+
     def test_skill(self):
         code, body, h = self.call("GET", "/api/skill", role="agent", headers={"Host": "tickets.example:43917"})
         text = body.decode()

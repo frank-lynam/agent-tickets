@@ -679,11 +679,13 @@ class Store:
                                 f"{new['done']}/{new['total']}", now)
         return {"checklist": self.detail(t["id"])["checklist"]}
 
-    def review_proposal(self, tid, accept, ready, actor, role):
+    def review_proposal(self, tid, accept, ready, actor, role, assignee=None):
         """Accept (to the backlog, or ready) or decline (to done, marked
-        declined) a proposal. On an epic, its proposed tickets go the same way."""
+        declined) a proposal. On an epic, its proposed tickets go the same way.
+        Accepting can assign it (an epic: its tickets) to someone at the same time."""
         if role != "human":
             raise ApiError(403, "only humans accept or decline proposals")
+        assignee = self._check_assignee(assignee) if accept and assignee else None
         with self.write_lock:
             db = self.db()
             t = self.ticket(tid)
@@ -701,6 +703,10 @@ class Store:
                         to = "ready" if ready and kind == "task" else cur
                         db.execute("UPDATE tickets SET proposed = 0, status = ?, updated_at = ? WHERE id = ?", (to, now, i))
                         self._event(db, i, actor, role, "accepted", None, to, now)
+                        old = db.execute("SELECT assignee FROM tickets WHERE id = ?", (i,)).fetchone()[0]
+                        if assignee and kind == "task" and old != assignee:
+                            db.execute("UPDATE tickets SET assignee = ? WHERE id = ?", (assignee, i))
+                            self._event(db, i, actor, role, "assignee", old, assignee, now)
                     else:
                         db.execute("UPDATE tickets SET proposed = 0, declined = 1, status = 'done', updated_at = ? "
                                    "WHERE id = ?", (now, i))
@@ -1492,6 +1498,10 @@ a.wl.missing{color:var(--review);text-decoration-style:dashed}
 .crumbs{font-size:13px;color:var(--dim);margin-bottom:4px}.crumbs a{text-decoration:none}
 .tree,.tree ul{list-style:none;margin:0;padding:0}.tree ul{margin-left:16px;border-left:1px solid var(--line);padding-left:10px}
 .tree li{margin:3px 0}.tree a{text-decoration:none}.tree>li>a{font-weight:600}
+select.as{width:auto;max-width:12em;padding:7px 8px;font-size:14px}
+.tl .new{animation:arrive 2.5s ease-out}
+@keyframes arrive{from{box-shadow:0 0 0 2px var(--accent)}to{box-shadow:0 0 0 2px transparent}}
+@media (prefers-reduced-motion:reduce){.tl .new{animation:none}}
 .list .item.prop{flex-wrap:wrap}.list .item.prop>a{flex:1 1 240px;min-width:0}.list .item.prop>.row{flex-wrap:wrap}
 .sub{margin-left:18px;border-left:2px solid var(--line);padding-left:10px}
 .deps li{margin:2px 0}
@@ -1618,6 +1628,23 @@ def column(title, tickets, empty):
     return f'<section><h2>{esc(title)} ({len(tickets)})</h2>{inner}</section>'
 
 
+DASH_JS = """
+// Every 10 seconds, swap in the latest dashboard (and the nav's counts) without reloading.
+setInterval(async () => {
+  if (document.hidden) return;
+  try {
+    const r = await fetch(location.pathname, {credentials: 'same-origin', cache: 'no-store'});
+    if (!r.ok) return;
+    const doc = new DOMParser().parseFromString(await r.text(), 'text/html');
+    for (const sel of ['#dash', 'header nav']) {
+      const now = document.querySelector(sel), next = doc.querySelector(sel);
+      if (now && next && now.innerHTML !== next.innerHTML) now.innerHTML = next.innerHTML;
+    }
+  } catch (e) {}
+}, 10000);
+"""
+
+
 def render_dashboard(store):
     by = {s: store.tickets([s], kind="task", proposed=False) for s in ("review", "in_progress", "ready")}
     epics = [e for e in store.tickets(["backlog", "ready", "in_progress", "review"], kind="epic", proposed=False)]
@@ -1630,7 +1657,7 @@ def render_dashboard(store):
                     f'<span class="t">{esc(e["title"])}</span></div><div class="meta">{pr["done"]} of {pr["total"]} done'
                     f'{f" · {doing} in progress" if doing else ""}</div><div class="bar"><i style="width:{pct}%"></i></div></a>')
     proposals = len(store.tickets(["backlog"], proposed=True))
-    body = ('<h1>In flight</h1><div class="cols">'
+    body = ('<div id="dash"><h1>In flight</h1><div class="cols">'
             + column("Needs your review", by["review"], "Nothing waiting on you.")
             + column("In progress", by["in_progress"], "No agent is working on anything.")
             + column("Ready to work", by["ready"], "Nothing cleared for agents. Promote something from the backlog.")
@@ -1638,31 +1665,38 @@ def render_dashboard(store):
             + (f'<p class="banner prop">Agents proposed {proposals} ticket{"s" if proposals != 1 else ""}: '
                f'<a href="/backlog">review them in the backlog</a>.</p>' if proposals else "")
             + f'<h2>Epics ({len(epics)})</h2>' + ("".join(rows) or '<p class="empty">No open epics.</p>')
-            + '<script>setInterval(() => { if (!document.hidden) location.reload(); }, 60000);</script>')
+            + f'</div><script>{DASH_JS}</script>')
     return page("Dashboard", body, "/", len(by["review"]))
 
 
 PROPOSAL_JS = """
+function assignFor(tid){ const s = document.getElementById('as-' + tid); return s ? (s.value || null) : undefined; }
 async function review(tid, action, ready){
-  try { await api('POST', '/api/tickets/' + tid + '/' + action, action === 'accept' ? {ready} : {}); location.reload(); }
+  const body = action === 'accept' ? {ready, assignee: assignFor(tid)} : {};
+  try { await api('POST', '/api/tickets/' + tid + '/' + action, body); location.reload(); }
+  catch (e) { fail(e); }
+}
+async function readyFor(tid){
+  try { await api('PATCH', '/api/tickets/' + tid, {status: 'ready', assignee: assignFor(tid) ?? null}); location.reload(); }
   catch (e) { fail(e); }
 }
 """
 
 
-def proposal_row(t, children=()):
+def proposal_row(store, t, children=()):
     kind = '<span class="tag epic">Epic</span> ' if t["kind"] == "epic" else ""
     deps = f' · after {", ".join(t["blocked_by"])}' if t.get("blocked_by") else ""
     more = f" (and its {len(children)} proposed ticket{'s' if len(children) != 1 else ''})" if children else ""
     tid = t["id"]
     head = (f'<div class="item prop"><a href="/t/{tid}"><span class="id">{tid}</span> {kind}<b>{esc(t["title"])}</b>'
             f'<div class="meta">proposed by {esc(t["created_by"])} {ago(t["created_at"])}{deps}</div></a><div class="row">'
-            f'<button class="primary" onclick="review(\'{tid}\',\'accept\',false)" title="Accept{esc(more)}">Accept</button>'
+            + assign_select(store, tid, t["assignee"], "Assign its tickets to" if t["kind"] == "epic" else "Assign to")
+            + f'<button class="primary" onclick="review(\'{tid}\',\'accept\',false)" title="Accept{esc(more)}">Accept</button>'
             + ("" if t["kind"] == "epic" else
                f'<button onclick="review(\'{tid}\',\'accept\',true)">Accept &amp; make ready</button>')
             + f'<button onclick="review(\'{tid}\',\'decline\')" title="Decline{esc(more)}">Decline</button></div></div>')
     if children:
-        head += '<div class="sub">' + "".join(proposal_row(c) for c in children) + "</div>"
+        head += '<div class="sub">' + "".join(proposal_row(store, c) for c in children) + "</div>"
     return head
 
 
@@ -1675,16 +1709,17 @@ def render_list(store, status, q):
         ids = {t["id"] for t in proposed}
         epics = [t for t in proposed if t["kind"] == "epic"]
         loose = [t for t in proposed if t["kind"] != "epic" and t.get("epic_id") not in ids]
-        blocks = [proposal_row(e, [t for t in proposed if t.get("epic_id") == e["id"]]) for e in epics]
-        blocks += [proposal_row(t) for t in loose]
+        blocks = [proposal_row(store, e, [t for t in proposed if t.get("epic_id") == e["id"]]) for e in epics]
+        blocks += [proposal_row(store, t) for t in loose]
         if blocks:
             props = (f'<h2>Proposed by agents ({len(proposed)})</h2><p class="meta">Accepting or declining an epic does the same '
                      f'to its proposed tickets.</p><div class="list">{"".join(blocks)}</div><h2>Accepted</h2>'
                      f'<script>{PROPOSAL_JS}</script>')
     rows = []
     for t in items:
-        btn = (f'<button class="primary" onclick="setStatus(\'{t["id"]}\',\'ready\')">Make ready</button>'
-               if status == "backlog" else "")
+        btn = (f'<div class="row">{assign_select(store, t["id"], t["assignee"])}'
+               f'<button class="primary" onclick="readyFor(\'{t["id"]}\')">Make ready</button></div>'
+               if status == "backlog" and t["kind"] == "task" else "")
         pr = '<span class="p1">High · </span>' if t["priority"] == 1 else ""
         if t["kind"] == "epic":
             pr = '<span class="tag epic">Epic</span> ' + pr
@@ -1692,7 +1727,7 @@ def render_list(store, status, q):
             pr = '<span class="tag">Declined</span> ' + pr
         if t.get("blocked_by"):
             pr += f'<span class="tag blocked">after {", ".join(t["blocked_by"])}</span> '
-        rows.append(f'<div class="item"><a href="/t/{t["id"]}"><span class="id">{t["id"]}</span> '
+        rows.append(f'<div class="item{" prop" if btn else ""}"><a href="/t/{t["id"]}"><span class="id">{t["id"]}</span> '
                     f'<b>{esc(t["title"])}</b><div class="meta">{pr}{"created" if status == "backlog" else "finished"} '
                     f'{ago(t["created_at"] if status == "backlog" else t["updated_at"])}</div></a>{btn}</div>')
     title = "Backlog" if status == "backlog" else "Done"
@@ -1701,8 +1736,15 @@ def render_list(store, status, q):
     hint = ('<p class="meta">Ideas waiting to be cleared. "Make ready" lets agents pick one up.</p>' if status == "backlog"
             else '<p class="meta">Work you approved. <a href="/api/export">Download a backup</a> of everything '
                  '(tickets, comments, history and files).</p>')
-    body = f'<h1>{title}</h1>{hint}{search}{props}<div class="list">{"".join(rows) or "<p class=empty>Nothing here.</p>"}</div>'
+    body = (f'<h1>{title}</h1>{hint}{search}{props}<div class="list">{"".join(rows) or "<p class=empty>Nothing here.</p>"}</div>'
+            + (f'<script>{PROPOSAL_JS}</script>' if status == "backlog" and not props else ""))
     return page(title, body, "/" + status, len(store.tickets(["review"])))
+
+
+def assign_select(store, tid, current=None, label="Assign to"):
+    """A small "for whom" picker that goes with Make ready / Accept: anyone, or a user."""
+    opts = assignee_options(store, current).replace('<option value="">No one</option>', '<option value="">Anyone</option>', 1)
+    return f'<select id="as-{tid}" class="as" aria-label="{label}" title="{label}">{opts}</select>'
 
 
 def assignee_options(store, current=None):
@@ -1872,23 +1914,33 @@ def render_attachment(a, store=None):
     return f'<div class="att">{media}<div class="meta">{link}</div></div>'
 
 
-def render_ticket(store, tid):
-    t = store.detail(tid)
+def ticket_sig(t):
+    """Changes to these mean the page's header and buttons are stale: "refresh to see it"."""
+    key = [t["status"], t["assignee"], t["title"], t["priority"], t["epic_id"], t["proposed"], t["declined"],
+           t["description"], t["kind"], t["blocked_by"], [d["id"] for d in t["depends_on"]]]
+    return hashlib.sha256(json.dumps(key, default=str).encode()).hexdigest()[:16]
+
+
+def ticket_timeline(store, t):
+    """The activity list: comments (with their files), loose files and events, oldest first. Every
+    entry has an id, and a comment a data-v (its file count), so the live page can add and update them."""
     by_comment = {}
     loose = []
     for a in t["attachments"]:
         (by_comment.setdefault(a["comment_id"], []) if a["comment_id"] else loose).append(a)
     items = []
     for c in t["comments"]:
-        files = "".join(render_attachment(a, store) for a in by_comment.get(c["id"], []))
+        mine = by_comment.get(c["id"], [])
+        files = "".join(render_attachment(a, store) for a in mine)
         role = "agent" if c["role"] == "agent" else ""
-        items.append((c["created_at"], f'<div class="c {role}"><span class="who {role}">{esc(c["author"])}</span> '
+        items.append((c["created_at"], f'<div class="c {role}" id="c{c["id"]}" data-v="{len(mine)}">'
+                                       f'<span class="who {role}">{esc(c["author"])}</span> '
                                        f'<span class="meta" title="{when(c["created_at"])}">{ago(c["created_at"])}</span>'
                                        f'<div class="body">{linkify(c["body"])}</div>{files}</div>'))
     for a in loose:
-        items.append((a["created_at"], f'<div class="c {"agent" if a["role"] == "agent" else ""}"><span class="who">'
-                                       f'{esc(a["author"])}</span> <span class="meta">attached a file · {ago(a["created_at"])}</span>'
-                                       f'{render_attachment(a, store)}</div>'))
+        items.append((a["created_at"], f'<div class="c {"agent" if a["role"] == "agent" else ""}" id="a{a["id"]}">'
+                                       f'<span class="who">{esc(a["author"])}</span> <span class="meta">attached a file · '
+                                       f'{ago(a["created_at"])}</span>{render_attachment(a, store)}</div>'))
     for e in t["events"]:
         if e["field"] == "created":
             text = f'{esc(e["actor"])} created it in {LABELS.get(e["new"], e["new"])}'
@@ -1915,26 +1967,87 @@ def render_ticket(store, tid):
             text = f'{esc(e["actor"])} edited the description'
         else:
             text = f'{esc(e["actor"])} changed {esc(e["field"]).replace("_", " ")} to {esc(e["new"] or "nothing")}'
-        items.append((e["at"], f'<div class="ev">{text} · <span title="{when(e["at"])}">{ago(e["at"])}</span></div>'))
+        items.append((e["at"], f'<div class="ev" id="e{e["id"]}">{text} · <span title="{when(e["at"])}">{ago(e["at"])}</span></div>'))
     items.sort(key=lambda x: x[0])
-    timeline = "".join(h for _, h in items) or '<p class="empty">No activity yet.</p>'
+    return "".join(h for _, h in items) or '<p class="empty">No activity yet.</p>'
 
-    wiki_box = ""
-    if t["wiki_links"]:
-        lis = "".join(f'<li><a class="wl{" missing" if w.get("missing") else ""}" href="/wiki/{w["path"]}">'
-                      f'{esc(w["title"] or w["path"])}</a>{" <span class=meta>(no such page yet)</span>" if w.get("missing") else ""}'
-                      f'</li>' for w in t["wiki_links"])
-        wiki_box = f'<h2 style="margin-top:0">Wiki pages</h2><div class="box"><ul class="ck">{lis}</ul></div>'
+
+def ticket_wiki_box(t):
+    if not t["wiki_links"]:
+        return ""
+    lis = "".join(f'<li><a class="wl{" missing" if w.get("missing") else ""}" href="/wiki/{w["path"]}">'
+                  f'{esc(w["title"] or w["path"])}</a>{" <span class=meta>(no such page yet)</span>" if w.get("missing") else ""}'
+                  f'</li>' for w in t["wiki_links"])
+    return f'<h2>Wiki pages</h2><div class="box"><ul class="ck">{lis}</ul></div>'
+
+
+def ticket_checklist(t):
     ck = t["checklist"]
     if ck is None:
-        ckhtml = '<p class="meta">None reported yet. The agent working the ticket uploads it as it goes.</p>'
-    else:
-        lis = "".join(f'<li class="note">{esc(i["text"])}</li>' if i.get("note") else
-                      f'<li>{"<span class=x>☑</span>" if i["done"] else "☐"} {esc(i["text"])}</li>' for i in ck["items"])
-        pct = round(100 * ck["done"] / ck["total"]) if ck["total"] else 0
-        ckhtml = (f'<p class="meta">Reported by {esc(ck["updated_by"])} {ago(ck["updated_at"])}</p>'
-                  + (f'<div class="meta">{ck["done"]} of {ck["total"]} done</div><div class="bar"><i style="width:{pct}%"></i></div>'
-                     if ck["total"] else "") + f'<ul class="ck">{lis}</ul>')
+        return '<p class="meta">None reported yet. The agent working the ticket uploads it as it goes.</p>'
+    lis = "".join(f'<li class="note">{esc(i["text"])}</li>' if i.get("note") else
+                  f'<li>{"<span class=x>☑</span>" if i["done"] else "☐"} {esc(i["text"])}</li>' for i in ck["items"])
+    pct = round(100 * ck["done"] / ck["total"]) if ck["total"] else 0
+    return (f'<p class="meta">Reported by {esc(ck["updated_by"])} {ago(ck["updated_at"])}</p>'
+            + (f'<div class="meta">{ck["done"]} of {ck["total"]} done</div><div class="bar"><i style="width:{pct}%"></i></div>'
+               if ck["total"] else "") + f'<ul class="ck">{lis}</ul>')
+
+
+def ticket_live(store, tid):
+    """What the open ticket page polls for."""
+    t = store.detail(tid)
+    ck = t["checklist"]
+    return {"sig": ticket_sig(t), "timeline": ticket_timeline(store, t),
+            "checklist": ticket_checklist(t), "checklist_v": str(ck["updated_at"]) if ck else "",
+            "wiki": ticket_wiki_box(t), "wiki_v": json.dumps(t["wiki_links"])}
+
+
+LIVE_JS = """
+// New comments, files and events appear as they happen; the checklist and
+// linked pages update in place. Nothing here touches the comment box. Changes
+// to the ticket itself (status, assignee, title...) only show a banner.
+(function(){
+  let busy = false;
+  async function live(){
+    if (busy || document.hidden) return;
+    busy = true;
+    try {
+      const r = await fetch('/t/' + TID + '/live', {credentials: 'same-origin', cache: 'no-store'});
+      if (!r.ok) return;
+      const d = await r.json(), tl = document.getElementById('tl'), tmp = document.createElement('div');
+      tmp.innerHTML = d.timeline;
+      for (const el of [...tmp.children]) {
+        if (!el.id) continue;
+        const cur = document.getElementById(el.id);
+        if (!cur) { tl.querySelector(':scope > .empty')?.remove(); el.classList.add('new'); tl.appendChild(el); }
+        else if (cur.dataset.v !== el.dataset.v) cur.replaceWith(el);
+      }
+      const ck = document.getElementById('ckbox');
+      if (ck.dataset.v !== d.checklist_v) { ck.innerHTML = d.checklist; ck.dataset.v = d.checklist_v; }
+      const wb = document.getElementById('wikibox');
+      if (wb.dataset.v !== d.wiki_v) { wb.innerHTML = d.wiki; wb.dataset.v = d.wiki_v; }
+      if (d.sig !== SIG) document.getElementById('changed').hidden = false;
+    } catch (e) {} finally { busy = false; }
+  }
+  setInterval(live, 5000);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) live(); });
+  // Your unsent comment is kept in this browser until you post it.
+  const box = document.getElementById('cbody'), key = 'at-draft:' + TID;
+  try { const saved = localStorage.getItem(key); if (saved && !box.value) box.value = saved; } catch (e) {}
+  box.addEventListener('input', () => {
+    try { box.value ? localStorage.setItem(key, box.value) : localStorage.removeItem(key); } catch (e) {}
+  });
+})();
+function clearDraft(){ try { localStorage.removeItem('at-draft:' + TID); } catch (e) {} }
+"""
+
+
+def render_ticket(store, tid):
+    t = store.detail(tid)
+    timeline = ticket_timeline(store, t)
+    wiki_box = ticket_wiki_box(t)
+    ckhtml = ticket_checklist(t)
+    ck_v = str(t["checklist"]["updated_at"]) if t["checklist"] else ""
 
     def chip(x):
         st = x["status"]
@@ -1950,7 +2063,8 @@ def render_ticket(store, tid):
     banners = ""
     if t["proposed"]:
         banners += (f'<div class="banner prop">Proposed by {esc(t["created_by"])}. '
-                    f'<button class="primary" onclick="review(TID,\'accept\',false)">Accept</button> '
+                    + assign_select(store, t["id"], t["assignee"], "Assign its tickets to" if t["kind"] == "epic" else "Assign to")
+                    + f' <button class="primary" onclick="review(TID,\'accept\',false)">Accept</button> '
                     + ("" if t["kind"] == "epic" else '<button onclick="review(TID,\'accept\',true)">Accept &amp; make ready</button> ')
                     + '<button onclick="review(TID,\'decline\')">Decline</button>'
                     + (' <span class="meta">(its proposed tickets go the same way)</span>' if t["kind"] == "epic" else "")
@@ -1989,26 +2103,31 @@ def render_ticket(store, tid):
         actions = []
     btns = "".join(f'<button class="{"primary" if p else ""}" onclick="setStatus(\'{t["id"]}\',\'{to}\')">{esc(lbl)}</button>'
                    for to, lbl, p in actions)
+    if s == "backlog" and t["kind"] == "task" and not t["proposed"]:  # Make ready, for someone
+        btns = (assign_select(store, t["id"], t["assignee"])
+                + btns.replace(f"setStatus('{t['id']}','ready')", f"readyFor('{t['id']}')", 1))
     move_opts = "".join(f'<option value="{x}">{LABELS[x]}</option>' for x in STATUSES if x != s)
     body = f"""<div class="row" style="margin-bottom:6px"><span class="id">{t['id']}</span>
 <span class="chip s-{s}">{LABELS[s]}</span>{'<span class="p1">High priority</span>' if t['priority'] == 1 else ''}
 <span class="meta">{'assigned to <b>' + esc(t['assignee']) + '</b>' if t['assignee'] else 'unassigned'}</span>
 {'<span class="tag epic">Epic</span>' if t['kind'] == 'epic' else ''}
 {f'<span class="meta">in epic <a href="/t/{t["epic_id"]}">{t["epic_id"]} · {esc(t.get("epic_title") or "")}</a></span>' if t['epic_id'] else ''}</div>
-<h1>{esc(t['title'])}</h1>{banners}
+<h1>{esc(t['title'])}</h1>
+<div class="banner prop" id="changed" hidden>This ticket has changed (status, assignee or details).
+ <button onclick="location.reload()">Refresh</button> <span class="meta">Your unsent comment is kept.</span></div>{banners}
 <div class="row" style="margin-bottom:16px">{btns}</div>
 <div class="detail"><div>
  <div class="box"><div class="desc">{linkify(t['description']) or '<span class="meta">No description.</span>'}</div></div>
  {epic_box}
- <h2>Activity</h2><div class="tl">{timeline}</div>
+ <h2>Activity</h2><div class="tl" id="tl">{timeline}</div>
  <h2>Comment</h2><form class="stack box" id="cf">
   <textarea id="cbody" placeholder="Feedback, a decision, or a question for the agent" aria-label="Comment"></textarea>
   <div class="row"><input type="file" id="cfiles" multiple aria-label="Attach files">
   <label class="meta">then <select id="cmove" style="width:auto"><option value="">keep status</option>{move_opts}</select></label>
   <button class="primary" id="csend">Post</button></div></form>
 </div><aside>
- <h2 style="margin-top:0">Checklist</h2><div class="box">{ckhtml}</div>
- {wiki_box}
+ <h2 style="margin-top:0">Checklist</h2><div class="box" id="ckbox" data-v="{ck_v}">{ckhtml}</div>
+ <div id="wikibox" data-v="{esc(json.dumps(t['wiki_links']))}">{wiki_box}</div>
  <h2>Assigned to</h2><div class="box"><select id="who" aria-label="Assigned to"
   onchange="assign(this.value)">{assignee_options(store, t['assignee'])}</select></div>
  {side_links}
@@ -2021,7 +2140,7 @@ def render_ticket(store, tid):
    <button class="primary">Save</button></form></details></div>
 </aside></div>
 <script>
-const TID = {json.dumps(t['id'])}, $ = (id) => document.getElementById(id);
+const TID = {json.dumps(t['id'])}, SIG = {json.dumps(ticket_sig(t))}, $ = (id) => document.getElementById(id);
 document.getElementById('cf').onsubmit = async (e) => {{
   e.preventDefault(); const btn = document.getElementById('csend'); btn.disabled = true; btn.textContent = 'Posting…';
   try {{
@@ -2030,6 +2149,7 @@ document.getElementById('cf').onsubmit = async (e) => {{
     if (text || files.length) cid = (await api('POST', '/api/tickets/' + TID + '/comments', {{body: text || '(attached files)'}})).id;
     for (const f of files) {{ btn.textContent = 'Uploading ' + f.name + '…'; await upload(TID, f, cid); }}
     if ($('cmove').value) await api('PATCH', '/api/tickets/' + TID, {{status: $('cmove').value}});
+    clearDraft();
     location.reload();
   }} catch (err) {{ fail(err); btn.disabled = false; btn.textContent = 'Post'; }}
 }};
@@ -2044,6 +2164,7 @@ if (df) df.onsubmit = async (e) => {{ e.preventDefault();
   try {{ await api('POST', '/api/tickets/' + TID + '/deps', {{depends_on: $('dep').value.trim()}}); location.reload(); }}
   catch (err) {{ fail(err); }} }};
 {PROPOSAL_JS}
+{LIVE_JS}
 document.getElementById('ef').onsubmit = async (e) => {{
   e.preventDefault();
   try {{ await api('PATCH', '/api/tickets/' + TID, {{title: $('etitle').value, description: $('edesc').value,
@@ -2849,6 +2970,8 @@ class Handler(BaseHTTPRequestHandler):
                 mid = (query.get("from_message") or [""])[0]
                 return self.html(render_new(store, (query.get("epic") or [None])[0],
                                             ticket_from_message(store, int(mid)) if mid.isdigit() else ("", "")))
+            if method == "GET" and (tm := re.fullmatch(rf"/t/({ID_PATH})/live", path)):
+                return self.json(200, ticket_live(store, tm.group(1)))
             if method == "GET" and (tm := re.fullmatch(rf"/t/({ID_PATH})", path)):
                 return self.html(render_ticket(store, tm.group(1)))
             if method == "GET" and (fm := re.fullmatch(r"/files/(\d+)/[^/]*", path)):
@@ -2978,8 +3101,9 @@ class Handler(BaseHTTPRequestHandler):
                 if sub in ("/accept", "/decline") and method == "POST" and not other:
                     # Always read the body, even for decline: left unread, it would
                     # be taken for the start of the next request on this connection.
-                    ready = bool(self.body_json().get("ready")) and sub == "/accept"
-                    return self.json(200, store.review_proposal(tid, sub == "/accept", ready, actor, role))
+                    d = self.body_json()
+                    return self.json(200, store.review_proposal(tid, sub == "/accept", bool(d.get("ready")) and sub == "/accept",
+                                                                actor, role, d.get("assignee")))
                 if other:
                     raise ApiError(404, "not found")
                 if not sub and method == "GET":

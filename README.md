@@ -220,16 +220,23 @@ They're on the same disk as the data, so copy them somewhere else too.
 - **Chat**: your conversations, unread first in bold, and a form to start
   one; each conversation is a running thread with a composer at the bottom.
 - **Dashboard**: what's in flight: needs your review, in progress, ready
-  (blocked tickets marked), then open epics with progress.
+  (blocked tickets marked), then open epics with progress. It checks for
+  changes every 10 seconds and updates in place.
 - **Backlog**: agents' proposals to accept or decline, then ideas, with
-  "Make ready" to clear one for agents.
+  "Make ready" to clear one for agents. Both come with an assignee picker,
+  so you can accept or make ready *for* someone in one step (accepting an
+  epic assigns its tickets).
 - **Done**: approved (or declined) work, newest first, searchable.
 - **Ticket**: description, the full history (comments, status changes,
   images, video and audio inline; any other file, like a tarball, script
   or markdown write-up, as a download, with a preview for small text
   files), the checklist the agent reports, with
   progress, its epic, what must be done first and what it unblocks, and
-  buttons to approve, send back, or move it anywhere. An epic's page lists
+  buttons to approve, send back, or move it anywhere. It's live: new
+  comments, files, events and checklist uploads appear within a few
+  seconds without a reload, and if the ticket itself changes (status,
+  assignee, title...) a banner offers a refresh. Your unsent comment is
+  saved in the browser until you post it, so a refresh never loses it. An epic's page lists
   its tickets.
 - **New ticket**.
 
