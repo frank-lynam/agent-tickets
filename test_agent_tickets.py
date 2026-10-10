@@ -844,7 +844,8 @@ class TicketsTest(unittest.TestCase):
         page = self.call("GET", f"/t/{t['id']}", role="human")[1].decode()
         self.assertIn("Cancel ticket", page)
         self.assertEqual(self.j("POST", f"/api/tickets/{t['id']}/cancel", {}, role=None, token=tok)[0], 403)
-        # The agent working it is woken and told to stop.
+        # The agent (which has handed it back) is woken and told to stop.
+        self.j("PATCH", f"/api/tickets/{t['id']}", {"status": "review"}, role=None, token=tok)
         threading.Timer(0.4, lambda: self.j("POST", f"/api/tickets/{t['id']}/cancel", {}, role="human")).start()
         woke = self.j("GET", "/api/wait?timeout=20", role=None, token=tok)[1]
         self.assertEqual(woke["tickets"][0]["why"], "Frank cancelled it: stop work on it")
@@ -910,49 +911,69 @@ class TicketsTest(unittest.TestCase):
 
     def test_wait(self):
         tok = self.j("POST", "/api/users", {"username": "agent-z", "kind": "agent"}, role="human")[1]["token"]
-        mine = self.new("in_progress", assignee="agent-z", title="mine")
-        # Nothing for it: times out.
-        started = time.time()
-        got = self.j("GET", "/api/wait?timeout=1", role=None, token=tok)[1]
-        self.assertEqual(got["reason"], "timeout")
-        self.assertLess(time.time() - started, 4)
+        W = lambda path="/api/wait?timeout=20": self.j("GET", path, role=None, token=tok)[1]
 
         def later(fn, delay=0.4):
             threading.Timer(delay, fn).start()
 
         def waited(path="/api/wait?timeout=20"):
             t0 = time.time()
-            r = self.j("GET", path, role=None, token=tok)[1]
-            return r, time.time() - t0
-        # A human replies on its ticket: wakes at once (well before the timeout).
-        later(lambda: self.j("POST", f"/api/tickets/{mine['id']}/comments", {"body": "use plan B"}, role="human"))
+            return W(path), time.time() - t0
+        # Nothing for it: times out.
+        started = time.time()
+        self.assertEqual(W("/api/wait?timeout=1")["reason"], "timeout")
+        self.assertLess(time.time() - started, 4)
+        # Work it already has comes back at once, in order: in progress (by priority), then ready.
+        low = self.new("in_progress", assignee="agent-z", title="low", priority=3)
+        high = self.new("in_progress", assignee="agent-z", title="high", priority=1)
+        queued = self.new("ready", assignee="agent-z", title="next up")
+        got, took = waited()
+        self.assertEqual((got["reason"], [t["id"] for t in got["tickets"]]), ("in_progress", [high["id"], low["id"]]))
+        self.assertEqual(got["tickets"][0]["why"], "yours and in progress: keep working on it")
+        self.assertLess(took, 2)
+        for t in (high, low):  # handed back
+            self.j("PATCH", f"/api/tickets/{t['id']}", {"status": "review"}, role=None, token=tok)
+        got = W()
+        self.assertEqual((got["reason"], got["tickets"][0]["id"]), ("ready", queued["id"]))
+        self.j("PATCH", f"/api/tickets/{queued['id']}", {"assignee": None}, role="human")
+        # Blocked work doesn't count; unassigned ready work only with queue=1.
+        stuck = self.new("ready", assignee="agent-z", title="waits on high", depends_on=high["id"])
+        self.assertEqual(W("/api/wait?timeout=1")["reason"], "timeout")
+        self.j("PATCH", f"/api/tickets/{stuck['id']}", {"status": "backlog"}, role="human")
+        got = W("/api/wait?timeout=1&queue=1")
+        self.assertEqual(got["reason"], "queue")
+        self.assertIn(queued["id"], [t["id"] for t in got["tickets"]])
+        for t in self.j("GET", "/api/tickets?status=ready", role="human")[1]["tickets"]:  # clear the shared queue
+            self.j("PATCH", f"/api/tickets/{t['id']}", {"status": "backlog"}, role="human")
+        # While waiting: a reply on its (in review) ticket wakes it at once.
+        later(lambda: self.j("POST", f"/api/tickets/{high['id']}/comments", {"body": "use plan B"}, role="human"))
         got, took = waited()
         self.assertEqual((got["reason"], got["tickets"][0]["id"], got["tickets"][0]["why"]),
-                         ("tickets", mine["id"], "Frank commented"))
+                         ("tickets", high["id"], "Frank commented"))
         self.assertLess(took, 5)
         # Its own changes don't wake it; being assigned a ticket does.
-        other = self.new("ready", title="next one")
-        later(lambda: self.j("POST", f"/api/tickets/{mine['id']}/comments", {"body": "on it"}, role=None, token=tok))
+        other = self.new("backlog", title="next one")
+        later(lambda: self.j("POST", f"/api/tickets/{high['id']}/comments", {"body": "on it"}, role=None, token=tok))
         later(lambda: self.j("PATCH", f"/api/tickets/{other['id']}", {"assignee": "agent-z"}, role="human"), 1.2)
         got, took = waited()
-        self.assertEqual([x["id"] for x in got["tickets"]], [other["id"]])
-        self.assertEqual(got["tickets"][0]["why"], "Frank assigned it to you")
+        self.assertEqual(([x["id"] for x in got["tickets"]], got["tickets"][0]["why"]), ([other["id"]], "Frank assigned it to you"))
         self.assertGreater(took, 1)
-        # A chat message wakes it, and keeps returning at once until it's read.
+        # Sent back to in progress: from then on it's work to do.
+        self.j("PATCH", f"/api/tickets/{high['id']}", {"status": "in_progress"}, role="human")
+        self.assertEqual(W()["reason"], "in_progress")
+        self.j("PATCH", f"/api/tickets/{high['id']}", {"status": "review"}, role=None, token=tok)
+        # Chat comes before everything, and keeps returning at once until it's read.
         later(lambda: self.j("POST", "/api/chat", {"members": ["agent-z"], "body": "got a sec?"}, role="human"))
-        got, took = waited()
+        got, _ = waited()
         self.assertEqual((got["reason"], got["chat"]["unread"]), ("chat", 1))
-        self.assertEqual(self.j("GET", "/api/wait?timeout=20", role=None, token=tok)[1]["reason"], "chat")
+        self.assertEqual(W()["reason"], "chat")
         for c in self.j("GET", "/api/chat/unread", role=None, token=tok)[1]["conversations"]:
             self.j("POST", f"/api/chat/{c['id']}/read", {}, role=None, token=tok)
-        # With queue=1, new unassigned ready work wakes it too.
-        later(lambda: self.new("ready", title="anyone's"))
-        got, _ = waited("/api/wait?timeout=20&queue=1")
-        self.assertEqual((got["reason"], got["tickets"][0]["title"], got["tickets"][0]["why"]),
-                         ("tickets", "anyone's", "Frank made it ready"))
+        self.assertEqual(W("/api/wait?timeout=1")["reason"], "timeout")
         # The briefing and skill teach it.
         brief = self.call("GET", "/api", role=None)[1].decode()
         self.assertIn("## Staying reachable when you're idle", brief)
+        self.assertIn("**Don't park work in in_progress:**", brief)
         self.assertIn("/api/wait", self.call("GET", "/api/skill", role=None, token=tok)[1].decode())
 
     def test_read_receipts(self):

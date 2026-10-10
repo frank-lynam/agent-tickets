@@ -270,7 +270,7 @@ DEFAULT_GUIDANCE = """## How we work
 3. After each step, tick it off in your file, upload it again, and comment what you did and what happened, including errors and surprises.
 4. When something is visible (a page, a chart, a game), attach a screenshot or a short recording.
 5. Hand back with a comment that starts "Done" or "Needs a decision", then set the status to review.
-6. When you've nothing to do, stay reachable: keep GET /api/wait running in the background (however your harness allows) so chat and replies on your tickets wake you.
+6. Between steps and when you're idle, ask GET /api/wait what to do next (chat, replies, your in-progress tickets, then ready ones) and keep it running in the background however your harness allows. Don't leave tickets in progress that you aren't working on: if you're waiting on a decision, move it to review and say what you need.
 
 ## How much to write
 
@@ -1166,10 +1166,26 @@ class Store:
             out[r["id"]] = {"id": r["id"], "title": r["title"], "status": r["status"], "why": why}
         return list(out.values())
 
+    def outstanding(self, user, status, assigned=True):
+        """Unblocked tickets (not epics or proposals) in `status`: the user's own, or with assigned=False,
+        nobody's. Highest priority first, then oldest."""
+        who = "t.assignee = ? COLLATE NOCASE" if assigned else "t.assignee IS NULL"
+        return [dict(r) for r in self.db().execute(
+            f"SELECT t.id, t.title, t.status, t.priority FROM tickets t WHERE t.status = ? AND t.kind = 'task' "
+            f"AND t.proposed = 0 AND {who} AND NOT EXISTS (SELECT 1 FROM deps d JOIN tickets p ON p.id = d.depends_on "
+            f"WHERE d.ticket_id = t.id AND p.status != 'done') ORDER BY t.priority, t.created_at",
+            (status, user) if assigned else (status,))]
+
     def wait_for(self, user, timeout, queue=False):
-        """Return as soon as `user` has unread chat, or (since the call began) a ticket of theirs was
-        commented on or changed by someone else; otherwise after `timeout` seconds."""
+        """What `user` should do next, as soon as there's anything: unread chat; replies or changes on
+        their tickets since the call began; their in-progress tickets; their ready tickets; with `queue`,
+        anyone's ready tickets. Only when there's none of that does it wait (up to `timeout` seconds)."""
         marks, end = self._marks(), time.time() + timeout
+        steps = [("in_progress", lambda: self.outstanding(user, "in_progress"),
+                  "yours and in progress: keep working on it"),
+                 ("ready", lambda: self.outstanding(user, "ready"), "assigned to you and ready: start it"),
+                 ("queue", lambda: self.outstanding(user, "ready", assigned=False) if queue else [],
+                  "ready for anyone: take it with GET /api/next?claim=1")]
         while True:
             notice = self.chat_notice(user)
             if notice:
@@ -1177,6 +1193,10 @@ class Store:
             news = self.news_for(user, marks, queue)
             if news:
                 return {"reason": "tickets", "chat": None, "tickets": news}
+            for reason, find, why in steps:
+                found = find()
+                if found:
+                    return {"reason": reason, "chat": None, "tickets": [{**t, "why": why} for t in found]}
             left = end - time.time()
             if left <= 0:
                 return {"reason": "timeout", "chat": None, "tickets": []}
@@ -3044,8 +3064,10 @@ enough, or a request fails in a way you don't understand. Errors come back as `{
 
 Stay reachable: keep `GET /api/wait?timeout=50` running in the background, in a loop, using whatever your
 harness offers (a background command that wakes you when it returns, a scheduled check, a hook before you end
-a turn). It returns when you have unread chat or someone replies on or changes your tickets. Answer chat
-first, then the tickets, then wait again. Write down here how you set it up for your harness.
+a turn). It tells you what to do next, at once if there's anything: unread chat, replies on your tickets,
+your in-progress tickets, your ready tickets (in that order). Do it, then call it again. Don't park work in
+in progress: if you're stuck on a decision, move it to review with what you need. Write down here how you set
+up the listener for your harness.
 
 ## Writing
 
@@ -3187,9 +3209,11 @@ proposed tickets, in one step.
    - How to check it (what to open, run or look at; attach a screenshot
      or recording).
    - For a decision: the question, the options, and what you'd recommend.
-6. Stopping before you're finished: leave it in_progress with a comment
-   saying where you got to and what's next, or release it (`ready`) if
-   someone else should take it.
+6. Stopping before you're finished: comment where you got to and what's
+   next. If you're blocked on a decision or on someone else, move it to
+   review saying what you need; if someone else should take it, release
+   it (`ready`). Leave it in_progress only if you're coming back to it:
+   `/api/wait` keeps handing your in-progress tickets back to you.
 7. After review a human may move it back to in_progress or ready with a
    comment saying what to change. Read their comment first.
 
@@ -3217,24 +3241,36 @@ even when you're between tasks. This server can't reach into your
 session: **you set up your own listener, once, with whatever your harness
 offers, and write down how in your skill.**
 
-- `GET /api/wait?timeout=50` holds the request open until there's
-  something for you, then returns it right away:
-  - `{"reason": "chat", "chat": {...}}`: you have unread chat (this
-    returns at once while any is unread, so answer or mark it read before
-    waiting again, or you'll spin);
-  - `{"reason": "tickets", "tickets": [{"id", "title", "status", "why"}]}`:
-    since you started waiting, someone else commented on or changed a
-    ticket assigned to you, or assigned you one;
-  - `{"reason": "timeout"}`: nothing yet. Call it again.
-  Add `&queue=1` to also wake for new unassigned ready tickets. The longest
-  timeout is 300 seconds; keep it under 100 if a proxy sits in front of this
-  server (many cut long requests), and loop.
+- `GET /api/wait?timeout=50` tells you what to do next. If there's
+  anything, it returns at once, the first of these that applies:
+  1. `{"reason": "chat", "chat": {...}}`: you have unread chat. Answer it
+     (or mark it read).
+  2. `{"reason": "tickets", "tickets": [{"id", "title", "status", "why"}]}`:
+     while you were waiting, someone else commented on or changed a ticket
+     assigned to you, or assigned you one. Read it and act on it.
+  3. `{"reason": "in_progress", "tickets": [...]}`: your in-progress
+     tickets, highest priority first. Keep working on them.
+  4. `{"reason": "ready", "tickets": [...]}`: ready tickets assigned to
+     you. Start the first (`GET /api/next?claim=1`).
+  5. `{"reason": "queue", "tickets": [...]}`: only with `&queue=1`:
+     unassigned ready tickets. Take one with `GET /api/next?claim=1`.
+  Only when none of these applies does it wait, and it returns the moment
+  one does, or `{"reason": "timeout"}` when time is up (then call it
+  again). Blocked tickets never count. The longest timeout is 300 seconds;
+  keep it under 100 if a proxy sits in front of this server (many cut long
+  requests), and loop.
+- Because of 1, 3 and 4, it returns straight away until you've dealt with
+  them: answer chat, and finish your in-progress tickets or hand them
+  back. **Don't park work in in_progress:** if you're stuck waiting on a
+  decision or on someone else, move the ticket to review with a comment
+  saying what you need, or release it to ready. Otherwise wait will keep
+  handing it back to you (which is the point).
 - Run it whenever you'd otherwise sit idle, so that its returning wakes you:
   for example a background command your harness tells you about when it
   finishes, a scheduled wake-up that calls it, or a hook that checks before
   you end a turn. Use whatever your harness supports; there's no one way.
-- When it returns: answer chat first, then deal with the tickets, then go
-  back to waiting.
+- When it returns: do what it says (chat first, then your tickets), then
+  call it again. You can also call it any time as "what should I do next?".
 - If your harness can't run anything while you're idle, tell a human in
   chat, so they know to nudge you when they write.
 
@@ -3288,8 +3324,9 @@ letters, like `KAMI`). Any case works, and a space for the hyphen in JSON.
     GET   /api/guidance              {"guidance": the house rules and any notes for you}
     GET   /api/next                  your next ready ticket, or {"ticket": null}; plus "guidance"
     GET   /api/next?claim=1          ...and move it to in_progress, assigned to you
-    GET   /api/wait?timeout=50       wait (up to 300 s) until you have unread chat, or a ticket of yours gets a
-                                     reply or change; &queue=1 also wakes for new unassigned ready tickets
+    GET   /api/wait?timeout=50       what to do next: unread chat, replies on your tickets, your in-progress
+                                     tickets, your ready tickets (&queue=1: anyone's ready tickets), at once if
+                                     any; otherwise waits up to 300 s for one
     GET   /api/tickets               {"tickets": [...]}; filters: ?status=ready,in_progress  ?q=text
                                      ?assignee=me (or a name, or "none")  ?epic=ID  ?kind=epic  ?proposed=1
     GET   /api/tickets/ID            one ticket, with comments, attachments, events, checklist
