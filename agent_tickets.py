@@ -1506,12 +1506,18 @@ form.stack{display:grid;gap:8px}
 .detail{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:20px}
 @media (max-width:800px){.detail{grid-template-columns:1fr}}
 .box{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}
-.desc{white-space:pre-wrap;overflow-wrap:anywhere}
+.desc{overflow-wrap:anywhere}
+.md p{white-space:pre-wrap;overflow-wrap:anywhere;margin:0 0 8px}.md>:last-child{margin-bottom:0}
+.md h2,.md h3,.md h4{text-transform:none;letter-spacing:0;color:inherit;margin:12px 0 4px;font-weight:700}
+.md h2{font-size:17px}.md h3{font-size:15.5px}.md h4{font-size:15px}.md>:first-child{margin-top:0}
+.md pre{white-space:pre;overflow:auto;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:8px 10px;
+font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;margin:0 0 8px}
+.md code{font:13px ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--bg);padding:1px 4px;border-radius:4px}
 .tl{display:grid;gap:10px}
 .c{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 14px}
 .c.agent{border-left:3px solid var(--agent)}
 .c .who{font-weight:600}.c .who.agent{color:var(--agent)}
-.c .body{white-space:pre-wrap;overflow-wrap:anywhere;margin-top:4px}
+.c .body{overflow-wrap:anywhere;margin-top:4px}
 .ev{color:var(--dim);font-size:13px;padding:0 4px}
 .att{margin-top:8px}
 .att img,.att video{max-width:100%;max-height:420px;border-radius:8px;display:block}
@@ -1541,7 +1547,7 @@ a.wl.missing{color:var(--review);text-decoration-style:dashed}
 .msg.mine{justify-self:end;background:var(--prog-bg)}
 .msg.agent{border-left:3px solid var(--agent)}
 .msg .who{font-weight:600}.msg .who.agent{color:var(--agent)}
-.msg .body{white-space:pre-wrap;overflow-wrap:anywhere;margin-top:2px}
+.msg .body{overflow-wrap:anywhere;margin-top:2px}
 .msg .mk{margin-left:6px;text-decoration:none;font-size:12px;opacity:.75}
 .receipt{margin:6px 2px 0;text-align:right}.receipt .unseen{color:var(--review)}
 .composer{position:sticky;bottom:0;margin-top:14px;padding:10px 0 4px;background:var(--bg)}
@@ -2016,7 +2022,7 @@ def ticket_timeline(store, t):
         items.append((c["created_at"], f'<div class="c {role}" id="c{c["id"]}" data-v="{len(mine)}">'
                                        f'<span class="who {role}">{esc(c["author"])}</span> '
                                        f'<span class="meta" title="{when(c["created_at"])}">{ago(c["created_at"])}</span>'
-                                       f'<div class="body">{linkify(c["body"])}</div>{files}</div>'))
+                                       f'<div class="body md">{wiki_html(store, c["body"])}</div>{files}</div>'))
     for a in loose:
         items.append((a["created_at"], f'<div class="c {"agent" if a["role"] == "agent" else ""}" id="a{a["id"]}">'
                                        f'<span class="who">{esc(a["author"])}</span> <span class="meta">attached a file · '
@@ -2197,7 +2203,7 @@ def render_ticket(store, tid):
  <button onclick="location.reload()">Refresh</button> <span class="meta">Your unsent comment is kept.</span></div>{banners}
 <div class="row" style="margin-bottom:16px">{btns}</div>
 <div class="detail"><div>
- <div class="box"><div class="desc">{linkify(t['description']) or '<span class="meta">No description.</span>'}</div></div>
+ <div class="box"><div class="desc md">{wiki_html(store, t['description']) or '<span class="meta">No description.</span>'}</div></div>
  {epic_box}
  <h2>Activity</h2><div class="tl" id="tl">{timeline}</div>
  <h2>Comment</h2><form class="stack box" id="cf">
@@ -2283,7 +2289,7 @@ def render_message(store, m, viewer):
     return (f'<div class="msg {role}{mine}" id="m{m["id"]}"><div><span class="who {role}">{esc(m["author"])}</span> '
             f'<span class="meta" title="{when(m["created_at"])}">{ago(m["created_at"])}</span>'
             f'<a class="mk" href="/new?from_message={m["id"]}" title="Make a ticket from this message">→ ticket</a></div>'
-            f'<div class="body">{chat_text(store, m["body"])}</div>{files}</div>')
+            f'<div class="body md">{wiki_html(store, m["body"])}</div>{files}</div>')
 
 
 def ticket_from_message(store, mid):
@@ -2431,19 +2437,24 @@ def render_chat(store, cid, viewer):
     return page(c["name"], body, "/chat", len(store.tickets(["review"])))
 
 
+BOLD = re.compile(r"\*\*([^*\n]+?)\*\*")
+
+
 def wiki_inline(store, text):
-    """One run of text: escaped, with `code`, links, ticket ids and [[wiki/links]]."""
+    """One run of text: escaped, with `code`, **bold**, links, ticket ids and [[wiki/links]]."""
     out = []
     for i, part in enumerate(re.split(r"(`[^`\n]+`)", text)):
         if i % 2:
             out.append(f"<code>{esc(part[1:-1])}</code>")
         else:
-            out.append(chat_text(store, part))
+            out.append(BOLD.sub(r"<b>\1</b>", chat_text(store, part)))
     return "".join(out)
 
 
 def wiki_html(store, text):
-    """Plain text with a little structure: # headings, ``` code blocks; blank lines split paragraphs."""
+    """Text as people and agents write it: line breaks and indentation kept, plus a little markdown:
+    # headings, ``` code blocks (monospace, spacing exact), `code`, **bold**, links. Used for the wiki,
+    ticket descriptions, comments and chat messages."""
     out, para, code = [], [], None
 
     def flush():

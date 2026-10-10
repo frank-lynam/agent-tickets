@@ -904,6 +904,22 @@ class TicketsTest(unittest.TestCase):
         self.assertEqual(self.j("GET", f"/api/chat/{c['id']}", role="human")[1]["read_up_to"]["agent-rr"],
                          conv["messages"][-1]["id"])
 
+    def test_formatted_text(self):
+        body = "## Plan\nstep one\n   - indented\n\n```\nname   ms\nopen  420\n```\nRun `npm test`. **Don't** <script>x</script> **<b>y</b>**"
+        t = self.new(description=body)
+        self.j("POST", f"/api/tickets/{t['id']}/comments", {"body": body}, role="human")
+        c = self.j("POST", "/api/chat", {"title": "fmt", "body": body}, role="human")[1]
+        for path in (f"/t/{t['id']}", f"/chat/{c['id']}"):
+            html = self.call("GET", path, role="human")[1].decode()
+            self.assertIn("<h3>Plan</h3>", html, path)
+            self.assertIn("<p>step one\n   - indented</p>", html, path)  # line breaks and indentation kept
+            self.assertIn("<pre>name   ms\nopen  420</pre>", html, path)  # exact spacing, monospace
+            self.assertIn("<code>npm test</code>", html, path)
+            self.assertIn("<b>Don&#x27;t</b>", html, path)
+            self.assertNotIn("<script>x</script>", html, path)
+            self.assertNotIn("<b>y</b>", html, path)
+        self.assertEqual(self.call("GET", f"/t/{t['id']}", role="human")[1].decode().count("<h3>Plan</h3>"), 2)
+
     def test_skill(self):
         code, body, h = self.call("GET", "/api/skill", role="agent", headers={"Host": "tickets.example:43917"})
         text = body.decode()
