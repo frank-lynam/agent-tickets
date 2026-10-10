@@ -1473,6 +1473,47 @@ def import_archive(store, src, replace=False):
 
 # --------------------------------------------------------------------------- HTML
 
+# Themes: name -> (label, palette, light or dark). Light is the default and
+# Dark follows the device under Auto; Goth rave has extra rules in the CSS.
+THEMES = {
+    "light": ("Light", {"bg": "#f6f5f1", "panel": "#fff", "ink": "#1f2328", "line": "#e2dfd7", "accent": "#3a5bd9"}, "light"),
+    "dark": ("Dark", {"bg": "#15171a", "panel": "#1d2024", "ink": "#e6e8eb", "line": "#2c3036", "accent": "#7d97f5"}, "dark"),
+    "sepia": ("Sepia", {"bg": "#f4ecd8", "panel": "#fbf6e9", "ink": "#3b2f22", "dim": "#7a6a55", "line": "#e2d5b8",
+                        "accent": "#9c4a1a", "accent-ink": "#fff8ee", "review": "#b0411e", "review-bg": "#f7e3d3",
+                        "prog": "#2f5f8a", "prog-bg": "#e2ebf3", "ready": "#4d7a2c", "ready-bg": "#e6efd9",
+                        "back": "#7a6a55", "back-bg": "#ece2cb", "done": "#5f564a", "done-bg": "#e9e1cf",
+                        "agent": "#7b4fa0"}, "light"),
+    "midnight": ("Midnight", {"bg": "#0d1321", "panel": "#151d2e", "ink": "#e3e9f5", "dim": "#8d9ab3", "line": "#24304a",
+                              "accent": "#5aa9ff", "accent-ink": "#04121f", "review": "#ffab6e", "review-bg": "#3a2618",
+                              "prog": "#7fb5ff", "prog-bg": "#172a47", "ready": "#5fd4a6", "ready-bg": "#12302a",
+                              "back": "#9aa6bd", "back-bg": "#1d2638", "done": "#aab4c8", "done-bg": "#1c2435",
+                              "agent": "#b49cff"}, "dark"),
+    "forest": ("Forest", {"bg": "#10170f", "panel": "#182317", "ink": "#e6eedc", "dim": "#98a88c", "line": "#2a3a27",
+                          "accent": "#9ccc65", "accent-ink": "#0d1a05", "review": "#f2a65a", "review-bg": "#3a2a14",
+                          "prog": "#7cc4d9", "prog-bg": "#15303a", "ready": "#a8e07a", "ready-bg": "#1f3314",
+                          "back": "#a3b096", "back-bg": "#202b1e", "done": "#b3bda8", "done-bg": "#1f281d",
+                          "agent": "#d4a5ff"}, "dark"),
+    "synthwave": ("Synthwave", {"bg": "#1a1033", "panel": "#241645", "ink": "#fbe9ff", "dim": "#b9a3d6", "line": "#3b2766",
+                                "accent": "#ff7edb", "accent-ink": "#1a0626", "review": "#ff8b3d", "review-bg": "#40211a",
+                                "prog": "#36f9f6", "prog-bg": "#0f3446", "ready": "#fede5d", "ready-bg": "#3a3214",
+                                "back": "#c7b3e6", "back-bg": "#2c1d52", "done": "#a08cc2", "done-bg": "#281a49",
+                                "agent": "#72f1b8"}, "dark"),
+    "contrast": ("High contrast", {"bg": "#000", "panel": "#000", "ink": "#fff", "dim": "#d6d6d6", "line": "#9a9a9a",
+                                   "accent": "#ffd400", "accent-ink": "#000", "review": "#ff7a7a", "review-bg": "#2a0000",
+                                   "prog": "#66ccff", "prog-bg": "#001a2a", "ready": "#66ff66", "ready-bg": "#002200",
+                                   "back": "#e6e6e6", "back-bg": "#1a1a1a", "done": "#e6e6e6", "done-bg": "#1a1a1a",
+                                   "agent": "#ff99ff"}, "dark"),
+    "goth": ("Goth rave", {"bg": "#09060d", "panel": "#130c1b", "ink": "#f3e8ff", "line": "#2f1d42", "accent": "#ff2bd6"},
+             "dark"),
+}
+EXTRA_THEMES = ("sepia", "midnight", "forest", "synthwave", "contrast")
+
+
+def theme_css():
+    return "\n".join(":root[data-theme=%s]{%s;color-scheme:%s}" % (
+        name, ";".join(f"--{k}:{v}" for k, v in THEMES[name][1].items()), THEMES[name][2]) for name in EXTRA_THEMES)
+
+
 CSS = """
 :root{--bg:#f6f5f1;--panel:#fff;--ink:#1f2328;--dim:#646b73;--line:#e2dfd7;--accent:#3a5bd9;--accent-ink:#fff;
 --review:#b5480f;--review-bg:#fdf0e7;--prog:#3a5bd9;--prog-bg:#edf1fd;--ready:#1d7a55;--ready-bg:#e8f6ef;
@@ -1494,7 +1535,6 @@ color-scheme:dark}
 radial-gradient(900px 500px at -10% 110%,#06283a 0%,transparent 55%),var(--bg);background-attachment:fixed}
 :root[data-theme=goth] header.top{background:rgba(19,12,27,.92);border-bottom:1px solid transparent;
 border-image:linear-gradient(90deg,#ff2bd6,#8a3dff,#29e7ff) 1}
-:root[data-theme=goth] header.top b{color:#ff2bd6;text-shadow:var(--glow);letter-spacing:.08em;text-transform:uppercase}
 :root[data-theme=goth] h1{text-shadow:0 0 14px rgba(199,125,255,.45)}
 :root[data-theme=goth] h2{color:#29e7ff;text-shadow:0 0 8px rgba(41,231,255,.35)}
 :root[data-theme=goth] nav a.on{background:#24113a;color:#ff2bd6;box-shadow:inset 0 -2px 0 #ff2bd6}
@@ -1512,13 +1552,26 @@ border-image:linear-gradient(90deg,#ff2bd6,#8a3dff,#29e7ff) 1}
 input[type=file]{color:var(--dim);font-size:13px;max-width:100%}
 input[type=file]::file-selector-button{font:600 13px system-ui,sans-serif;padding:6px 12px;margin-right:8px;border-radius:7px;
 border:1px solid var(--line);background:var(--panel);color:var(--ink);cursor:pointer}
-.theme{margin-left:auto;width:auto;padding:4px 8px;font-size:13px}
+""" + theme_css() + """
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
 a{color:var(--accent)}
-header.top{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:10px 16px;border-bottom:1px solid var(--line);background:var(--panel)}
-header.top b{margin-right:12px;font-size:15px}
-nav a{padding:6px 10px;border-radius:6px;text-decoration:none;color:var(--ink);white-space:nowrap;display:inline-block}
+header.top{position:sticky;top:0;z-index:30;display:flex;align-items:center;gap:4px;padding:3px 8px;border-bottom:1px solid var(--line);background:var(--panel)}
+header.top nav{display:flex;flex:1;min-width:0;overflow-x:auto;scrollbar-width:none}
+header.top nav::-webkit-scrollbar{display:none}
+nav a{padding:5px 9px;border-radius:6px;text-decoration:none;color:var(--ink);white-space:nowrap;display:inline-block;font-size:14px}
+.navx{flex:none;padding:4px 9px;font-size:13px;line-height:1;background:transparent;border-color:transparent;color:var(--dim)}
+.navx .min{display:none}
+:root[data-nav=min] header.top{position:fixed;top:6px;right:6px;padding:0;border:0;background:transparent}
+:root[data-nav=min] header.top nav{display:none}
+:root[data-nav=min] .navx{background:var(--panel);border:1px solid var(--line);color:var(--ink);padding:7px 11px;box-shadow:0 1px 4px rgba(0,0,0,.18)}
+:root[data-nav=min] .navx .open{display:none}:root[data-nav=min] .navx .min{display:inline}
+:root[data-nav=min] header.top:has(nav .n) .navx::after{content:"";display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--review);margin-left:5px;vertical-align:middle}
+.dlinks{display:flex;gap:6px 16px;flex-wrap:wrap;margin:-6px 0 14px;font-size:14px}
+.themes{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px}
+.themes button{display:flex;align-items:center;gap:8px;text-align:left;padding:10px 12px;border-width:2px}
+.themes button[aria-pressed=true]{outline:3px solid var(--accent);outline-offset:2px}
+.themes .sw{width:14px;height:14px;border-radius:50%;flex:none}
 nav a.on{background:var(--bg);font-weight:600}
 nav .n{display:inline-block;min-width:18px;padding:0 5px;margin-left:4px;border-radius:9px;background:var(--review);color:#fff;font-size:12px;text-align:center}
 main{max-width:1100px;margin:0 auto;padding:18px 16px 60px}
@@ -1619,13 +1672,25 @@ select.as{width:auto;max-width:12em;padding:7px 8px;font-size:14px}
 """
 
 JS = """
-(function(){ try { const t = localStorage.getItem('at-theme'); if (t) document.documentElement.dataset.theme = t; } catch (e) {} })();
+(function(){ try {
+  const t = localStorage.getItem('at-theme'); if (t) document.documentElement.dataset.theme = t;
+  if (localStorage.getItem('at-nav') === 'min') document.documentElement.dataset.nav = 'min';
+} catch (e) {} })();
+// The bar collapses to one small button (remembered in this browser).
+function toggleNav(){
+  const root = document.documentElement, min = root.dataset.nav !== 'min';
+  if (min) root.dataset.nav = 'min'; else delete root.dataset.nav;
+  try { min ? localStorage.setItem('at-nav', 'min') : localStorage.removeItem('at-nav'); } catch (e) {}
+  const b = document.getElementById('navx'); b.setAttribute('aria-expanded', String(!min));
+  b.setAttribute('aria-label', min ? 'Show menu' : 'Hide menu');
+}
 function setTheme(t){
   if (t) document.documentElement.dataset.theme = t; else delete document.documentElement.dataset.theme;
   try { t ? localStorage.setItem('at-theme', t) : localStorage.removeItem('at-theme'); } catch (e) {}
 }
 document.addEventListener('DOMContentLoaded', () => {
-  const sel = document.getElementById('theme'); if (sel) sel.value = document.documentElement.dataset.theme || '';
+  const b = document.getElementById('navx'), min = document.documentElement.dataset.nav === 'min';
+  if (b) { b.setAttribute('aria-expanded', String(!min)); b.setAttribute('aria-label', min ? 'Show menu' : 'Hide menu'); }
 });
 async function api(method, url, body){
   const r = await fetch(url, {method, headers: {'Content-Type':'application/json','X-Tickets':'1'},
@@ -1711,8 +1776,9 @@ CHAT_BADGE = "<!--chat-badge-->"
 
 
 def page(title, body, active="", review_count=0):
-    tabs = [("/", "Dashboard"), ("/chat", "Chat"), ("/wiki", "Wiki"), ("/backlog", "Backlog"), ("/done", "Done"), ("/new", "New ticket"),
-            ("/users", "Users"), ("/guidance", "Guidance")]
+    tabs = [("/", "Dashboard"), ("/chat", "Chat"), ("/wiki", "Wiki"), ("/new", "+ New"), ("/settings", "Settings")]
+    # Pages reached from the dashboard or settings light up those tabs.
+    active = {"/backlog": "/", "/done": "/", "/users": "/settings", "/guidance": "/settings"}.get(active, active)
     # The chat badge is per viewer: Handler.html() fills in CHAT_BADGE.
     nav = "".join(f'<a href="{h}" class="{"on" if h == active else ""}">{esc(n)}'
                   f'{f"<span class=n>{review_count}</span>" if h == "/" and review_count else ""}'
@@ -1720,10 +1786,9 @@ def page(title, body, active="", review_count=0):
     return (f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} · Agent tickets</title>'
             f'<style>{CSS}</style><script>{JS}</script></head><body>'
-            f'<header class="top"><b>Agent tickets</b><nav>{nav}</nav>'
-            f'<select id="theme" class="theme" aria-label="Theme" onchange="setTheme(this.value)">'
-            f'<option value="">Auto</option><option value="light">Light</option><option value="dark">Dark</option>'
-            f'<option value="goth">Goth rave</option></select></header><main>{body}</main></body></html>')
+            f'<header class="top"><nav aria-label="Main">{nav}</nav>'
+            f'<button type="button" id="navx" class="navx" aria-expanded="true" aria-label="Hide menu" onclick="toggleNav()">'
+            f'<span class="open">▴</span><span class="min">☰</span></button></header><main>{body}</main></body></html>')
 
 
 def card(t):
@@ -1775,6 +1840,7 @@ setInterval(async () => {
 
 
 def render_dashboard(store):
+    proposals = len(store.tickets(["backlog"], proposed=True))
     by = {s: store.tickets([s], kind="task", proposed=False) for s in ("review", "in_progress", "ready")}
     # Open epics, active ones first.
     epics = sorted(store.tickets(["backlog", "in_progress"], kind="epic", proposed=False),
@@ -1788,8 +1854,10 @@ def render_dashboard(store):
                     f'<span class="t">{esc(e["title"])}</span><span class="chip s-{e["status"]}">{EPIC_STATES[e["status"]]}</span>'
                     f'</div><div class="meta">{pr["done"]} of {pr["total"]} done'
                     f'{f" · {doing} in progress" if doing else ""}</div><div class="bar"><i style="width:{pct}%"></i></div></a>')
-    proposals = len(store.tickets(["backlog"], proposed=True))
-    body = ('<div id="dash"><h1>In flight</h1><div class="cols">'
+    backlog = len(store.tickets(["backlog"], proposed=False))
+    body = ('<div id="dash"><h1>In flight</h1>'
+            f'<p class="dlinks"><a href="/backlog">Backlog ({backlog})</a><a href="/done">Done</a>'
+            + (f'<a href="/backlog">Proposals ({proposals})</a>' if proposals else "") + '</p><div class="cols">'
             + column("Needs your review", by["review"], "Nothing waiting on you.")
             + column("In progress", by["in_progress"], "No agent is working on anything.")
             + column("Ready to work", by["ready"], "Nothing cleared for agents. Promote something from the backlog.")
@@ -1965,6 +2033,38 @@ $('uf').onsubmit = async (e) => {{ e.preventDefault();
     $('tok').appendChild(note); }} catch (err) {{ fail(err); }} }};
 </script>"""
     return page("Users", body, "/users", len(store.tickets(["review"])))
+
+
+SETTINGS_JS = """
+function pickTheme(t){
+  setTheme(t);
+  document.querySelectorAll('.themes button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.t === t)));
+}
+document.addEventListener('DOMContentLoaded', () => pickTheme(document.documentElement.dataset.theme || ''));
+"""
+
+
+def render_settings(role):
+    def opt(name, label, pal):
+        style = f"background:{pal['bg']};color:{pal['ink']};border-color:{pal['line']}"
+        return (f'<button type="button" data-t="{name}" onclick="pickTheme(\'{name}\')" aria-pressed="false" style="{style}">'
+                f'<span class="sw" style="background:{pal["accent"]}"></span>{esc(label)}</button>')
+    themes = (opt("", "Auto (follows your device)", THEMES["light"][1])
+              + "".join(opt(n, label, pal) for n, (label, pal, _) in THEMES.items()))
+    team = ""
+    if role == "human":
+        team = ('<h2>Team</h2><div class="list">'
+                '<div class="item"><a href="/users"><b>Users</b><div class="meta">Add humans and agents, new tokens, '
+                'disable accounts.</div></a></div>'
+                '<div class="item"><a href="/guidance"><b>Guidance</b><div class="meta">What agents are told about how to '
+                'work here, for all of them and each one.</div></a></div>'
+                '<div class="item"><a href="/api/export"><b>Download a backup</b><div class="meta">Everything: tickets, '
+                'comments, chat, wiki, history and files.</div></a></div></div>')
+    body = (f'<h1>Settings</h1><h2>Theme</h2><p class="meta">Saved in this browser.</p><div class="themes">{themes}</div>'
+            f'{team}<h2>For agents</h2><div class="list">'
+            '<div class="item"><a href="/api"><b>The agent briefing</b><div class="meta">What agents read to learn this '
+            'system (GET /api).</div></a></div></div><script>' + SETTINGS_JS + '</script>')
+    return body
 
 
 def render_guidance(store):
@@ -3278,6 +3378,8 @@ class Handler(BaseHTTPRequestHandler):
                     else:
                         store.set_setting("guidance", str(text))
                     return self.json(200, {"guidance": store.house_guidance()})
+            if method == "GET" and path == "/settings":
+                return self.html(page("Settings", render_settings(role), "/settings", len(store.tickets(["review"]))))
             if method == "GET" and path == "/guidance":
                 if role != "human":
                     raise ApiError(403, "only humans set the guidance")

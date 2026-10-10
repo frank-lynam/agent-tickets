@@ -963,6 +963,27 @@ class TicketsTest(unittest.TestCase):
         at.Store(self.srv.store.dir, [])
         self.assertEqual(state(), "active")  # parts d and r are still open
 
+    def test_nav_and_settings(self):
+        home = self.call("GET", "/", role="human")[1].decode()
+        nav = home[home.index("<nav"):home.index("</nav>")]
+        for link in ('href="/"', 'href="/chat"', 'href="/wiki"', 'href="/new"', 'href="/settings"'):
+            self.assertIn(link, nav)
+        for gone in ('href="/users"', 'href="/guidance"', 'href="/backlog"', 'href="/done"', 'id="theme"'):
+            self.assertNotIn(gone, nav)
+        self.assertIn('id="navx"', home)  # collapses
+        self.assertIn('<a href="/backlog">Backlog (', home)
+        self.assertIn('<a href="/done">Done</a>', home)
+        self.assertIn('class="on">Dashboard', self.call("GET", "/backlog", role="human")[1].decode())
+        settings = self.call("GET", "/settings", role="human")[1].decode()
+        for t in ("light", "dark", "sepia", "midnight", "forest", "synthwave", "contrast", "goth"):
+            self.assertIn(f'data-t="{t}"', settings)
+        self.assertIn('href="/users"', settings)
+        self.assertIn('href="/guidance"', settings)
+        self.assertIn(":root[data-theme=midnight]{--bg:#0d1321", settings)
+        agent = self.call("GET", "/settings", role="agent")[1].decode()
+        self.assertEqual(self.call("GET", "/settings", role="agent")[0], 200)
+        self.assertNotIn('href="/users"', agent)
+
     def test_skill(self):
         code, body, h = self.call("GET", "/api/skill", role="agent", headers={"Host": "tickets.example:43917"})
         text = body.decode()

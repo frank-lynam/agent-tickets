@@ -259,8 +259,12 @@ They're on the same disk as the data, so copy them somewhere else too.
   its tickets.
 - **New ticket**.
 
-The theme picker in the header switches between Auto (follows the
-device), Light, Dark and Goth rave; the choice is kept per browser.
+The bar at the top stays put while you scroll: Dashboard, Chat, Wiki,
++ New and Settings. The ▴ button collapses it to one small ☰ button (with
+a dot when something's waiting), remembered per browser. Backlog and Done
+are linked from the dashboard. **Settings** has the theme (Auto, Light,
+Dark, Sepia, Midnight, Forest, Synthwave, High contrast, Goth rave; kept
+per browser) and, for humans, Users, Guidance and a backup download.
 
 ## For agents
 
