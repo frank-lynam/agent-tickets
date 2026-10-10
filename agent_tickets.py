@@ -1530,6 +1530,13 @@ async function upload(tid, file, commentId){
   if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.error || ('HTTP ' + r.status)); }
 }
 function fail(e){ alert(e.message); }
+// Enter sends; Shift+Enter is a new line (and typing with an IME isn't interrupted).
+function enterSends(boxId, formId){
+  const box = document.getElementById(boxId); if (!box) return;
+  box.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); document.getElementById(formId).requestSubmit(); }
+  });
+}
 async function setStatus(tid, status){ try { await api('PATCH', '/api/tickets/' + tid, {status}); location.reload(); } catch (e) { fail(e); } }
 """
 
@@ -2121,7 +2128,7 @@ def render_ticket(store, tid):
  {epic_box}
  <h2>Activity</h2><div class="tl" id="tl">{timeline}</div>
  <h2>Comment</h2><form class="stack box" id="cf">
-  <textarea id="cbody" placeholder="Feedback, a decision, or a question for the agent" aria-label="Comment"></textarea>
+  <textarea id="cbody" placeholder="Feedback, a decision, or a question for the agent (Enter sends, Shift+Enter for a new line)" aria-label="Comment"></textarea>
   <div class="row"><input type="file" id="cfiles" multiple aria-label="Attach files">
   <label class="meta">then <select id="cmove" style="width:auto"><option value="">keep status</option>{move_opts}</select></label>
   <button class="primary" id="csend">Post</button></div></form>
@@ -2142,7 +2149,9 @@ def render_ticket(store, tid):
 <script>
 const TID = {json.dumps(t['id'])}, SIG = {json.dumps(ticket_sig(t))}, $ = (id) => document.getElementById(id);
 document.getElementById('cf').onsubmit = async (e) => {{
-  e.preventDefault(); const btn = document.getElementById('csend'); btn.disabled = true; btn.textContent = 'Posting…';
+  e.preventDefault(); const btn = document.getElementById('csend');
+  if (btn.disabled || (!$('cbody').value.trim() && !$('cfiles').files.length && !$('cmove').value)) return;
+  btn.disabled = true; btn.textContent = 'Posting…';
   try {{
     const files = [...$('cfiles').files], text = $('cbody').value.trim();
     let cid = null;
@@ -2165,6 +2174,7 @@ if (df) df.onsubmit = async (e) => {{ e.preventDefault();
   catch (err) {{ fail(err); }} }};
 {PROPOSAL_JS}
 {LIVE_JS}
+enterSends('cbody', 'cf');
 document.getElementById('ef').onsubmit = async (e) => {{
   e.preventDefault();
   try {{ await api('PATCH', '/api/tickets/' + TID, {{title: $('etitle').value, description: $('edesc').value,
@@ -2214,6 +2224,7 @@ def ticket_from_message(store, mid):
 
 CHAT_LIST_JS = """
 const $ = (id) => document.getElementById(id);
+enterSends('sb', 'sf');
 document.getElementById('sf').onsubmit = async (e) => {
   e.preventDefault();
   const members = [...document.querySelectorAll('input[name=who]:checked')].map(x => x.value);
@@ -2243,7 +2254,7 @@ Agents are told about new messages with every ticket update, and answer them fir
 <form class="stack" id="sf" style="margin-top:10px">
 <div class="who-pick" role="group" aria-label="With">{picks or '<span class="meta">No one else yet.</span>'}</div>
 <label>Title <span class="meta">(optional; for a group or a topic)</span><input type="text" id="st"></label>
-<label>Message<textarea id="sb" placeholder="What's on your mind?"></textarea></label>
+<label>Message<textarea id="sb" placeholder="What's on your mind? (Enter starts it, Shift+Enter for a new line)"></textarea></label>
 <button class="primary">Start</button></form></details>
 <div class="list clist">{"".join(rows) or '<p class="empty">No conversations yet.</p>'}</div>
 <script>{CHAT_LIST_JS}</script>"""
@@ -2295,7 +2306,7 @@ $('mf').onsubmit = async (e) => {
   busy = false; btn.disabled = false; btn.textContent = 'Send';
   await poll(true);
 };
-$('mbody').addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) $('mf').requestSubmit(); });
+enterSends('mbody', 'mf');
 const am = $('am');
 if (am) am.onsubmit = async (e) => { e.preventDefault();
   try { await api('POST', '/api/chat/' + CID + '/members', {username: $('amwho').value}); location.reload(); }
@@ -2321,7 +2332,7 @@ def render_chat(store, cid, viewer):
 <div class="meta">With {esc(", ".join(c["members"]) or "no one yet")}. Anyone can read and post here.</div>{add}
 <div id="chatroom" data-cid="{c["id"]}" data-last="{last}" style="margin-top:14px">
 <div class="chat" id="msgs">{shown or '<p class="empty" id="none">No messages yet. Say hello.</p>'}</div>
-<form class="stack composer" id="mf"><textarea id="mbody" placeholder="Message (Ctrl+Enter sends)" aria-label="Message"></textarea>
+<form class="stack composer" id="mf"><textarea id="mbody" placeholder="Message (Enter sends, Shift+Enter for a new line)" aria-label="Message"></textarea>
 <div class="row"><input type="file" id="mfiles" multiple aria-label="Attach files">
 <button class="primary" id="msend" style="margin-left:auto">Send</button></div></form></div>
 <script>{CHAT_JS}</script>"""
