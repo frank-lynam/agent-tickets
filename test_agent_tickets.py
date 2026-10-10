@@ -884,6 +884,8 @@ class TicketsTest(unittest.TestCase):
         self.assertIn("at-draft:", page)  # unsent comments are kept
         self.assertIn("enterSends('cbody', 'cf')", page)  # Enter sends, Shift+Enter is a new line
         self.assertIn("window.innerHeight * 0.8", page)  # text boxes grow to fit, up to 80% of the screen
+        self.assertIn("function markBusy()", page)  # buttons show they're working
+        self.assertIn("button.busy::after", page)
         # A comment and a file arrive: new entries with ids; the ticket's own state hasn't changed.
         c = self.j("POST", f"/api/tickets/{t['id']}/comments", {"body": "progress"}, role=None, token=tok)[1]
         self.j("POST", f"/api/tickets/{t['id']}/attachments?filename=x.txt&comment_id={c['id']}", raw=b"hi",

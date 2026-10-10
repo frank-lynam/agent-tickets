@@ -1714,6 +1714,17 @@ a.wl.missing{color:var(--review);text-decoration-style:dashed}
 .tree li{margin:3px 0}.tree a{text-decoration:none}.tree>li>a{font-weight:600}
 select.as{width:auto;max-width:12em;padding:7px 8px;font-size:14px}
 .tl .new{animation:arrive 2.5s ease-out}
+button.busy,select.busy{cursor:progress}
+button.busy{position:relative;color:transparent!important}
+button.busy::after{content:"";position:absolute;inset:0;margin:auto;width:14px;height:14px;border-radius:50%;
+border:2px solid var(--ink);border-right-color:transparent;animation:spin .7s linear infinite}
+button.primary.busy::after{border-color:var(--accent-ink);border-right-color:transparent}
+select.busy{opacity:.55}
+html.working,html.working *{cursor:progress}
+html.working::after{content:"";position:fixed;z-index:99;top:0;left:-40%;height:3px;width:40%;background:var(--accent);
+animation:slide 1.1s ease-in-out infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes slide{from{left:-40%}to{left:100%}}
 @keyframes arrive{from{box-shadow:0 0 0 2px var(--accent)}to{box-shadow:0 0 0 2px transparent}}
 @media (prefers-reduced-motion:reduce){.tl .new{animation:none}}
 .list .item.prop{flex-wrap:wrap}.list .item.prop>a{flex:1 1 240px;min-width:0}.list .item.prop>.row{flex-wrap:wrap}
@@ -1742,12 +1753,48 @@ document.addEventListener('DOMContentLoaded', () => {
   const b = document.getElementById('navx'), min = document.documentElement.dataset.nav === 'min';
   if (b) { b.setAttribute('aria-expanded', String(!min)); b.setAttribute('aria-label', min ? 'Show menu' : 'Hide menu'); }
 });
+// Feedback for every action: the button (or dropdown) you just used is disabled
+// and shows a spinner while its request runs, and a bar slides along the top.
+let busyEl = null, busyAt = 0;
+function noteTarget(el){ if (el && /^(BUTTON|SELECT)$/.test(el.tagName)) { busyEl = el; busyAt = Date.now(); } }
+document.addEventListener('click', (e) => noteTarget(e.target.closest && e.target.closest('button')), true);
+document.addEventListener('change', (e) => noteTarget(e.target), true);
+document.addEventListener('submit', (e) => noteTarget(e.submitter || e.target.querySelector('button.primary, button')), true);
+function markBusy(){
+  document.documentElement.classList.add('working');
+  const el = Date.now() - busyAt < 3000 ? busyEl : null;
+  if (!el || el.classList.contains('busy')) return null;
+  el.dataset.wasDisabled = el.disabled ? '1' : '';  // a form that disables its own button keeps control of it
+  el.classList.add('busy'); el.disabled = true; el.setAttribute('aria-busy', 'true');
+  return el;
+}
+function clearBusy(el){
+  if (leaving) return;
+  document.documentElement.classList.remove('working');
+  if (!el) return;
+  el.classList.remove('busy'); el.removeAttribute('aria-busy');
+  if (!el.dataset.wasDisabled) el.disabled = false;
+}
+let leaving = false;
+window.addEventListener('beforeunload', () => { leaving = true; });
+// Following a link to another page: show the bar until it arrives.
+document.addEventListener('click', (e) => {
+  const a = e.target.closest && e.target.closest('a[href]');
+  if (a && !a.target && !a.hasAttribute('download') && a.origin === location.origin && !e.ctrlKey && !e.metaKey
+      && !e.shiftKey && a.getAttribute('href')[0] !== '#') document.documentElement.classList.add('working');
+});
+window.addEventListener('pageshow', () => { leaving = false; document.documentElement.classList.remove('working'); });
 async function api(method, url, body){
-  const r = await fetch(url, {method, headers: {'Content-Type':'application/json','X-Tickets':'1'},
-    body: body === undefined ? undefined : JSON.stringify(body), credentials: 'same-origin'});
-  const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
-  return j;
+  const el = markBusy();
+  try {
+    const r = await fetch(url, {method, headers: {'Content-Type':'application/json','X-Tickets':'1'},
+      body: body === undefined ? undefined : JSON.stringify(body), credentials: 'same-origin'});
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    // Most actions reload the page next (then it stays busy until the new page); otherwise give it back.
+    setTimeout(() => clearBusy(el), 250);
+    return j;
+  } catch (e) { clearBusy(el); throw e; }
 }
 async function upload(tid, file, commentId){
   const q = new URLSearchParams({filename: file.name}); if (commentId) q.set('comment_id', commentId);
