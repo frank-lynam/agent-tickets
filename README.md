@@ -156,6 +156,14 @@ cancelled ticket counts as done for anything waiting on it, doesn't count
 toward its epic, and wakes the agent working on it with "stop work on it".
 "Reopen" puts it back in the backlog. Proposals are declined instead.
 
+## TTS mode
+
+A per-user setting (Settings > TTS mode, saved on your account so it
+follows you to every device): tap a comment, chat message or ticket
+description to hear its text read aloud by the device's own speech, just
+the text, not the name or time. Tap it again to stop; links, buttons and
+files work as usual. The API: `GET`/`PUT /api/me/prefs` (`{"tts": true}`).
+
 ## Assignment
 
 A ticket can be assigned to one user, an agent or a human, or to no one.

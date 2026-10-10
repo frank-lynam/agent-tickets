@@ -1045,6 +1045,18 @@ class TicketsTest(unittest.TestCase):
         self.assertEqual(self.call("GET", "/settings", role="agent")[0], 200)
         self.assertNotIn('href="/users"', agent)
 
+    def test_tts_mode(self):
+        self.assertEqual(self.j("GET", "/api/me/prefs", role="human")[1], {"tts": False})
+        self.assertNotIn('<html lang="en" data-tts="1">', self.call("GET", "/", role="human")[1].decode())
+        self.assertEqual(self.j("PUT", "/api/me/prefs", {"tts": True}, role="human")[1], {"tts": True})
+        self.assertEqual(self.j("PUT", "/api/me/prefs", {"loud": True}, role="human")[0], 400)
+        self.assertIn('<html lang="en" data-tts="1">', self.call("GET", "/", role="human")[1].decode())
+        self.assertIn('id="tts" style="width:22px;height:22px" checked', self.call("GET", "/settings", role="human")[1].decode())
+        self.assertEqual(self.j("GET", "/api/me", role="human")[1]["prefs"], {"tts": True})
+        # It's per user: the agent's pages aren't affected.
+        self.assertNotIn('<html lang="en" data-tts="1">', self.call("GET", "/settings", role="agent")[1].decode())
+        self.j("PUT", "/api/me/prefs", {"tts": False}, role="human")
+
     def test_skill(self):
         code, body, h = self.call("GET", "/api/skill", role="agent", headers={"Host": "tickets.example:43917"})
         text = body.decode()

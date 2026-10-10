@@ -250,7 +250,7 @@ CREATE INDEX IF NOT EXISTS events_ticket ON events(ticket_id, at);
 
 
 # Bumped (with a migration in Store.__init__) whenever the tables change.
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 TABLES = ("users", "settings", "tickets", "deps", "comments", "attachments", "events",
           "conversations", "chat_members", "messages", "chat_files", "wiki_pages", "wiki_revisions")
 KINDS = ("human", "agent")
@@ -317,7 +317,8 @@ class Store:
                                  ("tickets", "declined", "INTEGER NOT NULL DEFAULT 0"),
                                  ("tickets", "checklist_md", "TEXT"), ("tickets", "checklist_by", "TEXT"),
                                  ("tickets", "checklist_at", "REAL"),
-                                 ("tickets", "cancelled", "INTEGER NOT NULL DEFAULT 0")):
+                                 ("tickets", "cancelled", "INTEGER NOT NULL DEFAULT 0"),
+                                 ("users", "prefs", "TEXT")):
             if col not in {r[1] for r in db.execute(f"PRAGMA table_info({table})")}:
                 db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
         db.execute("CREATE INDEX IF NOT EXISTS tickets_assignee ON tickets(assignee, status)")
@@ -407,6 +408,26 @@ class Store:
         if row and (row["guidance"] or "").strip():
             text += f"\n\n## Notes for you ({username})\n\n" + row["guidance"].strip()
         return text
+
+    PREFS = {"tts": False}  # each user's own settings, and their defaults
+
+    def prefs(self, username):
+        row = self.db().execute("SELECT prefs FROM users WHERE username = ?", (username,)).fetchone()
+        try:
+            saved = json.loads(row[0]) if row and row[0] else {}
+        except ValueError:
+            saved = {}
+        return {k: saved.get(k, v) for k, v in self.PREFS.items()}
+
+    def set_prefs(self, username, changes):
+        bad = [k for k in changes if k not in self.PREFS]
+        if bad:
+            raise ApiError(400, f"unknown setting {bad[0]}; settings: {list(self.PREFS)}")
+        merged = {**self.prefs(username), **{k: bool(v) for k, v in changes.items()}}
+        u = self.user(username)
+        with self.write_lock, self.db() as db:
+            db.execute("UPDATE users SET prefs = ? WHERE id = ?", (json.dumps(merged), u["id"]))
+        return merged
 
     def set_user_guidance(self, username, text):
         u = self.user(username)
@@ -1695,6 +1716,8 @@ a.wl.missing{color:var(--review);text-decoration-style:dashed}
 .msg .who{font-weight:600}.msg .who.agent{color:var(--agent)}
 .msg .body{overflow-wrap:anywhere;margin-top:2px}
 .msg .mk{margin-left:6px;text-decoration:none;font-size:12px;opacity:.75}
+html[data-tts="1"] .c,html[data-tts="1"] .msg,html[data-tts="1"] .desc{cursor:pointer}
+.speaking{outline:3px solid var(--accent);outline-offset:2px}
 .receipt{margin:6px 2px 0;text-align:right}.receipt .unseen{color:var(--review)}
 .composer{position:sticky;bottom:0;margin-top:14px;padding:10px 0 4px;background:var(--bg)}
 .composer textarea{min-height:64px}
@@ -1777,6 +1800,28 @@ function clearBusy(el){
 }
 let leaving = false;
 window.addEventListener('beforeunload', () => { leaving = true; });
+// TTS mode (a per-user setting): tapping a comment, chat message or description
+// reads just its text aloud with the device's speech; tap it again to stop.
+let speaking = null;
+function speakBox(box, text){
+  const again = speaking === box;
+  speechSynthesis.cancel();
+  document.querySelectorAll('.speaking').forEach(x => x.classList.remove('speaking'));
+  speaking = null;
+  if (again || !text) return;
+  const u = new SpeechSynthesisUtterance(text);
+  u.onend = u.onerror = () => { box.classList.remove('speaking'); if (speaking === box) speaking = null; };
+  box.classList.add('speaking'); speaking = box;
+  speechSynthesis.speak(u);
+}
+document.addEventListener('click', (e) => {
+  if (document.documentElement.dataset.tts !== '1' || !window.speechSynthesis) return;
+  if (!e.target.closest || e.target.closest('a,button,input,textarea,select,summary,video,audio,img,.att')) return;
+  if (String(window.getSelection ? getSelection() : '').length) return;  // selecting text, not tapping
+  const box = e.target.closest('.c, .msg, .desc');
+  const body = box && (box.classList.contains('desc') ? box : box.querySelector(':scope > .body'));
+  if (body) speakBox(box, body.innerText.trim());
+});
 // Following a link to another page: show the bar until it arrives.
 document.addEventListener('click', (e) => {
   const a = e.target.closest && e.target.closest('a[href]');
@@ -2143,6 +2188,11 @@ $('uf').onsubmit = async (e) => {{ e.preventDefault();
 
 
 SETTINGS_JS = """
+async function setTts(on){
+  try { await api('PUT', '/api/me/prefs', {tts: on}); document.documentElement.dataset.tts = on ? '1' : ''; }
+  catch (e) { fail(e); document.getElementById('tts').checked = !on; }
+}
+document.addEventListener('DOMContentLoaded', () => { if (!window.speechSynthesis) document.getElementById('tts-none').hidden = false; });
 function pickTheme(t){
   setTheme(t);
   document.querySelectorAll('.themes button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.t === t)));
@@ -2151,7 +2201,7 @@ document.addEventListener('DOMContentLoaded', () => pickTheme(document.documentE
 """
 
 
-def render_settings(role):
+def render_settings(role, prefs):
     def opt(name, label, pal):
         style = f"background:{pal['bg']};color:{pal['ink']};border-color:{pal['line']}"
         return (f'<button type="button" data-t="{name}" onclick="pickTheme(\'{name}\')" aria-pressed="false" style="{style}">'
@@ -2167,7 +2217,12 @@ def render_settings(role):
                 'work here, for all of them and each one.</div></a></div>'
                 '<div class="item"><a href="/api/export"><b>Download a backup</b><div class="meta">Everything: tickets, '
                 'comments, chat, wiki, history and files.</div></a></div></div>')
-    body = (f'<h1>Settings</h1><h2>Theme</h2><p class="meta">Saved in this browser.</p><div class="themes">{themes}</div>'
+    tts = (f'<h2>TTS mode</h2><div class="box"><label class="row" style="gap:10px;cursor:pointer">'
+           f'<input type="checkbox" id="tts" style="width:22px;height:22px"{" checked" if prefs["tts"] else ""} '
+           f'onchange="setTts(this.checked)"><span><b>Read aloud on tap</b><br><span class="meta">Tap a comment, chat '
+           f'message or ticket description to hear its text; tap again to stop. Saved for your account, on every '
+           f'device.</span></span></label><p class="meta" id="tts-none" hidden>This browser can\'t read aloud.</p></div>')
+    body = (f'<h1>Settings</h1>{tts}<h2>Theme</h2><p class="meta">Saved in this browser.</p><div class="themes">{themes}</div>'
             f'{team}<h2>For agents</h2><div class="list">'
             '<div class="item"><a href="/api"><b>The agent briefing</b><div class="meta">What agents read to learn this '
             'system (GET /api).</div></a></div></div><script>' + SETTINGS_JS + '</script>')
@@ -3356,6 +3411,8 @@ class Handler(BaseHTTPRequestHandler):
         role, actor = getattr(self, "who_is", (None, None))
         n = self.server.store.unread_total(actor) if actor else 0
         body = body.replace(CHAT_BADGE, f"<span class=n>{n}</span>" if n else "", 1)
+        if actor and self.server.store.prefs(actor)["tts"]:
+            body = body.replace('<html lang="en">', '<html lang="en" data-tts="1">', 1)
         self.send(200, body, "text/html; charset=utf-8", {"Cache-Control": "no-store"})
 
     def body_json(self):
@@ -3496,7 +3553,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self.html(render_users(store, actor))
             if method == "GET" and path == "/api/me":
                 return self.json(200, {"username": actor, "kind": role, "guidance": store.guidance_for(actor),
-                                       "chat_unread": store.unread_total(actor)})
+                                       "chat_unread": store.unread_total(actor), "prefs": store.prefs(actor)})
+            if path == "/api/me/prefs":
+                if method == "GET":
+                    return self.json(200, store.prefs(actor))
+                if method in ("PUT", "PATCH"):
+                    return self.json(200, store.set_prefs(actor, self.body_json()))
             if path == "/api/guidance":
                 if method == "GET":
                     return self.json(200, {"guidance": store.guidance_for(actor)})
@@ -3511,7 +3573,8 @@ class Handler(BaseHTTPRequestHandler):
                         store.set_setting("guidance", str(text))
                     return self.json(200, {"guidance": store.house_guidance()})
             if method == "GET" and path == "/settings":
-                return self.html(page("Settings", render_settings(role), "/settings", len(store.tickets(["review"]))))
+                return self.html(page("Settings", render_settings(role, store.prefs(actor)), "/settings",
+                                      len(store.tickets(["review"]))))
             if method == "GET" and path == "/guidance":
                 if role != "human":
                     raise ApiError(403, "only humans set the guidance")
