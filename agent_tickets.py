@@ -511,7 +511,10 @@ class Store:
             "SELECT n.id, n.title, n.status FROM deps d JOIN tickets n ON n.id = d.ticket_id "
             "WHERE d.depends_on = ? ORDER BY n.id", (t["id"],))]
         if t["kind"] == "epic":
-            t["tickets"] = self.tickets(epic=t["id"], limit=1000)
+            # Most complete first: done, review, in progress, ready, backlog; declined last; oldest first within each.
+            rank = {"done": 0, "review": 1, "in_progress": 2, "ready": 3, "backlog": 4}
+            t["tickets"] = sorted(self.tickets(epic=t["id"], limit=1000),
+                                  key=lambda x: (5 if x["declined"] else rank[x["status"]], x["created_at"]))
         self._links(t)
         return t
 

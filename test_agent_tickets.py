@@ -947,11 +947,21 @@ class TicketsTest(unittest.TestCase):
         self.assertNotIn("Close epic", page)
         self.assertIn(">Complete</span>", page)
         self.assertNotIn(f"/t/{e['id']}\"", self.call("GET", "/backlog", role="human")[1].decode())
+        # Its page lists tickets most complete first, declined last.
+        d = self.new("backlog", title="part d", epic_id=e["id"])
+        r = self.new("review", title="part r", epic_id=e["id"])
+        x = self.j("POST", "/api/tickets", {"title": "part x", "epic_id": e["id"]}, role="agent")[1]
+        self.j("POST", f"/api/tickets/{x['id']}/decline", {}, role="human")
+        order = [t["title"] for t in self.j("GET", f"/api/tickets/{e['id']}", role="human")[1]["tickets"]]
+        self.assertEqual(order, ["part a", "part b", "part r", "part d", "part x"])
+        html = self.call("GET", f"/t/{e['id']}", role="human")[1].decode()
+        self.assertLess(html.index("part b"), html.index("part r"))
+        self.assertLess(html.index("part r"), html.index("part d"))
         # Out-of-step epics (from before this rule) are fixed when the server starts.
         with self.srv.store.db() as db:
             db.execute("UPDATE tickets SET status = 'backlog' WHERE id = ?", (e["id"],))
         at.Store(self.srv.store.dir, [])
-        self.assertEqual(state(), "complete")
+        self.assertEqual(state(), "active")  # parts d and r are still open
 
     def test_skill(self):
         code, body, h = self.call("GET", "/api/skill", role="agent", headers={"Host": "tickets.example:43917"})
