@@ -8,6 +8,36 @@ at the end of the day, comment, and approve.
 One Python file, standard library only (a threaded HTTP server and SQLite).
 No dependencies to install.
 
+## Quick start
+
+On a Linux machine with `git`, Python 3.8+ and systemd, paste this into
+bash. It installs to `~/workspace/agent-tickets` (where the service files
+expect it), creates your login, and starts the server plus a nightly
+backup (03:30, into `~/backups/agent-tickets`, keeping 30):
+
+```bash
+git clone https://github.com/frank-lynam/agent-tickets.git ~/workspace/agent-tickets
+cd ~/workspace/agent-tickets
+python3 agent_tickets.py --add-user "$USER" --kind human   # prints your login token: save it
+mkdir -p ~/.config/systemd/user ~/backups/agent-tickets
+cp agent-tickets.service agent-tickets-backup.service agent-tickets-backup.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now agent-tickets.service agent-tickets-backup.timer
+sudo loginctl enable-linger "$USER"   # keep it running when you're logged out
+systemctl --user --no-pager status agent-tickets.service | head -3
+```
+
+Then open `http://127.0.0.1:43917/?key=YOUR_TOKEN` once; the browser keeps
+you signed in. To reach it from other machines, add `--host 0.0.0.0` to
+the `ExecStart` line in `~/.config/systemd/user/agent-tickets.service`,
+then `systemctl --user daemon-reload && systemctl --user restart
+agent-tickets` (or put it behind a tunnel or reverse proxy). To add
+agents, see **Users and tokens** below, and point each one at `/api`.
+
+Updating later: `cd ~/workspace/agent-tickets && git pull && systemctl
+--user restart agent-tickets` (take a backup first: `python3
+agent_tickets.py --export ~/backups/agent-tickets/`).
+
 ## Statuses
 
 | Status | Meaning | Who moves it there |
@@ -115,6 +145,16 @@ In chat, the latest message shows who has read it and who hasn't yet
 ("Not read yet by agent-1 (sent 25m ago)"), live. If an agent hasn't read
 your message, it isn't listening: nudge it. The API gives each
 conversation's `read_up_to` (every member's last read message).
+
+## Cancelling
+
+Anything not yet done can be cancelled from its page ("Cancel ticket"),
+for work overtaken by events, duplicates and the like: it moves to Done,
+marked Cancelled. Write why in a comment (the text in the comment box goes
+in first). Cancelling an epic cancels its unfinished tickets too. A
+cancelled ticket counts as done for anything waiting on it, doesn't count
+toward its epic, and wakes the agent working on it with "stop work on it".
+"Reopen" puts it back in the backlog. Proposals are declined instead.
 
 ## Assignment
 

@@ -836,6 +836,44 @@ class TicketsTest(unittest.TestCase):
         self.assertNotIn('id="eprio"', html)
         self.assertIn("set the priority to <b>High</b>", html)
 
+    def test_cancel(self):
+        tok = self.j("POST", "/api/users", {"username": "agent-x", "kind": "agent"}, role="human")[1]["token"]
+        t = self.new("in_progress", assignee="agent-x", title="Obsolete")
+        page = self.call("GET", f"/t/{t['id']}", role="human")[1].decode()
+        self.assertIn("Cancel ticket", page)
+        self.assertEqual(self.j("POST", f"/api/tickets/{t['id']}/cancel", {}, role=None, token=tok)[0], 403)
+        # The agent working it is woken and told to stop.
+        threading.Timer(0.4, lambda: self.j("POST", f"/api/tickets/{t['id']}/cancel", {}, role="human")).start()
+        woke = self.j("GET", "/api/wait?timeout=20", role=None, token=tok)[1]
+        self.assertEqual(woke["tickets"][0]["why"], "Frank cancelled it: stop work on it")
+        got = self.j("GET", f"/api/tickets/{t['id']}", role="human")[1]
+        self.assertEqual((got["status"], got["cancelled"]), ("done", 1))
+        self.assertEqual(self.j("POST", f"/api/tickets/{t['id']}/cancel", {}, role="human")[0], 409)  # already done
+        page = self.call("GET", f"/t/{t['id']}", role="human")[1].decode()
+        self.assertIn(">Cancelled</span>", page)
+        self.assertIn("<b>cancelled</b> it", page)
+        self.assertNotIn("Cancel ticket", page)
+        self.assertIn("Cancelled</span>", self.call("GET", "/done", role="human")[1].decode())
+        # Reopening puts it back in the backlog as an ordinary ticket.
+        self.assertIn(f"setStatus('{t['id']}','backlog')", page)
+        back = self.j("PATCH", f"/api/tickets/{t['id']}", {"status": "backlog"}, role="human")[1]
+        self.assertEqual((back["status"], back["cancelled"]), ("backlog", 0))
+        # Proposals are declined, not cancelled.
+        prop = self.j("POST", "/api/tickets", {"title": "idea"}, role=None, token=tok)[1]
+        self.assertEqual(self.j("POST", f"/api/tickets/{prop['id']}/cancel", {}, role="human")[0], 409)
+        # An epic takes its unfinished tickets with it; finished ones stay done, and it doesn't count them.
+        e = self.new("backlog", title="Dropped plan", kind="epic")
+        done = self.new("ready", title="already shipped", epic_id=e["id"])
+        self.j("PATCH", f"/api/tickets/{done['id']}", {"status": "done"}, role="human")
+        open_ = self.new("ready", title="never mind", epic_id=e["id"])
+        after = self.new("backlog", title="waits on it")
+        self.j("POST", f"/api/tickets/{after['id']}/deps", {"depends_on": open_["id"]}, role="human")
+        got = self.j("POST", f"/api/tickets/{e['id']}/cancel", {}, role="human")[1]
+        self.assertEqual((got["epic_state"], got["cancelled"]), ("cancelled", 1))
+        self.assertEqual(self.j("GET", f"/api/tickets/{open_['id']}", role="human")[1]["cancelled"], 1)
+        self.assertEqual(self.j("GET", f"/api/tickets/{done['id']}", role="human")[1]["cancelled"], 0)
+        self.assertEqual(self.j("GET", f"/api/tickets/{after['id']}", role="human")[1]["blocked_by"], [])  # unblocked
+
     def test_live_ticket_page(self):
         tok = self.j("POST", "/api/users", {"username": "agent-l", "kind": "agent"}, role="human")[1]["token"]
         t = self.new("in_progress", assignee="agent-l")

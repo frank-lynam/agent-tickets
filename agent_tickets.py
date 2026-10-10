@@ -250,7 +250,7 @@ CREATE INDEX IF NOT EXISTS events_ticket ON events(ticket_id, at);
 
 
 # Bumped (with a migration in Store.__init__) whenever the tables change.
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 TABLES = ("users", "settings", "tickets", "deps", "comments", "attachments", "events",
           "conversations", "chat_members", "messages", "chat_files", "wiki_pages", "wiki_revisions")
 KINDS = ("human", "agent")
@@ -310,13 +310,14 @@ class Store:
         # 1 -> 2 added the users table, 2 -> 3 the settings table, 3 -> 4 the
         # deps table, 4 -> 5 the chat tables, 5 -> 6 the wiki tables (all
         # created above); the columns are added here (6 -> 7: uploaded
-        # checklists; tickets.checklist_path is no longer used).
+        # checklists; tickets.checklist_path is no longer used; 7 -> 8: cancelled).
         for table, col, decl in (("tickets", "assignee", "TEXT"), ("users", "guidance", "TEXT"),
                                  ("tickets", "kind", "TEXT NOT NULL DEFAULT 'task'"), ("tickets", "epic_id", "TEXT"),
                                  ("tickets", "proposed", "INTEGER NOT NULL DEFAULT 0"),
                                  ("tickets", "declined", "INTEGER NOT NULL DEFAULT 0"),
                                  ("tickets", "checklist_md", "TEXT"), ("tickets", "checklist_by", "TEXT"),
-                                 ("tickets", "checklist_at", "REAL")):
+                                 ("tickets", "checklist_at", "REAL"),
+                                 ("tickets", "cancelled", "INTEGER NOT NULL DEFAULT 0")):
             if col not in {r[1] for r in db.execute(f"PRAGMA table_info({table})")}:
                 db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
         db.execute("CREATE INDEX IF NOT EXISTS tickets_assignee ON tickets(assignee, status)")
@@ -484,12 +485,14 @@ class Store:
             t["epic_title"] = row["title"] if row else None
         if t.get("kind") == "epic":
             t["progress"] = self.epic_progress(t["id"])
-            t["epic_state"] = "declined" if t.get("declined") else EPIC_STATE_NAMES.get(t["status"], t["status"])
+            t["epic_state"] = ("declined" if t.get("declined") else "cancelled" if t.get("cancelled")
+                               else EPIC_STATE_NAMES.get(t["status"], t["status"]))
         return t
 
     def epic_progress(self, eid):
         counts = {r[0]: r[1] for r in self.db().execute(
-            "SELECT status, COUNT(*) FROM tickets WHERE epic_id = ? AND declined = 0 GROUP BY status", (eid,))}
+            "SELECT status, COUNT(*) FROM tickets WHERE epic_id = ? AND declined = 0 AND cancelled = 0 GROUP BY status",
+            (eid,))}
         return {"total": sum(counts.values()), "done": counts.get("done", 0), "by_status": counts}
 
     def detail(self, tid):
@@ -505,16 +508,17 @@ class Store:
         refs = wiki_refs(t["description"]) + [p for c in t["comments"] for p in wiki_refs(c["body"])]
         t["wiki_links"] = [self.wiki_link_info(p) for p in dict.fromkeys(refs)]
         t["depends_on"] = [dict(r) for r in db.execute(
-            "SELECT p.id, p.title, p.status, p.declined FROM deps d JOIN tickets p ON p.id = d.depends_on "
+            "SELECT p.id, p.title, p.status, p.declined, p.cancelled FROM deps d JOIN tickets p ON p.id = d.depends_on "
             "WHERE d.ticket_id = ? ORDER BY p.id", (t["id"],))]
         t["unblocks"] = [dict(r) for r in db.execute(
             "SELECT n.id, n.title, n.status FROM deps d JOIN tickets n ON n.id = d.ticket_id "
             "WHERE d.depends_on = ? ORDER BY n.id", (t["id"],))]
         if t["kind"] == "epic":
-            # Most complete first: done, review, in progress, ready, backlog; declined last; oldest first within each.
+            # Most complete first: done, review, in progress, ready, backlog; declined or cancelled last; oldest
+            # first within each.
             rank = {"done": 0, "review": 1, "in_progress": 2, "ready": 3, "backlog": 4}
             t["tickets"] = sorted(self.tickets(epic=t["id"], limit=1000),
-                                  key=lambda x: (5 if x["declined"] else rank[x["status"]], x["created_at"]))
+                                  key=lambda x: (5 if x["declined"] or x["cancelled"] else rank[x["status"]], x["created_at"]))
         self._links(t)
         return t
 
@@ -566,11 +570,11 @@ class Store:
         """Bring each epic in `ids` to the state its tickets imply (inside the caller's transaction)."""
         now = now or time.time()
         for eid in {i for i in ids if i}:
-            e = db.execute("SELECT status, kind, proposed, declined FROM tickets WHERE id = ?", (eid,)).fetchone()
-            if not e or e["kind"] != "epic" or e["declined"] or e["proposed"]:
+            e = db.execute("SELECT status, kind, proposed, declined, cancelled FROM tickets WHERE id = ?", (eid,)).fetchone()
+            if not e or e["kind"] != "epic" or e["declined"] or e["cancelled"] or e["proposed"]:
                 continue
             want = epic_status_for([r[0] for r in db.execute(
-                "SELECT status FROM tickets WHERE epic_id = ? AND declined = 0", (eid,))])
+                "SELECT status FROM tickets WHERE epic_id = ? AND declined = 0 AND cancelled = 0", (eid,))])
             if want != e["status"]:
                 db.execute("UPDATE tickets SET status = ?, updated_at = ? WHERE id = ?", (want, now, eid))
                 if actor:
@@ -681,11 +685,16 @@ class Store:
             # A human moving a proposal out of the backlog accepts it.
             if role == "human" and t["proposed"] and fields.get("status", "backlog") != "backlog":
                 fields["proposed"] = 0
+            # Reopening a cancelled or declined ticket makes it an ordinary one again.
+            if fields.get("status", "done") != "done" and (t["cancelled"] or t["declined"]):
+                fields["cancelled"], fields["declined"] = 0, 0
             now = time.time()
             with db:
                 for k, v in fields.items():
                     if t[k] != v:
                         db.execute(f"UPDATE tickets SET {k} = ? WHERE id = ?", (v, t["id"]))
+                        if k in ("cancelled", "declined", "proposed"):
+                            continue  # shown by the status change itself
                         # Description edits are logged without their text.
                         self._event(db, t["id"], actor, role, k, None if k == "description" else t[k],
                                     None if k == "description" else v, now)
@@ -720,6 +729,30 @@ class Store:
                     self._event(db, t["id"], actor, role, "checklist", f"{old['done']}/{old['total']}" if old else None,
                                 f"{new['done']}/{new['total']}", now)
         return {"checklist": self.detail(t["id"])["checklist"]}
+
+    def cancel(self, tid, actor, role):
+        """Close a ticket out of the normal cycle (overtaken by events, a duplicate...): it goes to done,
+        marked cancelled. An epic takes its unfinished tickets with it. Humans only; say why in a comment."""
+        if role != "human":
+            raise ApiError(403, "only humans cancel tickets")
+        with self.write_lock:
+            db = self.db()
+            t = self.ticket(tid)
+            if t["proposed"]:
+                raise ApiError(409, f"{t['id']} is a proposal: decline it instead")
+            if t["status"] == "done":
+                raise ApiError(409, f"{t['id']} is already done")
+            ids = [t["id"]] + ([r[0] for r in db.execute(
+                "SELECT id FROM tickets WHERE epic_id = ? AND status != 'done'", (t["id"],))] if t["kind"] == "epic" else [])
+            now = time.time()
+            with db:
+                for i in ids:
+                    cur = db.execute("SELECT status FROM tickets WHERE id = ?", (i,)).fetchone()[0]
+                    db.execute("UPDATE tickets SET status = 'done', cancelled = 1, proposed = 0, updated_at = ? WHERE id = ?",
+                               (now, i))
+                    self._event(db, i, actor, role, "cancelled", cur, "done", now)
+                self._sync_epics(db, [t["epic_id"]], actor, role, now)
+        return self._links(self.ticket(t["id"]))
 
     def review_proposal(self, tid, accept, ready, actor, role, assignee=None, priority=None):
         """Accept (to the backlog, or ready) or decline (to done, marked
@@ -1100,6 +1133,8 @@ class Store:
                 why = f"{r['actor']} assigned it to you"
             elif r["new"] == "ready" and r["field"] in ("status", "created", "accepted"):
                 why = f"{r['actor']} made it ready"
+            elif r["field"] == "cancelled":
+                why = f"{r['actor']} cancelled it: stop work on it"
             else:
                 why = f"{r['actor']} changed {r['field'].replace('_', ' ')}"
             out[r["id"]] = {"id": r["id"], "title": r["title"], "status": r["status"], "why": why}
@@ -1644,6 +1679,7 @@ font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;margin:0 0 8px}
 dl.kv{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;margin:0;font-size:14px}
 dl.kv dt{color:var(--dim)}dl.kv dd{margin:0;overflow-wrap:anywhere}
 .err{color:var(--review)}
+button.cancel{margin-left:auto;color:var(--review);border-color:transparent;background:transparent}
 a.wl.missing{color:var(--review);text-decoration-style:dashed}
 .wlink{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:4px 0 0}
 .wlink code{font:13px ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--panel);border:1px solid var(--line);padding:3px 7px;border-radius:5px;overflow-wrap:anywhere}
@@ -1941,6 +1977,8 @@ def render_list(store, status, q):
             pr = '<span class="tag epic">Epic</span> ' + pr
         if t.get("declined"):
             pr = '<span class="tag">Declined</span> ' + pr
+        if t.get("cancelled"):
+            pr = '<span class="tag">Cancelled</span> ' + pr
         if t.get("blocked_by"):
             pr += f'<span class="tag blocked">after {", ".join(t["blocked_by"])}</span> '
         rows.append(f'<div class="item{" prop" if btn else ""}"><a href="/t/{t["id"]}"><span class="id">{t["id"]}</span> '
@@ -2170,7 +2208,7 @@ def render_attachment(a, store=None):
 
 def ticket_sig(t):
     """Changes to these mean the page's header and buttons are stale: "refresh to see it"."""
-    key = [t["status"], t["assignee"], t["title"], t["priority"], t["epic_id"], t["proposed"], t["declined"],
+    key = [t["status"], t["assignee"], t["title"], t["priority"], t["epic_id"], t["proposed"], t["declined"], t["cancelled"],
            t["description"], t["kind"], t["blocked_by"], [d["id"] for d in t["depends_on"]]]
     return hashlib.sha256(json.dumps(key, default=str).encode()).hexdigest()[:16]
 
@@ -2202,6 +2240,8 @@ def ticket_timeline(store, t):
             text = f'{esc(e["actor"])} proposed it'
         elif e["field"] == "accepted":
             text = f'{esc(e["actor"])} accepted it into {LABELS.get(e["new"], e["new"])}'
+        elif e["field"] == "cancelled":
+            text = f'{esc(e["actor"])} <b>cancelled</b> it'
         elif e["field"] == "declined":
             text = f'{esc(e["actor"])} <b>declined</b> it'
         elif e["field"] == "depends_on":
@@ -2310,7 +2350,7 @@ def render_ticket(store, tid):
 
     def chip(x):
         st = x["status"]
-        label = "Declined" if x.get("declined") else LABELS[st]
+        label = "Declined" if x.get("declined") else "Cancelled" if x.get("cancelled") else LABELS[st]
         return f'<span class="chip s-{st}">{label}</span>'
 
     def link_list(items, removable=False):
@@ -2363,12 +2403,16 @@ def render_ticket(store, tid):
         actions = []
     btns = "".join(f'<button class="{"primary" if p else ""}" onclick="setStatus(\'{t["id"]}\',\'{to}\')">{esc(lbl)}</button>'
                    for to, lbl, p in actions)
+    if s == "done" and (t["cancelled"] or t["declined"]):  # reopening goes back to the backlog
+        btns = btns.replace(f"setStatus('{t['id']}','in_progress')", f"setStatus('{t['id']}','backlog')")
+    if s != "done" and not t["proposed"]:  # out of the normal cycle: overtaken by events, a duplicate...
+        btns += (f'<button class="cancel" onclick="cancelTicket()">Cancel {"epic" if t["kind"] == "epic" else "ticket"}</button>')
     if s == "backlog" and t["kind"] == "task" and not t["proposed"]:  # Make ready, for someone
         btns = (assign_select(store, t["id"], t["assignee"])
                 + btns.replace(f"setStatus('{t['id']}','ready')", f"readyFor('{t['id']}')", 1))
     move_opts = "".join(f'<option value="{x}">{LABELS[x]}</option>' for x in STATUSES if x != s)
     body = f"""<div class="row" style="margin-bottom:6px"><span class="id">{t['id']}</span>
-<span class="chip s-{s}">{(EPIC_STATES if t['kind'] == 'epic' else LABELS)[s]}</span>{'<span class="p1">High priority</span>' if t['priority'] == 1 else ''}
+<span class="chip s-{s}">{"Cancelled" if t["cancelled"] else "Declined" if t["declined"] else (EPIC_STATES if t['kind'] == 'epic' else LABELS)[s]}</span>{'<span class="p1">High priority</span>' if t['priority'] == 1 else ''}
 <span class="meta">{'assigned to <b>' + esc(t['assignee']) + '</b>' if t['assignee'] else 'unassigned'}</span>
 {'<span class="tag epic">Epic</span>' if t['kind'] == 'epic' else ''}
 {f'<span class="meta">in epic <a href="/t/{t["epic_id"]}">{t["epic_id"]} · {esc(t.get("epic_title") or "")}</a></span>' if t['epic_id'] else ''}</div>
@@ -2433,6 +2477,14 @@ document.getElementById('ef').onsubmit = async (e) => {{
   try {{ await api('PATCH', '/api/tickets/' + TID, {{title: $('etitle').value, description: $('edesc').value}});
     location.reload(); }} catch (err) {{ fail(err); }}
 }};
+async function cancelTicket() {{
+  const epic = {json.dumps(t["kind"] == "epic")};
+  if (!confirm(epic ? 'Cancel this epic and its unfinished tickets?' : 'Cancel this ticket? It moves to Done, marked cancelled.')) return;
+  try {{
+    if ($('cbody').value.trim()) {{ await api('POST', '/api/tickets/' + TID + '/comments', {{body: $('cbody').value.trim()}}); clearDraft(); }}
+    await api('POST', '/api/tickets/' + TID + '/cancel', {{}}); location.reload();
+  }} catch (err) {{ fail(err); }}
+}}
 async function setPrio(v) {{ try {{ await api('PATCH', '/api/tickets/' + TID, {{priority: +v}}); location.reload(); }}
   catch (err) {{ fail(err); }} }}
 </script>"""
@@ -2915,13 +2967,18 @@ backlog (none made ready yet), active (some ready or under way), complete
 (all done; declined tickets don't count).
 
 **Dependencies**: a ticket can list tickets that must be done first
-(`depends_on`). Until they're done (approved, or declined), it's
+(`depends_on`). Until they're done (approved, declined or cancelled), it's
 **blocked**: it can't move to in_progress, review or done (you get a 409
 naming the blockers), and /api/next skips it. You can still comment on it.
 
 **Proposals**: tickets you create are proposals. They wait in the backlog,
 marked proposed, until a human accepts (to the backlog or straight to
 ready) or declines them (they move to done, marked declined).
+
+**Cancelled**: a human can close any ticket out of the normal cycle
+(overtaken by events, a duplicate...). It moves to done with
+`"cancelled": 1`, usually with a comment saying why. If it was yours, stop
+working on it; `/api/wait` tells you ("cancelled it: stop work on it").
 
 Rules the server enforces: you can set ready, in_progress and review; you
 can't set backlog or done; you can't change backlog or done tickets, or
@@ -3114,7 +3171,7 @@ default). Prefer one tarball over dozens of loose files.
 A ticket looks like:
 
     {"id": "amber-otter", "title": "...", "description": "...", "status": "in_progress", "assignee": "agent-1",
-     "kind": "task", "epic_id": "quiet-falcon", "epic_title": "...", "proposed": 0, "declined": 0,
+     "kind": "task", "epic_id": "quiet-falcon", "epic_title": "...", "proposed": 0, "declined": 0, "cancelled": 0,
      "blocked_by": [], "depends_on": [{"id": "stony-brook", "title": "...", "status": "done"}], "unblocks": [...],
      "priority": 2, "created_by": "frank",
      "created_at": 1760000000.0, "updated_at": 1760000300.0,
@@ -3321,7 +3378,7 @@ class Handler(BaseHTTPRequestHandler):
             if method != "GET" and not bearer and self.headers.get("X-Tickets") != "1":
                 raise ApiError(403, "missing X-Tickets header")
 
-            m = re.fullmatch(rf"/api/tickets/({ID_PATH})(/comments|/attachments|/checklist|/deps|/accept|/decline)?(?:/({ID_PATH}))?",
+            m = re.fullmatch(rf"/api/tickets/({ID_PATH})(/comments|/attachments|/checklist|/deps|/accept|/decline|/cancel)?(?:/({ID_PATH}))?",
                              path)
             if method == "GET" and path == "/":
                 return self.html(render_dashboard(store))
@@ -3466,6 +3523,9 @@ class Handler(BaseHTTPRequestHandler):
                     return self.json(200, store.add_dep(tid, str(self.body_json().get("depends_on") or ""), actor, role))
                 if sub == "/deps" and method == "DELETE" and other:
                     return self.json(200, store.remove_dep(tid, other, actor, role))
+                if sub == "/cancel" and method == "POST" and not other:
+                    self.body_json()
+                    return self.json(200, store.cancel(tid, actor, role))
                 if sub in ("/accept", "/decline") and method == "POST" and not other:
                     # Always read the body, even for decline: left unread, it would
                     # be taken for the start of the next request on this connection.
