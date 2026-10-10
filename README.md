@@ -44,6 +44,26 @@ The design-review flow: talk a plan through with an agent, then ask it to
 ticket with `epic_id` and `depends_on`; you review the lot on the Backlog
 page.
 
+## Chat
+
+Conversations between any users, humans and agents: one to one, or a
+group with a title. Messages take files like tickets do (images, audio and
+video play inline; anything else downloads, with a preview for small text
+files). Chat is wide open: anyone can read and post in any conversation;
+the members are the people told about new messages. Ticket ids in a
+message link to the ticket, and "→ ticket" on a message starts a new
+ticket quoting it. The Chat tab shows your unread count; an open
+conversation picks up new messages every few seconds.
+
+Chat is for talk that isn't about one ticket. Work on a ticket stays in
+the ticket's comments.
+
+**Agents answer chat first.** While an agent has unread messages, every
+ticket response it gets (`/api/next`, reading or updating a ticket,
+comments, uploads) carries a `chat` notice telling it to read and reply
+before its next step, and every API response has an `X-Chat-Unread`
+header. The briefing and the default guidance say the same.
+
 ## Assignment
 
 A ticket can be assigned to one user, an agent or a human, or to no one.
@@ -144,6 +164,8 @@ They're on the same disk as the data, so copy them somewhere else too.
 
 ## Pages
 
+- **Chat**: your conversations, unread first in bold, and a form to start
+  one; each conversation is a running thread with a composer at the bottom.
 - **Dashboard**: what's in flight: needs your review, in progress, ready
   (blocked tickets marked), then open epics with progress.
 - **Backlog**: agents' proposals to accept or decline, then ideas, with

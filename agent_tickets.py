@@ -58,11 +58,18 @@ ID_CONSONANTS = "BDFGHKLMNPRSTVZ"
 ID_VOWELS = "AEIOU"
 
 
-def new_id(taken):
+# Ids that spell something nobody wants on a ticket (only words the pattern above can make).
+ID_BLOCKED = frozenset("""
+DAGO DAGOS DIKE DIKES FAGOT HOMO HOMOS KIKE KIKES LOSER MORON NAZI NAZIS NIGA NIGER PAKI PAKIS PEDO PEDOS
+PENIS PUBES PUTA PUTAS PUTO RAPE RAPED RAPES SEMEN SUKA
+""".split())
+
+
+def new_id(taken, pick=random.choice):
     for length in (4, 4, 4, 5):
         for _ in range(200):
-            tid = "".join(random.choice(ID_CONSONANTS if i % 2 == 0 else ID_VOWELS) for i in range(length))
-            if not taken(tid):
+            tid = "".join(pick(ID_CONSONANTS if i % 2 == 0 else ID_VOWELS) for i in range(length))
+            if tid not in ID_BLOCKED and not taken(tid):
                 return tid
     raise RuntimeError("no free ticket id")
 
@@ -93,6 +100,22 @@ CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS deps (
   ticket_id TEXT NOT NULL REFERENCES tickets(id), depends_on TEXT NOT NULL REFERENCES tickets(id),
   PRIMARY KEY (ticket_id, depends_on));
+CREATE TABLE IF NOT EXISTS conversations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, created_by TEXT NOT NULL, created_at REAL NOT NULL,
+  updated_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS chat_members (
+  conversation_id INTEGER NOT NULL REFERENCES conversations(id), username TEXT NOT NULL COLLATE NOCASE,
+  last_read INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (conversation_id, username));
+CREATE TABLE IF NOT EXISTS messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id INTEGER NOT NULL REFERENCES conversations(id),
+  author TEXT NOT NULL, role TEXT NOT NULL, body TEXT NOT NULL, created_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS chat_files (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id INTEGER NOT NULL REFERENCES conversations(id),
+  message_id INTEGER REFERENCES messages(id), filename TEXT NOT NULL, path TEXT NOT NULL, mime TEXT NOT NULL,
+  size INTEGER NOT NULL, author TEXT NOT NULL, role TEXT NOT NULL, created_at REAL NOT NULL);
+CREATE INDEX IF NOT EXISTS messages_conv ON messages(conversation_id, id);
+CREATE INDEX IF NOT EXISTS chat_members_user ON chat_members(username);
+CREATE INDEX IF NOT EXISTS chat_files_message ON chat_files(message_id);
 CREATE INDEX IF NOT EXISTS tickets_status ON tickets(status, priority, created_at);
 CREATE INDEX IF NOT EXISTS comments_ticket ON comments(ticket_id, created_at);
 CREATE INDEX IF NOT EXISTS attachments_ticket ON attachments(ticket_id);
@@ -101,8 +124,9 @@ CREATE INDEX IF NOT EXISTS events_ticket ON events(ticket_id, at);
 
 
 # Bumped (with a migration in Store.__init__) whenever the tables change.
-SCHEMA_VERSION = 4
-TABLES = ("users", "settings", "tickets", "deps", "comments", "attachments", "events")
+SCHEMA_VERSION = 5
+TABLES = ("users", "settings", "tickets", "deps", "comments", "attachments", "events",
+          "conversations", "chat_members", "messages", "chat_files")
 KINDS = ("human", "agent")
 USERNAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,31}")
 
@@ -111,6 +135,7 @@ USERNAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,31}")
 # the /api briefing. Humans edit it on the Guidance page; this is the start.
 DEFAULT_GUIDANCE = """## How we work
 
+0. Chat comes first. When a response carries a "chat" notice, read your unread messages and answer them before your next step on the ticket. Chat is for questions and planning that aren't about one ticket; anything about a ticket goes in a comment on that ticket.
 1. When you take a ticket, first post a one-line comment: you're starting, and you'll write a checklist.
 2. Write a markdown checklist of the steps ("- [ ] step") in a file, set it as the ticket's checklist_path, and post a short plan: what you'll do, and how you'll know it's done.
 3. After each step, tick it off in the checklist and comment what you did and what happened, including errors and surprises.
@@ -152,7 +177,8 @@ class Store:
         db = self.db()
         db.executescript(SCHEMA)
         # 1 -> 2 added the users table, 2 -> 3 the settings table, 3 -> 4 the
-        # deps table (all created above); the columns are added here.
+        # deps table, 4 -> 5 the chat tables (all created above); the columns
+        # are added here.
         for table, col, decl in (("tickets", "assignee", "TEXT"), ("users", "guidance", "TEXT"),
                                  ("tickets", "kind", "TEXT NOT NULL DEFAULT 'task'"), ("tickets", "epic_id", "TEXT"),
                                  ("tickets", "proposed", "INTEGER NOT NULL DEFAULT 0"),
@@ -630,6 +656,19 @@ class Store:
             c = self.db().execute("SELECT ticket_id FROM comments WHERE id = ?", (comment_id,)).fetchone()
             if not c or c["ticket_id"] != t["id"]:
                 raise ApiError(400, f"comment {comment_id} isn't on ticket {t['id']}")
+        name, mime, dest = self._write_upload(self.files / t["id"], filename, mime, size, stream, max_bytes)
+        now = time.time()
+        with self.write_lock:
+            db = self.db()
+            with db:
+                cur = db.execute("INSERT INTO attachments (ticket_id, comment_id, filename, path, mime, size, author, role, "
+                                 "created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                                 (t["id"], comment_id, name, str(dest.relative_to(self.files)), mime, size, actor, role, now))
+                db.execute("UPDATE tickets SET updated_at = ? WHERE id = ?", (now, t["id"]))
+        return self.attachment_json(self.attachment(cur.lastrowid))
+
+    def _write_upload(self, folder, filename, mime, size, stream, max_bytes):
+        """Save an upload under `folder`; (clean name, mime type, path on disk)."""
         if size > max_bytes:
             raise ApiError(413, f"file is larger than the {max_bytes // (1 << 20)} MB limit")
         name = re.sub(r"[^\w.\- ]+", "_", Path(filename or "upload").name).strip() or "upload"
@@ -637,8 +676,7 @@ class Store:
         # curl --data-binary (and urllib) send form-urlencoded when no type is given.
         if mime in ("", "application/octet-stream", "application/x-www-form-urlencoded"):
             mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
-        folder = self.files / t["id"]
-        folder.mkdir(exist_ok=True)
+        folder.mkdir(parents=True, exist_ok=True)
         dest = folder / f"{secrets.token_hex(6)}-{name}"
         left = size
         with open(dest, "wb") as f:
@@ -651,15 +689,213 @@ class Store:
         if left:
             dest.unlink(missing_ok=True)
             raise ApiError(400, "the upload ended early")
+        return name, mime, dest
+
+    # --- chat: conversations anyone can read and post in; members are the
+    # people who get told about new messages.
+    def conversation(self, cid, viewer=None):
+        try:
+            cid = int(cid)
+        except (TypeError, ValueError):
+            raise ApiError(404, "no such conversation")
+        row = self.db().execute("SELECT * FROM conversations WHERE id = ?", (cid,)).fetchone()
+        if not row:
+            raise ApiError(404, f"no conversation {cid}")
+        c = dict(row)
+        c["members"] = [r[0] for r in self.db().execute(
+            "SELECT username FROM chat_members WHERE conversation_id = ? ORDER BY username COLLATE NOCASE", (cid,))]
+        others = [m for m in c["members"] if not viewer or m.lower() != viewer.lower()]
+        c["name"] = c["title"] or ", ".join(others or c["members"]) or f"Conversation {cid}"
+        if viewer:
+            c["unread"] = self._unread_in(cid, viewer)
+        return c
+
+    def _unread_in(self, cid, user):
+        return self.db().execute(
+            "SELECT COUNT(*) FROM messages g JOIN chat_members m ON m.conversation_id = g.conversation_id "
+            "AND m.username = ? WHERE g.conversation_id = ? AND g.id > m.last_read AND g.author != ? COLLATE NOCASE",
+            (user, cid, user)).fetchone()[0]
+
+    def unread_total(self, user):
+        return self.db().execute(
+            "SELECT COUNT(*) FROM messages g JOIN chat_members m ON m.conversation_id = g.conversation_id "
+            "AND m.username = ? WHERE g.id > m.last_read AND g.author != ? COLLATE NOCASE", (user, user)).fetchone()[0]
+
+    def conversations(self, viewer, limit=200):
+        out = []
+        for r in self.db().execute("SELECT id FROM conversations ORDER BY updated_at DESC LIMIT ?", (limit,)).fetchall():
+            c = self.conversation(r[0], viewer)
+            last = self.db().execute("SELECT author, role, body, created_at FROM messages WHERE conversation_id = ? "
+                                     "ORDER BY id DESC LIMIT 1", (r[0],)).fetchone()
+            c["last_message"] = dict(last) if last else None
+            out.append(c)
+        return out
+
+    def chat_file_json(self, f, internal=False):
+        f = dict(f)
+        path = f.pop("path")
+        f["url"] = f"/chat-files/{f['id']}/{quote(f['filename'])}"
+        if internal:
+            f["_path"] = path  # for previews on our own pages, never sent out
+        return f
+
+    def chat_file(self, fid):
+        row = self.db().execute("SELECT * FROM chat_files WHERE id = ?", (fid,)).fetchone()
+        if not row:
+            raise ApiError(404, "no such file")
+        return dict(row)
+
+    def messages(self, cid, after=0, limit=200, internal=False):
+        """A conversation's messages after id `after` (the latest `limit`), oldest first, with their files."""
+        msgs = [dict(r) for r in self.db().execute(
+            "SELECT * FROM (SELECT * FROM messages WHERE conversation_id = ? AND id > ? ORDER BY id DESC LIMIT ?) "
+            "ORDER BY id", (cid, after, limit))]
+        by_id = {m["id"]: m for m in msgs}
+        for m in msgs:
+            m["files"] = []
+        if msgs:
+            for f in self.db().execute(f"SELECT * FROM chat_files WHERE message_id IN ({','.join('?' * len(by_id))}) "
+                                       "ORDER BY id", list(by_id)):
+                by_id[f["message_id"]]["files"].append(self.chat_file_json(f, internal))
+        return msgs
+
+    def message(self, mid):
+        row = self.db().execute("SELECT * FROM messages WHERE id = ?", (mid,)).fetchone()
+        if not row:
+            raise ApiError(404, f"no message {mid}")
+        m = dict(row)
+        m["files"] = [self.chat_file_json(f) for f in self.db().execute(
+            "SELECT * FROM chat_files WHERE message_id = ? ORDER BY id", (mid,))]
+        return m
+
+    def conversation_detail(self, cid, viewer, after=0, mark=True):
+        c = self.conversation(cid, viewer)
+        c["messages"] = self.messages(c["id"], after)
+        if mark:
+            self.mark_read(c["id"], viewer)
+            c["unread"] = 0
+        return c
+
+    def unread(self, user):
+        """The conversations `user` has unread messages in, each with those messages."""
+        out = []
+        for r in self.db().execute(
+                "SELECT m.conversation_id, m.last_read FROM chat_members m JOIN conversations c "
+                "ON c.id = m.conversation_id WHERE m.username = ? ORDER BY c.updated_at DESC", (user,)).fetchall():
+            msgs = [x for x in self.messages(r[0], after=r[1]) if x["author"].lower() != user.lower()]
+            if msgs:
+                c = self.conversation(r[0], user)
+                c["messages"] = msgs
+                out.append(c)
+        return out
+
+    def chat_notice(self, user):
+        """What goes with every ticket response to an agent that has unread chat."""
+        total = self.unread_total(user)
+        if not total:
+            return None
+        convs = [{"id": c["id"], "name": c["name"], "unread": c["unread"]} for c in self.unread(user)]
+        where = "; ".join(f'{c["name"]} ({c["unread"]})' for c in convs)
+        return {"unread": total, "conversations": convs,
+                "notice": f"You have {total} unread chat message{'s' if total != 1 else ''} ({where}). Answer chat "
+                          "before your next step on this ticket: GET /api/chat/unread, then reply with "
+                          "POST /api/chat/ID/messages (or POST /api/chat/ID/read when no reply is needed). Then carry on."}
+
+    def mark_read(self, cid, user, upto=None):
+        db = self.db()
+        if upto is None:
+            upto = db.execute("SELECT COALESCE(MAX(id), 0) FROM messages WHERE conversation_id = ?", (cid,)).fetchone()[0]
+        with self.write_lock, db:
+            db.execute("UPDATE chat_members SET last_read = MAX(last_read, ?) WHERE conversation_id = ? AND username = ?",
+                       (upto, cid, user))
+
+    def start_conversation(self, data, actor, role):
+        """A new conversation; with no title and one other person, the existing
+        conversation between the two of you if there is one."""
+        title = str(data.get("title") or "").strip()[:120] or None
+        names = data.get("members") or []
+        if isinstance(names, str):
+            names = [n for n in re.split(r"[\s,]+", names) if n]
+        members = {self.user(str(n))["username"] for n in names}
+        members.add(actor)
+        if len(members) < 2 and not title:
+            raise ApiError(400, "say who it's with (members), or give it a title")
+        cid = None
+        with self.write_lock:
+            db = self.db()
+            if not title and len(members) == 2:
+                want = {m.lower() for m in members}
+                for r in db.execute("SELECT id FROM conversations WHERE title IS NULL").fetchall():
+                    have = {x[0].lower() for x in db.execute(
+                        "SELECT username FROM chat_members WHERE conversation_id = ?", (r[0],))}
+                    if have == want:
+                        cid = r[0]
+                        break
+            if cid is None:
+                now = time.time()
+                with db:
+                    cid = db.execute("INSERT INTO conversations (title, created_by, created_at, updated_at) "
+                                     "VALUES (?,?,?,?)", (title, actor, now, now)).lastrowid
+                    for m in members:
+                        db.execute("INSERT INTO chat_members (conversation_id, username) VALUES (?, ?)", (cid, m))
+        body = str(data.get("body") or "").strip()
+        if body:
+            self.post_message(cid, body, actor, role)
+        return cid
+
+    def post_message(self, cid, body, actor, role):
+        body = str(body or "").strip()
+        if not body:
+            raise ApiError(400, "a message needs a body")
+        if len(body) > 100_000:
+            raise ApiError(413, "message too long; attach it as a file")
+        c = self.conversation(cid)
         now = time.time()
         with self.write_lock:
             db = self.db()
             with db:
-                cur = db.execute("INSERT INTO attachments (ticket_id, comment_id, filename, path, mime, size, author, role, "
-                                 "created_at) VALUES (?,?,?,?,?,?,?,?,?)",
-                                 (t["id"], comment_id, name, str(dest.relative_to(self.files)), mime, size, actor, role, now))
-                db.execute("UPDATE tickets SET updated_at = ? WHERE id = ?", (now, t["id"]))
-        return self.attachment_json(self.attachment(cur.lastrowid))
+                mid = db.execute("INSERT INTO messages (conversation_id, author, role, body, created_at) VALUES (?,?,?,?,?)",
+                                 (c["id"], actor, role, body, now)).lastrowid
+                # Posting joins you to the conversation, and means you've read it.
+                db.execute("INSERT OR IGNORE INTO chat_members (conversation_id, username) VALUES (?, ?)", (c["id"], actor))
+                db.execute("UPDATE chat_members SET last_read = ? WHERE conversation_id = ? AND username = ?",
+                           (mid, c["id"], actor))
+                db.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (now, c["id"]))
+        return self.message(mid)
+
+    def add_member(self, cid, username, actor, role):
+        c = self.conversation(cid)
+        u = self.user(username)
+        with self.write_lock:
+            db = self.db()
+            with db:
+                added = db.execute("INSERT OR IGNORE INTO chat_members (conversation_id, username) VALUES (?, ?)",
+                                   (c["id"], u["username"])).rowcount
+                # They start with nothing unread except the note that they were added.
+                db.execute("UPDATE chat_members SET last_read = (SELECT COALESCE(MAX(id), 0) FROM messages "
+                           "WHERE conversation_id = ?) WHERE conversation_id = ? AND username = ? AND ?",
+                           (c["id"], c["id"], u["username"], added))
+        if added:
+            self.post_message(c["id"], f"(added {u['username']})", actor, role)
+        return self.conversation(c["id"], actor)
+
+    def add_chat_file(self, cid, mid, filename, mime, size, stream, actor, role, max_bytes):
+        c = self.conversation(cid)
+        if mid is not None:
+            row = self.db().execute("SELECT conversation_id FROM messages WHERE id = ?", (mid,)).fetchone()
+            if not row or row[0] != c["id"]:
+                raise ApiError(400, f"message {mid} isn't in conversation {c['id']}")
+        name, mime, dest = self._write_upload(self.files / "chat" / str(c["id"]), filename, mime, size, stream, max_bytes)
+        now = time.time()
+        with self.write_lock:
+            db = self.db()
+            with db:
+                fid = db.execute("INSERT INTO chat_files (conversation_id, message_id, filename, path, mime, size, author, "
+                                 "role, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                                 (c["id"], mid, name, str(dest.relative_to(self.files)), mime, size, actor, role,
+                                  now)).lastrowid
+                db.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (now, c["id"]))
+        return self.chat_file_json(self.chat_file(fid))
 
 
 # --------------------------------------------------------------------------- keys
@@ -707,7 +943,8 @@ def export_archive(store, dest):
         db.execute("COMMIT")
     finally:
         db.close()
-    missing = [a["path"] for a in tables["attachments"] if not (store.files / a["path"]).is_file()]
+    paths = [a["path"] for a in tables["attachments"]] + [f["path"] for f in tables["chat_files"]]
+    missing = [p for p in paths if not (store.files / p).is_file()]
     doc = {"format": EXPORT_FORMAT, "version": EXPORT_VERSION, "schema_version": schema,
            "exported_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "statuses": STATUSES,
            "missing_files": missing, "tables": tables}
@@ -717,9 +954,10 @@ def export_archive(store, dest):
         info = tarfile.TarInfo("export.json")
         info.size, info.mtime = len(data), int(time.time())
         tar.addfile(info, io.BytesIO(data))
-        for a in tables["attachments"]:
-            if a["path"] not in missing:
-                tar.add(store.files / a["path"], arcname="files/" + a["path"], recursive=False)
+        gone = set(missing)
+        for p in paths:
+            if p not in gone:
+                tar.add(store.files / p, arcname="files/" + p, recursive=False)
     os.replace(tmp, dest)
     return {t: len(rows) for t, rows in tables.items()}
 
@@ -899,6 +1137,20 @@ dl.kv dt{color:var(--dim)}dl.kv dd{margin:0;overflow-wrap:anywhere}
 .tag.epic{background:var(--prog-bg);color:var(--agent)}
 .banner{border-radius:10px;padding:10px 14px;margin-bottom:14px;background:var(--review-bg);color:var(--review)}
 .banner.prop{background:var(--prog-bg);color:var(--prog)}
+.chat{display:grid;gap:8px}
+.msg{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:8px 12px;max-width:min(680px,94%);justify-self:start}
+.msg.mine{justify-self:end;background:var(--prog-bg)}
+.msg.agent{border-left:3px solid var(--agent)}
+.msg .who{font-weight:600}.msg .who.agent{color:var(--agent)}
+.msg .body{white-space:pre-wrap;overflow-wrap:anywhere;margin-top:2px}
+.msg .mk{margin-left:6px;text-decoration:none;font-size:12px;opacity:.75}
+.composer{position:sticky;bottom:0;margin-top:14px;padding:10px 0 4px;background:var(--bg)}
+.composer textarea{min-height:64px}
+.clist .item.unread b{color:var(--accent)}
+.clist .count{display:inline-block;min-width:20px;padding:0 6px;border-radius:10px;background:var(--accent);color:var(--accent-ink);font-size:12px;text-align:center;font-weight:700}
+.who-pick{display:flex;flex-wrap:wrap;gap:6px 14px}.who-pick label{white-space:nowrap}
+:root[data-theme=goth] .msg.mine{background:#24113a;border-color:#4a2370}
+:root[data-theme=goth] .clist .count{box-shadow:var(--glow)}
 .list .item.prop{flex-wrap:wrap}.list .item.prop>a{flex:1 1 240px;min-width:0}.list .item.prop>.row{flex-wrap:wrap}
 .sub{margin-left:18px;border-left:2px solid var(--line);padding-left:10px}
 .deps li{margin:2px 0}
@@ -958,11 +1210,16 @@ def linkify(text):
     return re.sub(r"(https?://[^\s<]+)", r'<a href="\1" target="_blank" rel="noopener">\1</a>', out)
 
 
+CHAT_BADGE = "<!--chat-badge-->"
+
+
 def page(title, body, active="", review_count=0):
-    tabs = [("/", "Dashboard"), ("/backlog", "Backlog"), ("/done", "Done"), ("/new", "New ticket"), ("/users", "Users"),
-            ("/guidance", "Guidance")]
+    tabs = [("/", "Dashboard"), ("/chat", "Chat"), ("/backlog", "Backlog"), ("/done", "Done"), ("/new", "New ticket"),
+            ("/users", "Users"), ("/guidance", "Guidance")]
+    # The chat badge is per viewer: Handler.html() fills in CHAT_BADGE.
     nav = "".join(f'<a href="{h}" class="{"on" if h == active else ""}">{esc(n)}'
-                  f'{f"<span class=n>{review_count}</span>" if h == "/" and review_count else ""}</a>' for h, n in tabs)
+                  f'{f"<span class=n>{review_count}</span>" if h == "/" and review_count else ""}'
+                  f'{CHAT_BADGE if h == "/chat" else ""}</a>' for h, n in tabs)
     return (f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} · Agent tickets</title>'
             f'<style>{CSS}</style><script>{JS}</script></head><body>'
@@ -1107,11 +1364,11 @@ def epic_options(store, current=None):
     return "".join(opts)
 
 
-def render_new(store, epic=None):
+def render_new(store, epic=None, prefill=("", "")):
     opts = "".join(f'<option value="{s}"{" selected" if s == "backlog" else ""}>{LABELS[s]}</option>' for s in STATUSES)
     body = f"""<h1>New ticket</h1><form class="stack box" id="nf">
-<label>Title<input type="text" id="nt-title" required></label>
-<label>Description<textarea id="nt-desc" rows="8"></textarea></label>
+<label>Title<input type="text" id="nt-title" required value="{esc(prefill[0])}"></label>
+<label>Description<textarea id="nt-desc" rows="8">{esc(prefill[1])}</textarea></label>
 <div class="row"><label>Status <select id="nt-status">{opts}</select></label>
 <label>Priority <select id="nt-prio"><option value="1">High</option><option value="2" selected>Normal</option><option value="3">Low</option></select></label>
 <label>Assign to <select id="nt-who">{assignee_options(store)}</select></label></div>
@@ -1221,7 +1478,8 @@ def text_preview(store, a):
     if not (a["mime"].startswith("text/") or a["mime"] in TEXT_MIME or ext in TEXT_EXT) or a["size"] > PREVIEW_BYTES:
         return None
     try:
-        raw = (store.files / store.attachment(a["id"])["path"]).read_bytes()[:PREVIEW_BYTES]
+        rel = a.get("_path") or store.attachment(a["id"])["path"]
+        raw = (store.files / rel).read_bytes()[:PREVIEW_BYTES]
         if b"\0" in raw:
             return None
         text = raw.decode("utf-8")
@@ -1429,6 +1687,159 @@ document.getElementById('ef').onsubmit = async (e) => {{
     return page(f"{t['id']} {t['title']}", body, "", len(store.tickets(["review"])))
 
 
+TICKET_WORD = re.compile(r"\b[A-Z]{4,5}\b")
+
+
+def chat_text(store, body):
+    """A message's text: escaped, with links, and ticket ids that exist linked to their tickets."""
+    parts = re.split(r"(https?://[^\s<]+)", esc(body))
+    ids = set(TICKET_WORD.findall(" ".join(parts[::2])))
+    known = {r[0] for r in store.db().execute(
+        f"SELECT id FROM tickets WHERE id IN ({','.join('?' * len(ids))})", list(ids))} if ids else set()
+    out = []
+    for i, p in enumerate(parts):
+        if i % 2:
+            out.append(f'<a href="{p}" target="_blank" rel="noopener">{p}</a>')
+        else:
+            out.append(TICKET_WORD.sub(lambda m: f'<a href="/t/{m[0]}">{m[0]}</a>' if m[0] in known else m[0], p))
+    return "".join(out)
+
+
+def render_message(store, m, viewer):
+    role = "agent" if m["role"] == "agent" else ""
+    mine = " mine" if m["author"].lower() == viewer.lower() else ""
+    files = "".join(render_attachment(f, store) for f in m["files"])
+    return (f'<div class="msg {role}{mine}" id="m{m["id"]}"><div><span class="who {role}">{esc(m["author"])}</span> '
+            f'<span class="meta" title="{when(m["created_at"])}">{ago(m["created_at"])}</span>'
+            f'<a class="mk" href="/new?from_message={m["id"]}" title="Make a ticket from this message">→ ticket</a></div>'
+            f'<div class="body">{chat_text(store, m["body"])}</div>{files}</div>')
+
+
+def ticket_from_message(store, mid):
+    """Title and description for a new ticket that quotes a chat message."""
+    m = store.message(mid)
+    c = store.conversation(m["conversation_id"])
+    first = m["body"].strip().splitlines()[0] if m["body"].strip() else ""
+    quoted = "\n".join("> " + line for line in m["body"].splitlines())
+    return first[:100], f"From chat ({c['name']}), {m['author']} wrote:\n\n{quoted}\n"
+
+
+CHAT_LIST_JS = """
+const $ = (id) => document.getElementById(id);
+document.getElementById('sf').onsubmit = async (e) => {
+  e.preventDefault();
+  const members = [...document.querySelectorAll('input[name=who]:checked')].map(x => x.value);
+  try { const c = await api('POST', '/api/chat', {title: $('st').value, members, body: $('sb').value});
+        location.href = '/chat/' + c.id; }
+  catch (err) { fail(err); }
+};
+"""
+
+
+def render_chat_list(store, viewer):
+    rows = []
+    for c in store.conversations(viewer):
+        last = c["last_message"]
+        snip = f'<b>{esc(last["author"])}:</b> {esc(last["body"][:160])}' if last else "No messages yet."
+        badge = f' <span class="count">{c["unread"]}</span>' if c.get("unread") else ""
+        group = f' <span class="meta">· {len(c["members"])} people</span>' if c["title"] else ""
+        rows.append(f'<div class="item{" unread" if c.get("unread") else ""}"><a href="/chat/{c["id"]}"><b>{esc(c["name"])}</b>'
+                    f'{badge}{group}<div class="snip">{snip}</div></a><span class="meta">{ago(c["updated_at"])}</span></div>')
+    people = [u for u in store.users() if not u["disabled"] and u["username"].lower() != viewer.lower()]
+    picks = "".join(f'<label><input type="checkbox" name="who" value="{esc(u["username"])}"> {esc(u["username"])}'
+                    f'{" <span class=meta>(agent)</span>" if u["kind"] == "agent" else ""}</label>' for u in people)
+    body = f"""<h1>Chat</h1>
+<p class="meta">For questions and planning that aren't about one ticket. Anything about a ticket goes on the ticket.
+Agents are told about new messages with every ticket update, and answer them first.</p>
+<details class="box" style="margin-bottom:14px"{" open" if not rows else ""}><summary><b>Start a conversation</b></summary>
+<form class="stack" id="sf" style="margin-top:10px">
+<div class="who-pick" role="group" aria-label="With">{picks or '<span class="meta">No one else yet.</span>'}</div>
+<label>Title <span class="meta">(optional; for a group or a topic)</span><input type="text" id="st"></label>
+<label>Message<textarea id="sb" placeholder="What's on your mind?"></textarea></label>
+<button class="primary">Start</button></form></details>
+<div class="list clist">{"".join(rows) or '<p class="empty">No conversations yet.</p>'}</div>
+<script>{CHAT_LIST_JS}</script>"""
+    return page("Chat", body, "/chat", len(store.tickets(["review"])))
+
+
+CHAT_JS = """
+const room = document.getElementById('chatroom'), CID = room.dataset.cid, $ = (id) => document.getElementById(id);
+const box = $('msgs');
+let LAST = +room.dataset.last, busy = false;
+function nearBottom(){ return window.innerHeight + window.scrollY >= document.body.scrollHeight - 160; }
+async function poll(force){
+  if (busy) { if (force) setTimeout(() => poll(true), 250); return; }
+  if (document.hidden && !force) return;
+  busy = true;
+  try {
+    const r = await fetch('/chat/' + CID + '/since/' + LAST, {credentials: 'same-origin'});
+    if (r.ok) {
+      const html = await r.text(), last = +r.headers.get('X-Last-Id');
+      if (html.trim()) {
+        const stick = force || nearBottom();
+        document.getElementById('none')?.remove();
+        box.insertAdjacentHTML('beforeend', html);
+        if (stick) window.scrollTo(0, document.body.scrollHeight);
+      }
+      if (last) LAST = last;
+    }
+  } catch (e) {} finally { busy = false; }
+}
+setInterval(poll, 4000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
+window.scrollTo(0, document.body.scrollHeight);
+async function chatUpload(file, mid){
+  const q = new URLSearchParams({filename: file.name, message_id: mid});
+  const r = await fetch('/api/chat/' + CID + '/files?' + q, {method: 'POST',
+    headers: {'Content-Type': file.type || 'application/octet-stream', 'X-Tickets': '1'}, body: file, credentials: 'same-origin'});
+  if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.error || ('HTTP ' + r.status)); }
+}
+$('mf').onsubmit = async (e) => {
+  e.preventDefault();
+  const btn = $('msend'), text = $('mbody').value.trim(), files = [...$('mfiles').files];
+  if (!text && !files.length) return;
+  btn.disabled = true; busy = true;  // no polling mid-send, so the message shows up with its files
+  try {
+    const m = await api('POST', '/api/chat/' + CID + '/messages', {body: text || '(attached files)'});
+    for (const f of files) { btn.textContent = 'Uploading ' + f.name + '…'; await chatUpload(f, m.id); }
+    $('mbody').value = ''; $('mfiles').value = '';
+  } catch (err) { fail(err); }
+  busy = false; btn.disabled = false; btn.textContent = 'Send';
+  await poll(true);
+};
+$('mbody').addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) $('mf').requestSubmit(); });
+const am = $('am');
+if (am) am.onsubmit = async (e) => { e.preventDefault();
+  try { await api('POST', '/api/chat/' + CID + '/members', {username: $('amwho').value}); location.reload(); }
+  catch (err) { fail(err); } };
+"""
+
+
+def render_chat(store, cid, viewer):
+    c = store.conversation(cid, viewer)
+    msgs = store.messages(c["id"], internal=True)
+    store.mark_read(c["id"], viewer)
+    last = msgs[-1]["id"] if msgs else 0
+    others = [u for u in store.users() if not u["disabled"]
+              and u["username"].lower() not in {m.lower() for m in c["members"]}]
+    add = ""
+    if others:
+        opts = "".join(f'<option value="{esc(u["username"])}">{esc(u["username"])}</option>' for u in others)
+        add = (f'<form class="row" id="am" style="margin-top:6px"><select id="amwho" aria-label="Add someone" '
+               f'style="width:auto">{opts}</select><button>Add to conversation</button></form>')
+    shown = "".join(render_message(store, m, viewer) for m in msgs)
+    body = f"""<p class="meta" style="margin:0 0 4px"><a href="/chat">← Chat</a></p>
+<h1 style="margin-bottom:4px">{esc(c["name"])}</h1>
+<div class="meta">With {esc(", ".join(c["members"]) or "no one yet")}. Anyone can read and post here.</div>{add}
+<div id="chatroom" data-cid="{c["id"]}" data-last="{last}" style="margin-top:14px">
+<div class="chat" id="msgs">{shown or '<p class="empty" id="none">No messages yet. Say hello.</p>'}</div>
+<form class="stack composer" id="mf"><textarea id="mbody" placeholder="Message (Ctrl+Enter sends)" aria-label="Message"></textarea>
+<div class="row"><input type="file" id="mfiles" multiple aria-label="Attach files">
+<button class="primary" id="msend" style="margin-left:auto">Send</button></div></form></div>
+<script>{CHAT_JS}</script>"""
+    return page(c["name"], body, "/chat", len(store.tickets(["review"])))
+
+
 API_DOCS = """# Agent tickets: a briefing for AI agents
 
 This is a ticket tracker shared between you (an AI agent) and the humans you
@@ -1437,6 +1848,9 @@ with comments and files (screenshots, recordings, audio), and hand it back
 for review. Humans read it later, usually at the end of the day, and reply
 on the ticket. Treat it as your asynchronous channel to them: anything they
 should know goes in a comment on the ticket it's about.
+
+There's also **chat**, for talk that isn't about one ticket (questions,
+planning, heads-ups). Chat comes first: see "Chat" below.
 
 ## Signing in
 
@@ -1520,6 +1934,23 @@ proposed tickets, in one step.
 7. After review a human may move it back to in_progress or ready with a
    comment saying what to change. Read their comment first.
 
+## Chat
+
+Conversations between any users, humans and agents; anyone can read and
+post in any of them. The members of a conversation are the people who are
+told about its new messages.
+
+**Answer chat before you carry on.** When you have unread messages, every
+ticket response (`/api/next`, `GET`/`PATCH` a ticket, comments, uploads)
+includes a `"chat"` field (`{"unread": 2, "conversations": [...], "notice":
+"..."}`), and every API response has an `X-Chat-Unread` header. When you see
+it: `GET /api/chat/unread`, reply to each conversation, then go back to your
+ticket. If a message needs no reply, mark it read (`POST /api/chat/ID/read`).
+Reading a conversation (`GET /api/chat/ID`) or posting in it also marks it read.
+
+Keep chat for things that aren't about one ticket. Work on a ticket is
+discussed in comments on the ticket, where the humans review it.
+
 ## Endpoints
 
 All JSON in and out, except file uploads (raw bytes) and this page.
@@ -1541,6 +1972,16 @@ Ticket ids are four or five letters, like `KAMI`, in any case.
     PATCH /api/tickets/ID            any of {"status", "title", "description", "priority", "checklist_path", "assignee",
                                       "epic_id"}
     POST  /api/tickets/ID/comments   {"body": "..."} -> the comment, with its "id"
+    GET   /api/chat/unread           {"unread": N, "conversations": [{..., "messages": [unread ones]}]}
+    GET   /api/chat                  {"conversations": [{"id", "name", "members", "unread", "last_message"}]}
+    POST  /api/chat                  {"members": ["frank"], "title" (optional), "body" (optional first message)}
+                                     -> the conversation (with one person and no title: your existing one)
+    GET   /api/chat/ID               the conversation and its messages (?after=MESSAGE_ID for newer ones);
+                                     marks it read (?peek=1 doesn't)
+    POST  /api/chat/ID/messages      {"body": "..."} -> the message, with its "id"
+    POST  /api/chat/ID/files?filename=notes.md&message_id=N   a file for that message (raw bytes, like tickets)
+    POST  /api/chat/ID/read          mark it read without replying
+    POST  /api/chat/ID/members       {"username": "agent-2"}: tell someone else about it
     POST  /api/tickets/ID/attachments?filename=demo.mp4&comment_id=N
                                      the file's raw bytes as the body, with its Content-Type;
                                      comment_id (optional) attaches it to that comment
@@ -1609,9 +2050,13 @@ def docs_for(store, actor, role):
     queue = [dict(r) for r in store.db().execute(
         "SELECT id, title FROM tickets WHERE status = 'ready' AND assignee = ? COLLATE NOCASE "
         "ORDER BY priority, created_at", (actor,))]
-    lines = [f"\n## Right now\n", f"You're signed in as **{actor}** ({role}).",
-             f"Tickets: {counts.get('ready', 0)} ready, {counts.get('in_progress', 0)} in progress, "
-             f"{counts.get('review', 0)} waiting for review, {counts.get('backlog', 0)} in the backlog."]
+    unread = store.unread_total(actor)
+    lines = [f"\n## Right now\n", f"You're signed in as **{actor}** ({role})."]
+    if unread:
+        lines.append(f"**You have {unread} unread chat message{'s' if unread != 1 else ''}. Answer them first:** "
+                     "`GET /api/chat/unread`.")
+    lines.append(f"Tickets: {counts.get('ready', 0)} ready, {counts.get('in_progress', 0)} in progress, "
+                 f"{counts.get('review', 0)} waiting for review, {counts.get('backlog', 0)} in the backlog.")
     if mine:
         lines.append("You have these in progress (start here):")
         lines += [f"- {t['id']}: {t['title']}" for t in mine]
@@ -1671,9 +2116,21 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(data)
 
     def json(self, code, obj):
-        self.send(code, json.dumps(obj, default=str), "application/json; charset=utf-8", {"Cache-Control": "no-store"})
+        extra = {"Cache-Control": "no-store"}
+        role, actor = getattr(self, "who_is", (None, None))
+        if role == "agent" and code < 400:
+            # Agents are told about unread chat on every response, and asked to answer it first.
+            notice = self.server.store.chat_notice(actor)
+            if notice:
+                extra["X-Chat-Unread"] = str(notice["unread"])
+                if isinstance(obj, dict) and not getattr(self, "req_path", "").startswith("/api/chat"):
+                    obj = {**obj, "chat": notice}
+        self.send(code, json.dumps(obj, default=str), "application/json; charset=utf-8", extra)
 
     def html(self, body):
+        role, actor = getattr(self, "who_is", (None, None))
+        n = self.server.store.unread_total(actor) if actor else 0
+        body = body.replace(CHAT_BADGE, f"<span class=n>{n}</span>" if n else "", 1)
         self.send(200, body, "text/html; charset=utf-8", {"Cache-Control": "no-store"})
 
     def body_json(self):
@@ -1713,8 +2170,10 @@ class Handler(BaseHTTPRequestHandler):
         query = parse_qs(url.query)
         path = url.path.rstrip("/") or "/"
         store = self.server.store
+        self.who_is, self.req_path = (None, None), path
         try:
             role, actor, bearer = self.who(query)
+            self.who_is = (role, actor)
             # The briefing is public (it's only documentation); with a token
             # it adds who's asking and what's waiting. An agent calling the
             # base URL with its token gets it too, instead of the web page.
@@ -1722,7 +2181,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, docs_for(store, actor, role), "text/markdown; charset=utf-8",
                                  {"Cache-Control": "no-store"})
             if role is None:
-                if path.startswith("/api") or path.startswith("/files"):
+                if path.startswith(("/api", "/files", "/chat-files")):
                     raise ApiError(401, "missing, wrong or disabled token (Authorization: Bearer <token>). "
                                         "How this works: GET /api")
                 return self.send(401, page("Locked", "<h1>Locked</h1><p>Open this page once with "
@@ -1748,18 +2207,37 @@ class Handler(BaseHTTPRequestHandler):
             if method == "GET" and path in ("/backlog", "/done"):
                 return self.html(render_list(store, path[1:], (query.get("q") or [""])[0].strip()))
             if method == "GET" and path == "/new":
-                return self.html(render_new(store, (query.get("epic") or [None])[0]))
+                mid = (query.get("from_message") or [""])[0]
+                return self.html(render_new(store, (query.get("epic") or [None])[0],
+                                            ticket_from_message(store, int(mid)) if mid.isdigit() else ("", "")))
             if method == "GET" and (tm := re.fullmatch(r"/t/([A-Za-z]{4,5})", path)):
                 return self.html(render_ticket(store, tm.group(1)))
             if method == "GET" and (fm := re.fullmatch(r"/files/(\d+)/[^/]*", path)):
                 return self.serve_file(store.attachment(int(fm.group(1))))
+            if method == "GET" and (fm := re.fullmatch(r"/chat-files/(\d+)/[^/]*", path)):
+                return self.serve_file(store.chat_file(int(fm.group(1))))
+            if method == "GET" and path == "/chat":
+                return self.html(render_chat_list(store, actor))
+            if method == "GET" and (cm := re.fullmatch(r"/chat/(\d+)", path)):
+                return self.html(render_chat(store, int(cm.group(1)), actor))
+            if method == "GET" and (cm := re.fullmatch(r"/chat/(\d+)/since/(\d+)", path)):
+                # The chat page polls this for new messages (as HTML), which also marks them read.
+                cid = store.conversation(int(cm.group(1)))["id"]
+                msgs = store.messages(cid, after=int(cm.group(2)), internal=True)
+                if msgs:
+                    store.mark_read(cid, actor, msgs[-1]["id"])
+                return self.send(200, "".join(render_message(store, m, actor) for m in msgs), "text/html; charset=utf-8",
+                                 {"Cache-Control": "no-store", "X-Last-Id": str(msgs[-1]["id"] if msgs else 0)})
+            if path.startswith("/api/chat"):
+                return self.chat_api(method, path, query, actor, role)
             um = re.fullmatch(r"/api/users(?:/([^/]+))?(/token)?", path)
             if method == "GET" and path == "/users":
                 if role != "human":
                     raise ApiError(403, "only humans manage users")
                 return self.html(render_users(store, actor))
             if method == "GET" and path == "/api/me":
-                return self.json(200, {"username": actor, "kind": role, "guidance": store.guidance_for(actor)})
+                return self.json(200, {"username": actor, "kind": role, "guidance": store.guidance_for(actor),
+                                       "chat_unread": store.unread_total(actor)})
             if path == "/api/guidance":
                 if method == "GET":
                     return self.json(200, {"guidance": store.guidance_for(actor)})
@@ -1856,12 +2334,48 @@ class Handler(BaseHTTPRequestHandler):
         except ApiError as e:
             if method != "GET":
                 self.close_connection = True  # an unread body would confuse the next request
-            if path.startswith("/api") or path.startswith("/files") or method != "GET":
+            if path.startswith(("/api", "/files", "/chat-files")) or method != "GET":
                 return self.json(e.code, {"error": e.msg})
             return self.send(e.code, page("Error", f"<h1>{esc(e.msg)}</h1><p><a href='/'>Dashboard</a></p>"),
                              "text/html; charset=utf-8")
         except (BrokenPipeError, ConnectionResetError):
             pass
+
+    def chat_api(self, method, path, query, actor, role):
+        store = self.server.store
+        if path == "/api/chat":
+            if method == "GET":
+                return self.json(200, {"conversations": store.conversations(actor), "unread": store.unread_total(actor)})
+            if method == "POST":
+                cid = store.start_conversation(self.body_json(), actor, role)
+                return self.json(201, store.conversation_detail(cid, actor, mark=False))
+        if path == "/api/chat/unread" and method == "GET":
+            convs = store.unread(actor)
+            return self.json(200, {"unread": sum(len(c["messages"]) for c in convs), "conversations": convs})
+        m = re.fullmatch(r"/api/chat/(\d+)(/messages|/files|/members|/read)?", path)
+        if m:
+            cid, sub = int(m.group(1)), m.group(2)
+            if not sub and method == "GET":
+                after = (query.get("after") or ["0"])[0]
+                return self.json(200, store.conversation_detail(cid, actor, int(after) if after.isdigit() else 0,
+                                                                mark=not query.get("peek")))
+            if sub == "/messages" and method == "POST":
+                return self.json(201, store.post_message(cid, self.body_json().get("body"), actor, role))
+            if sub == "/members" and method == "POST":
+                return self.json(200, store.add_member(cid, str(self.body_json().get("username") or ""), actor, role))
+            if sub == "/read" and method == "POST":
+                self.body_json()
+                store.mark_read(store.conversation(cid)["id"], actor)
+                return self.json(200, {"unread": store.unread_total(actor)})
+            if sub == "/files" and method == "POST":
+                size = int(self.headers.get("Content-Length") or -1)
+                if size < 0:
+                    raise ApiError(411, "send the file with a Content-Length")
+                mid = (query.get("message_id") or [""])[0]
+                return self.json(201, store.add_chat_file(
+                    cid, int(mid) if mid.isdigit() else None, (query.get("filename") or ["upload"])[0],
+                    self.headers.get("Content-Type"), size, self.rfile, actor, role, self.server.max_upload))
+        raise ApiError(404, "not found")
 
     def serve_export(self):
         store = self.server.store

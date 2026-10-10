@@ -92,6 +92,11 @@ class TicketsTest(unittest.TestCase):
         t = self.new()
         self.assertRegex(t["id"], r"^([BDFGHKLMNPRSTVZ][AEIOU]){2}[BDFGHKLMNPRSTVZ]?$")
         self.assertEqual(self.j("GET", "/api/tickets/" + t["id"].lower())[1]["id"], t["id"])
+        # Words nobody wants as an id are skipped.
+        letters = iter("NAZI" + "BADU")
+        self.assertEqual(at.new_id(lambda tid: False, pick=lambda pool: next(letters)), "BADU")
+        for word in at.ID_BLOCKED:  # every entry is one the generator could make
+            self.assertRegex(word, r"^([BDFGHKLMNPRSTVZ][AEIOU]){2}[BDFGHKLMNPRSTVZ]?$")
 
     def test_agents_file_into_the_backlog_only(self):
         code, t = self.j("POST", "/api/tickets", {"title": "Idea from an agent"})
@@ -555,6 +560,78 @@ class TicketsTest(unittest.TestCase):
             other = at.Store(Path(tmp) / "data", [tmp])
             at.import_archive(other, Path(tmp) / "b.tar.gz")
             self.assertEqual([x["id"] for x in other.detail(third["id"])["depends_on"]], [first["id"]])
+
+    # --- chat
+    def test_chat(self):
+        tok = self.j("POST", "/api/users", {"username": "agent-c", "kind": "agent"}, role="human")[1]["token"]
+        other = self.j("POST", "/api/users", {"username": "agent-o", "kind": "agent"}, role="human")[1]["token"]
+        t = self.new("ready", title="chatty", assignee="agent-c")
+        # Frank starts a conversation with the agent.
+        code, c = self.j("POST", "/api/chat", {"members": ["AGENT-C"], "body": "Quick q: KAMI or ZZZZ? see https://x.io/KAMI"},
+                         role="human")
+        self.assertEqual((code, sorted(c["members"]), c["name"]), (201, ["Frank", "agent-c"], "agent-c"))
+        # Any ticket response tells the agent, until it answers.
+        code, got, h = self.call("PATCH", f"/api/tickets/{t['id']}", {"status": "in_progress"}, role=None, token=tok)
+        got = json.loads(got)
+        self.assertEqual((got["status"], got["chat"]["unread"], h["X-Chat-Unread"]), ("in_progress", 1, "1"))
+        self.assertIn("Answer chat", got["chat"]["notice"])
+        self.assertEqual(self.j("GET", "/api/next", role=None, token=tok)[1]["chat"]["conversations"][0]["id"], c["id"])
+        self.assertIn("unread chat message", self.call("GET", "/api", role=None, token=tok)[1].decode())
+        self.assertEqual(self.j("GET", "/api/me", role=None, token=tok)[1]["chat_unread"], 1)
+        unread = self.j("GET", "/api/chat/unread", role=None, token=tok)[1]
+        self.assertEqual((unread["unread"], unread["conversations"][0]["messages"][0]["author"]), (1, "Frank"))
+        self.assertNotIn("chat", unread)  # chat endpoints don't nag about themselves
+        # It answers, with a file; the notice is gone, and Frank now has one unread.
+        m = self.j("POST", f"/api/chat/{c['id']}/messages", {"body": "ZZZZ. Notes attached."}, role=None, token=tok)[1]
+        f = self.j("POST", f"/api/chat/{c['id']}/files?filename=notes.md&message_id={m['id']}", raw=b"# Notes\n- a\n",
+                   role=None, token=tok)[1]
+        self.assertEqual(f["mime"], "text/markdown")
+        self.assertNotIn("chat", self.j("GET", f"/api/tickets/{t['id']}", role=None, token=tok)[1])
+        self.assertEqual(self.call("GET", f["url"], role="human")[1], b"# Notes\n- a\n")
+        self.assertIn("sandbox", self.call("GET", f["url"], role="human")[2]["Content-Security-Policy"])
+        self.assertEqual(self.j("GET", "/api/chat", role="human")[1]["unread"], 1)
+        # Humans aren't nagged in JSON; the page shows a badge, and opening the conversation reads it.
+        self.assertNotIn("chat", self.j("GET", f"/api/tickets/{t['id']}", role="human")[1])
+        self.assertIn('Chat<span class=n>1</span>', self.call("GET", "/", role="human")[1].decode())
+        html = self.call("GET", f"/chat/{c['id']}", role="human")[1].decode()
+        self.assertIn("notes.md", html)
+        self.assertIn('class="pv"', html)  # markdown preview
+        self.assertNotIn('<a href="/t/ZZZZ">', html)  # not a ticket
+        self.assertIn('href="https://x.io/KAMI"', html)
+        self.assertEqual(self.j("GET", "/api/chat", role="human")[1]["unread"], 0)
+        # Ticket ids that exist are linked.
+        self.j("POST", f"/api/chat/{c['id']}/messages", {"body": f"See {t['id']}"}, role="human")
+        self.assertIn(f'<a href="/t/{t["id"]}">', self.call("GET", f"/chat/{c['id']}", role="human")[1].decode())
+        # Polling fragment: only newer messages.
+        _, frag, h = self.call("GET", f"/chat/{c['id']}/since/{m['id']}", role="human")
+        self.assertIn(f'See <a href="/t/{t["id"]}">', frag.decode())
+        self.assertNotIn("ZZZZ. Notes", frag.decode())
+        # One conversation per pair; groups need a title or more people.
+        self.assertEqual(self.j("POST", "/api/chat", {"members": ["Frank"]}, role=None, token=tok)[1]["id"], c["id"])
+        self.assertEqual(self.j("POST", "/api/chat", {"members": []}, role=None, token=tok)[0], 400)
+        self.assertEqual(self.j("POST", "/api/chat", {"members": ["nobody"]}, role="human")[0], 404)
+        g = self.j("POST", "/api/chat", {"title": "Planning", "members": ["agent-c"]}, role="human")[1]
+        self.assertNotEqual(g["id"], c["id"])
+        # Wide open: anyone reads and posts; adding someone tells them (once).
+        self.assertEqual(self.j("GET", f"/api/chat/{c['id']}", role=None, token=other)[0], 200)
+        self.j("POST", f"/api/chat/{g['id']}/members", {"username": "agent-o"}, role="human")
+        self.assertEqual(self.j("GET", "/api/chat/unread", role=None, token=other)[1]["unread"], 1)
+        self.j("POST", f"/api/chat/{g['id']}/read", {}, role=None, token=other)
+        self.assertEqual(self.j("GET", "/api/me", role=None, token=other)[1]["chat_unread"], 0)
+        # A ticket from a message.
+        new = self.call("GET", f"/new?from_message={m['id']}", role="human")[1].decode()
+        self.assertIn("&gt; ZZZZ. Notes attached.", new)
+        # Pages, and the cookie rule.
+        self.assertEqual(self.call("GET", "/chat", role="human")[0], 200)
+        self.assertEqual(self.call("GET", "/chat/99999", role="human")[0], 404)
+        # Backups carry conversations, messages and their files.
+        with tempfile.TemporaryDirectory() as tmp:
+            at.export_archive(self.srv.store, Path(tmp) / "b.tar.gz")
+            restored = at.Store(Path(tmp) / "data", [tmp])
+            at.import_archive(restored, Path(tmp) / "b.tar.gz")
+            msgs = restored.messages(c["id"], internal=True)
+            self.assertEqual(msgs[1]["files"][0]["filename"], "notes.md")
+            self.assertTrue((restored.files / msgs[1]["files"][0]["_path"]).is_file())
 
     def test_old_database_upgrades(self):
         with tempfile.TemporaryDirectory() as tmp:
