@@ -253,7 +253,7 @@ CREATE INDEX IF NOT EXISTS events_ticket ON events(ticket_id, at);
 SCHEMA_VERSION = 9
 TABLES = ("users", "settings", "tickets", "deps", "comments", "attachments", "events",
           "conversations", "chat_members", "messages", "chat_files", "wiki_pages", "wiki_revisions")
-KINDS = ("human", "agent")
+KINDS = ("human", "agent", "guest")  # guests can read everything and change nothing
 USERNAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,31}")
 
 
@@ -563,7 +563,10 @@ class Store:
         """A real user's exact name, or None for unassigned."""
         if name in (None, ""):
             return None
-        return self.user(str(name))["username"]
+        u = self.user(str(name))
+        if u["kind"] == "guest":
+            raise ApiError(400, f"{u['username']} is a guest: guests can't be assigned work")
+        return u["username"]
 
     def _check_epic(self, eid):
         """An epic's id, or None."""
@@ -619,6 +622,8 @@ class Store:
         if kind not in ("task", "epic"):
             raise ApiError(400, 'kind is "task" or "epic"')
         epic_id = self._check_epic(data.get("epic_id"))
+        if kind == "epic":
+            data = {**data, "status": "backlog", "assignee": None}
         if kind == "epic" and epic_id:
             raise ApiError(400, "epics can't belong to another epic")
         deps = data.get("depends_on") or []
@@ -1309,7 +1314,10 @@ class Store:
         names = data.get("members") or []
         if isinstance(names, str):
             names = [n for n in re.split(r"[\s,]+", names) if n]
-        members = {self.user(str(n))["username"] for n in names}
+        found = [self.user(str(n)) for n in names]
+        if any(u["kind"] == "guest" for u in found):
+            raise ApiError(400, "guests can read chats but can't be in them")
+        members = {u["username"] for u in found}
         members.add(actor)
         if len(members) < 2 and not title:
             raise ApiError(400, "say who it's with (members), or give it a title")
@@ -1359,6 +1367,8 @@ class Store:
     def add_member(self, cid, username, actor, role):
         c = self.conversation(cid)
         u = self.user(username)
+        if u["kind"] == "guest":
+            raise ApiError(400, "guests can read chats but can't be in them")
         with self.write_lock:
             db = self.db()
             with db:
@@ -1624,6 +1634,7 @@ input[type=file]::file-selector-button{font:600 13px system-ui,sans-serif;paddin
 border:1px solid var(--line);background:var(--panel);color:var(--ink);cursor:pointer}
 """ + theme_css() + """
 *{box-sizing:border-box}
+[hidden]{display:none!important}
 body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
 a{color:var(--accent)}
 header.top{position:sticky;top:0;z-index:30;display:flex;align-items:center;gap:4px;padding:3px 8px;border-bottom:1px solid var(--line);background:var(--panel)}
@@ -1637,6 +1648,14 @@ nav a{padding:5px 9px;border-radius:6px;text-decoration:none;color:var(--ink);wh
 :root[data-nav=min] .navx{background:var(--panel);border:1px solid var(--line);color:var(--ink);padding:7px 11px;box-shadow:0 1px 4px rgba(0,0,0,.18)}
 :root[data-nav=min] .navx .open{display:none}:root[data-nav=min] .navx .min{display:inline}
 :root[data-nav=min] header.top:has(nav .n) .navx::after{content:"";display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--review);margin-left:5px;vertical-align:middle}
+html[data-role=guest] :is(#cf,#mf,#sf,#ef,#df,#wf,#am,#nf,#uf,details:has(#ef),a.btn,.msg .mk,select.as,
+nav a[href="/new"],button[onclick]:not(.navx):not([onclick^="copyWikiLink"]):not([onclick^="pickTheme"]):not([onclick="location.reload()"])){display:none!important}
+html[data-role=guest] :is(.row:has(> #prio),h2:has(+ #cf),a[href^="/new"],a[href^="/wiki-new"]){display:none!important}
+html[data-role=guest] select{pointer-events:none;opacity:.75}
+.kinds{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.kinds button{display:grid;gap:2px;text-align:left;padding:10px 12px;border-width:2px;font-weight:400}
+.kinds button b{font-size:16px}
+.kinds button[aria-pressed=true]{border-color:var(--accent);background:var(--prog-bg)}
 .dlinks{display:flex;gap:6px 16px;flex-wrap:wrap;margin:-6px 0 14px;font-size:14px}
 .themes{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px}
 .themes button{display:flex;align-items:center;gap:8px;text-align:left;padding:10px 12px;border-width:2px}
@@ -2103,7 +2122,7 @@ def assignee_options(store, current=None):
     """<option>s for an assignee picker: no one, then active users."""
     opts = ['<option value="">No one</option>']
     for u in store.users():
-        if u["disabled"] and u["username"] != current:
+        if (u["disabled"] or u["kind"] == "guest") and u["username"] != current:
             continue
         sel = " selected" if current and u["username"].lower() == current.lower() else ""
         opts.append(f'<option value="{esc(u["username"])}"{sel}>{esc(u["username"])} ({u["kind"]})</option>')
@@ -2118,26 +2137,49 @@ def epic_options(store, current=None):
     return "".join(opts)
 
 
+NEW_JS = """
+const $ = (id) => document.getElementById(id);
+// Ticket or epic: an epic is a plan that groups tickets, so the ticket-only fields go away.
+function setKind(kind){
+  const epic = kind === 'epic';
+  document.querySelectorAll('.kinds button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.kind === kind)));
+  document.querySelectorAll('.task-only').forEach(el => { el.hidden = epic; });
+  $('nt-h').textContent = epic ? 'New epic' : 'New ticket';
+  $('nt-go').textContent = epic ? 'Create epic' : 'Create ticket';
+  $('nt-title').placeholder = epic ? 'The plan, e.g. Offline sync' : '';
+  $('nf').dataset.kind = kind;
+}
+$('nf').onsubmit = async (e) => {
+  e.preventDefault();
+  const epic = $('nf').dataset.kind === 'epic';
+  const data = {title: $('nt-title').value, description: $('nt-desc').value, kind: epic ? 'epic' : 'task'};
+  if (!epic) Object.assign(data, {status: $('nt-status').value, priority: +$('nt-prio').value,
+    assignee: $('nt-who').value || null, epic_id: $('nt-epic').value || null, depends_on: $('nt-deps').value});
+  try { const t = await api('POST', '/api/tickets', data); location = '/t/' + t.id; } catch (err) { fail(err); }
+};
+setKind('task');
+"""
+
+
 def render_new(store, epic=None, prefill=("", "")):
     opts = "".join(f'<option value="{s}"{" selected" if s == "backlog" else ""}>{LABELS[s]}</option>' for s in STATUSES)
-    body = f"""<h1>New ticket</h1><form class="stack box" id="nf">
+    body = f"""<h1 id="nt-h">New ticket</h1><form class="stack box" id="nf" data-kind="task">
+<div class="kinds" role="group" aria-label="What are you creating?">
+ <button type="button" data-kind="task" aria-pressed="true" onclick="setKind('task')"><b>Ticket</b>
+  <span class="meta">A piece of work for an agent or a human</span></button>
+ <button type="button" data-kind="epic" aria-pressed="false" onclick="setKind('epic')"><b>Epic</b>
+  <span class="meta">A plan that groups tickets; its state follows them</span></button>
+</div>
 <label>Title<input type="text" id="nt-title" required value="{esc(prefill[0])}"></label>
 <label>Description<textarea id="nt-desc" rows="8">{esc(prefill[1])}</textarea></label>
 <p class="meta" style="margin:-4px 0 0">Link wiki pages with <code>[[section/page]]</code>: every wiki page has a Copy link button.</p>
-<div class="row"><label>Status <select id="nt-status">{opts}</select></label>
+<div class="row task-only"><label>Status <select id="nt-status">{opts}</select></label>
 <label>Priority <select id="nt-prio"><option value="1">High</option><option value="2" selected>Normal</option><option value="3">Low</option></select></label>
 <label>Assign to <select id="nt-who">{assignee_options(store)}</select></label></div>
-<div class="row"><label>Kind <select id="nt-kind"><option value="task">Ticket</option><option value="epic">Epic (a plan that groups tickets)</option></select></label>
-<label>Epic <select id="nt-epic">{epic_options(store, epic)}</select></label></div>
-<label>Must be done first (ticket ids, optional)<input type="text" id="nt-deps" placeholder="amber-otter, quiet-falcon"></label>
-<div><button class="primary">Create</button></div></form>
-<script>const $ = (id) => document.getElementById(id);
-$('nf').onsubmit = async (e) => {{ e.preventDefault();
- try {{ const t = await api('POST', '/api/tickets', {{title: $('nt-title').value, description: $('nt-desc').value,
-   status: $('nt-status').value, priority: +$('nt-prio').value,
-   assignee: $('nt-who').value || null, kind: $('nt-kind').value, epic_id: $('nt-epic').value || null,
-   depends_on: $('nt-deps').value}});
-   location = '/t/' + t.id; }} catch (err) {{ fail(err); }} }};</script>"""
+<div class="row task-only"><label>Epic <select id="nt-epic">{epic_options(store, epic)}</select></label></div>
+<label class="task-only">Must be done first (ticket ids, optional)<input type="text" id="nt-deps" placeholder="amber-otter, quiet-falcon"></label>
+<div><button class="primary" id="nt-go">Create ticket</button></div></form>
+<script>{NEW_JS}</script>"""
     return page("New ticket", body, "/new", len(store.tickets(["review"])))
 
 
@@ -2165,7 +2207,7 @@ token is shown once, when it's made. Give agents theirs as <code>Authorization: 
 <div class="list">{"".join(rows)}</div>
 <h2>Add a user</h2><form class="row box" id="uf"><input type="text" id="uname" placeholder="name, e.g. agent-1"
  aria-label="Username" style="flex:1;min-width:160px" required><select id="ukind" style="width:auto" aria-label="Kind">
- <option value="agent">Agent</option><option value="human">Human</option></select><button class="primary">Add</button></form>
+ <option value="agent">Agent</option><option value="human">Human</option><option value="guest">Guest (read-only)</option></select><button class="primary">Add</button></form>
 <script>
 const $ = (id) => document.getElementById(id);
 function showTok(who, token) {{ $('tok').hidden = false; $('tokwho').textContent = 'Token for ' + who; $('tokval').value = token;
@@ -2670,7 +2712,8 @@ def render_chat_list(store, viewer):
         group = f' <span class="meta">· {len(c["members"])} people</span>' if c["title"] else ""
         rows.append(f'<div class="item{" unread" if c.get("unread") else ""}"><a href="/chat/{c["id"]}"><b>{esc(c["name"])}</b>'
                     f'{badge}{group}<div class="snip">{snip}</div></a><span class="meta">{ago(c["updated_at"])}</span></div>')
-    people = [u for u in store.users() if not u["disabled"] and u["username"].lower() != viewer.lower()]
+    people = [u for u in store.users() if not u["disabled"] and u["kind"] != "guest"
+              and u["username"].lower() != viewer.lower()]
     picks = "".join(f'<label><input type="checkbox" name="who" value="{esc(u["username"])}"> {esc(u["username"])}'
                     f'{" <span class=meta>(agent)</span>" if u["kind"] == "agent" else ""}</label>' for u in people)
     body = f"""<h1>Chat</h1>
@@ -2746,7 +2789,7 @@ def render_chat(store, cid, viewer):
     msgs = store.messages(c["id"], internal=True)
     store.mark_read(c["id"], viewer)
     last = msgs[-1]["id"] if msgs else 0
-    others = [u for u in store.users() if not u["disabled"]
+    others = [u for u in store.users() if not u["disabled"] and u["kind"] != "guest"
               and u["username"].lower() not in {m.lower() for m in c["members"]}]
     add = ""
     if others:
@@ -3038,6 +3081,9 @@ variable or your harness's secret store. Then you won't need to re-read this
 briefing each time; the skill points back here for the details.
 
 ## Signing in
+
+(Users are humans, agents, or guests: guests can read everything and change
+nothing.)
 
 Every request needs your token: `Authorization: Bearer <token>`. A human
 gives it to you. The token is who you are: your username goes on your
@@ -3413,6 +3459,10 @@ class Handler(BaseHTTPRequestHandler):
         body = body.replace(CHAT_BADGE, f"<span class=n>{n}</span>" if n else "", 1)
         if actor and self.server.store.prefs(actor)["tts"]:
             body = body.replace('<html lang="en">', '<html lang="en" data-tts="1">', 1)
+        if role == "guest":
+            body = body.replace('<html lang="en"', '<html lang="en" data-role="guest"', 1).replace(
+                "<main>", '<main><p class="banner prop guest-note">Read-only guest: you can look at everything, but not '
+                          'change anything.</p>', 1)
         self.send(200, body, "text/html; charset=utf-8", {"Cache-Control": "no-store"})
 
     def body_json(self):
@@ -3478,6 +3528,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Set-Cookie", f"{COOKIE}={query['key'][0]}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax{secure}")
                 self.send_header("Content-Length", "0")
                 return self.end_headers()
+            # Guests read; the only thing they can change is their own display settings.
+            if role == "guest" and (method not in ("GET", "HEAD") and path != "/api/me/prefs"
+                                    or path in ("/new", "/wiki-new") or (path == "/api/next" and query.get("claim"))):
+                raise ApiError(403, "guests can read but not change anything")
             # Changes made with the cookie must come from our own pages.
             if method != "GET" and not bearer and self.headers.get("X-Tickets") != "1":
                 raise ApiError(403, "missing X-Tickets header")

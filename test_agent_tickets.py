@@ -745,7 +745,9 @@ class TicketsTest(unittest.TestCase):
         rev = self.srv.store.wiki_revisions(fp["id"])[-1]["id"]
         self.assertIn("The version", self.call("GET", f"/wiki/projects/fitness-pizza?rev={rev}", role="human")[1].decode())
         # The briefing names the sections; backups restore a page moved under a newer one.
-        self.assertIn("Wiki sections: Projects (`projects`)", self.call("GET", "/api", role=None, token=tok)[1].decode())
+        brief = self.call("GET", "/api", role=None, token=tok)[1].decode()
+        sections = [line for line in brief.splitlines() if line.startswith("Wiki sections:")]
+        self.assertIn("Projects (`projects`)", sections[0])
         late = mk(title="Later section")[1]
         self.j("PUT", "/api/wiki/projects", {"parent": late["path"]}, role="human")
         with tempfile.TemporaryDirectory() as tmp:
@@ -1056,6 +1058,48 @@ class TicketsTest(unittest.TestCase):
         # It's per user: the agent's pages aren't affected.
         self.assertNotIn('<html lang="en" data-tts="1">', self.call("GET", "/settings", role="agent")[1].decode())
         self.j("PUT", "/api/me/prefs", {"tts": False}, role="human")
+
+    def test_guest(self):
+        guest = self.j("POST", "/api/users", {"username": "visitor", "kind": "guest"}, role="human")[1]["token"]
+        t = self.new("ready", title="visible to guests")
+        c = self.j("POST", "/api/chat", {"title": "open room", "body": "hi"}, role="human")[1]
+        self.j("POST", "/api/wiki", {"title": "Guest readable"}, role="human")
+        g = lambda m, path, body=None: self.j(m, path, body, role=None, token=guest)
+        # Reads work.
+        for path in ("/api/tickets", f"/api/tickets/{t['id']}", "/api/chat", f"/api/chat/{c['id']}", "/api/wiki",
+                     "/api/wiki/guest-readable", "/api/me", "/api/next"):
+            self.assertEqual(g("GET", path)[0], 200, path)
+        for path in ("/", f"/t/{t['id']}", "/backlog", "/done", "/chat", f"/chat/{c['id']}", "/wiki", "/settings"):
+            self.assertEqual(self.call("GET", path, role=None, token=guest)[0], 200, path)
+        # Changes don't.
+        for m, path, body in (("POST", "/api/tickets", {"title": "x"}), ("PATCH", f"/api/tickets/{t['id']}", {"status": "done"}),
+                              ("POST", f"/api/tickets/{t['id']}/comments", {"body": "x"}),
+                              ("POST", f"/api/tickets/{t['id']}/cancel", {}), ("POST", f"/api/chat/{c['id']}/messages", {"body": "x"}),
+                              ("POST", "/api/chat", {"title": "x"}), ("POST", "/api/wiki", {"title": "x"}),
+                              ("GET", "/api/next?claim=1", None)):
+            self.assertEqual(g(m, path, body)[0], 403, path)
+        self.assertEqual(self.call("GET", "/new", role=None, token=guest)[0], 403)
+        self.assertEqual(self.call("GET", "/users", role=None, token=guest)[0], 403)
+        # Their own display settings are theirs.
+        self.assertEqual(g("PUT", "/api/me/prefs", {"tts": True})[0], 200)
+        # Guests aren't assignable or chat members, and aren't offered as either.
+        self.assertEqual(self.j("PATCH", f"/api/tickets/{t['id']}", {"assignee": "visitor"}, role="human")[0], 400)
+        self.assertEqual(self.j("POST", "/api/chat", {"members": ["visitor"]}, role="human")[0], 400)
+        self.assertNotIn('value="visitor"', self.call("GET", f"/t/{t['id']}", role="human")[1].decode())
+        # Their pages say so and hide the forms.
+        page = self.call("GET", f"/t/{t['id']}", role=None, token=guest)[1].decode()
+        self.assertIn('data-role="guest"', page)
+        self.assertIn("Read-only guest", page)
+        self.assertIn('<option value="guest">Guest (read-only)</option>', self.call("GET", "/users", role="human")[1].decode())
+
+    def test_new_page_kind_first(self):
+        html = self.call("GET", "/new", role="human")[1].decode()
+        self.assertLess(html.index('class="kinds"'), html.index('id="nt-title"'))  # the kind comes first
+        self.assertEqual(html.count('class="row task-only"') + html.count('class="task-only"'), 3)
+        # An epic created with ticket-only fields ignores them: backlog, no assignee.
+        e = self.j("POST", "/api/tickets", {"title": "Plan", "kind": "epic", "status": "ready", "assignee": "tester"},
+                   role="human")[1]
+        self.assertEqual((e["status"], e["assignee"]), ("backlog", None))
 
     def test_skill(self):
         code, body, h = self.call("GET", "/api/skill", role="agent", headers={"Host": "tickets.example:43917"})

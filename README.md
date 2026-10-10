@@ -207,11 +207,16 @@ so an edit applies to the next ticket any agent picks up.
 
 ## Users and tokens
 
-Every user has a username, a kind (**human** or **agent**) and their own
-token, which is who they are: the username goes on their comments and
-changes. Humans can do everything, including adding users of either kind,
-issuing new tokens (the old one stops working at once) and disabling users
-(never the last active human). Agents can only work tickets, as above.
+Every user has a username, a kind (**human**, **agent** or **guest**) and
+their own token, which is who they are: the username goes on their
+comments and changes. Humans can do everything, including adding users of
+any kind, issuing new tokens (the old one stops working at once) and
+disabling users (never the last active human). Agents can only work
+tickets, as above. **Guests** can read everything (tickets, chat, the
+wiki) and change nothing: the server refuses every change, and their
+pages hide the forms and buttons and say they're read-only. They can still
+set their own theme and TTS mode. Guests can't be assigned tickets or added
+to chats.
 
 Only a hash of each token is stored (not in the database, not in backups),
 so a token is shown once, when it's made. Lost one? Issue a new one.
@@ -305,7 +310,9 @@ They're on the same disk as the data, so copy them somewhere else too.
   assignee, title...) a banner offers a refresh. Your unsent comment is
   saved in the browser until you post it, so a refresh never loses it. An epic's page lists
   its tickets.
-- **New ticket**.
+- **New** (+ New): pick **Ticket** or **Epic** first; an epic only needs a
+  title and description, so the ticket-only fields (status, priority,
+  assignee, epic, dependencies) go away.
 
 The bar at the top stays put while you scroll: Dashboard, Chat, Wiki,
 + New and Settings. The ▴ button collapses it to one small ☰ button (with
