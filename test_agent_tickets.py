@@ -815,6 +815,27 @@ class TicketsTest(unittest.TestCase):
         self.assertIn(f'id="as-{b2["id"]}"', page)
         self.assertIn(f"readyFor('{b2['id']}')", page)
 
+    def test_priority_up_top_and_on_accept(self):
+        tok = self.j("POST", "/api/users", {"username": "agent-p2", "kind": "agent"}, role="human")[1]["token"]
+        p = self.j("POST", "/api/tickets", {"title": "Urgent idea"}, role=None, token=tok)[1]
+        self.assertIn(f'id="pr-{p["id"]}"', self.call("GET", "/backlog", role="human")[1].decode())
+        self.assertIn(f'id="pr-{p["id"]}"', self.call("GET", f"/t/{p['id']}", role="human")[1].decode())
+        got = self.j("POST", f"/api/tickets/{p['id']}/accept", {"ready": True, "priority": 1}, role="human")[1]
+        self.assertEqual((got["status"], got["priority"]), ("ready", 1))
+        bad = self.j("POST", "/api/tickets", {"title": "x"}, role=None, token=tok)[1]
+        self.assertEqual(self.j("POST", f"/api/tickets/{bad['id']}/accept", {"priority": 7}, role="human")[0], 400)
+        # An epic's priority applies to its proposed tickets too.
+        e = self.j("POST", "/api/tickets", {"title": "Low plan", "kind": "epic"}, role=None, token=tok)[1]
+        k = self.j("POST", "/api/tickets", {"title": "Low step", "epic_id": e["id"]}, role=None, token=tok)[1]
+        self.j("POST", f"/api/tickets/{e['id']}/accept", {"priority": 3}, role="human")
+        self.assertEqual(self.j("GET", f"/api/tickets/{k['id']}", role="human")[1]["priority"], 3)
+        # On the ticket page it sits right under the description, not in the Edit form.
+        html = self.call("GET", f"/t/{p['id']}", role="human")[1].decode()
+        self.assertLess(html.index('class="desc md"'), html.index('id="prio"'))
+        self.assertLess(html.index('id="prio"'), html.index("<h2>Activity</h2>"))
+        self.assertNotIn('id="eprio"', html)
+        self.assertIn("set the priority to <b>High</b>", html)
+
     def test_live_ticket_page(self):
         tok = self.j("POST", "/api/users", {"username": "agent-l", "kind": "agent"}, role="human")[1]["token"]
         t = self.new("in_progress", assignee="agent-l")

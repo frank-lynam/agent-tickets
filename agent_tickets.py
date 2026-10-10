@@ -721,13 +721,23 @@ class Store:
                                 f"{new['done']}/{new['total']}", now)
         return {"checklist": self.detail(t["id"])["checklist"]}
 
-    def review_proposal(self, tid, accept, ready, actor, role, assignee=None):
+    def review_proposal(self, tid, accept, ready, actor, role, assignee=None, priority=None):
         """Accept (to the backlog, or ready) or decline (to done, marked
         declined) a proposal. On an epic, its proposed tickets go the same way.
-        Accepting can assign it (an epic: its tickets) to someone at the same time."""
+        Accepting can assign it (an epic: its tickets) to someone, and set its priority (an epic: its
+        tickets' too), at the same time."""
         if role != "human":
             raise ApiError(403, "only humans accept or decline proposals")
         assignee = self._check_assignee(assignee) if accept and assignee else None
+        if accept and priority not in (None, ""):
+            try:
+                priority = int(priority)
+            except (TypeError, ValueError):
+                priority = 0
+            if priority not in PRIORITIES:
+                raise ApiError(400, "priority is 1 (high), 2 (normal) or 3 (low)")
+        else:
+            priority = None
         with self.write_lock:
             db = self.db()
             t = self.ticket(tid)
@@ -749,6 +759,10 @@ class Store:
                         if assignee and kind == "task" and old != assignee:
                             db.execute("UPDATE tickets SET assignee = ? WHERE id = ?", (assignee, i))
                             self._event(db, i, actor, role, "assignee", old, assignee, now)
+                        was = db.execute("SELECT priority FROM tickets WHERE id = ?", (i,)).fetchone()[0]
+                        if priority and was != priority:
+                            db.execute("UPDATE tickets SET priority = ? WHERE id = ?", (priority, i))
+                            self._event(db, i, actor, role, "priority", was, priority, now)
                     else:
                         db.execute("UPDATE tickets SET proposed = 0, declined = 1, status = 'done', updated_at = ? "
                                    "WHERE id = ?", (now, i))
@@ -1872,7 +1886,8 @@ def render_dashboard(store):
 PROPOSAL_JS = """
 function assignFor(tid){ const s = document.getElementById('as-' + tid); return s ? (s.value || null) : undefined; }
 async function review(tid, action, ready){
-  const body = action === 'accept' ? {ready, assignee: assignFor(tid)} : {};
+  const pr = document.getElementById('pr-' + tid);
+  const body = action === 'accept' ? {ready, assignee: assignFor(tid), priority: pr ? +pr.value : undefined} : {};
   try { await api('POST', '/api/tickets/' + tid + '/' + action, body); location.reload(); }
   catch (e) { fail(e); }
 }
@@ -1891,6 +1906,7 @@ def proposal_row(store, t, children=()):
     head = (f'<div class="item prop"><a href="/t/{tid}"><span class="id">{tid}</span> {kind}<b>{esc(t["title"])}</b>'
             f'<div class="meta">proposed by {esc(t["created_by"])} {ago(t["created_at"])}{deps}</div></a><div class="row">'
             + assign_select(store, tid, t["assignee"], "Assign its tickets to" if t["kind"] == "epic" else "Assign to")
+            + prio_select(tid, t["priority"])
             + f'<button class="primary" onclick="review(\'{tid}\',\'accept\',false)" title="Accept{esc(more)}">Accept</button>'
             + ("" if t["kind"] == "epic" else
                f'<button onclick="review(\'{tid}\',\'accept\',true)">Accept &amp; make ready</button>')
@@ -1939,6 +1955,12 @@ def render_list(store, status, q):
     body = (f'<h1>{title}</h1>{hint}{search}{props}<div class="list">{"".join(rows) or "<p class=empty>Nothing here.</p>"}</div>'
             + (f'<script>{PROPOSAL_JS}</script>' if status == "backlog" and not props else ""))
     return page(title, body, "/" + status, len(store.tickets(["review"])))
+
+
+def prio_select(tid, current=2, label="Priority"):
+    """A priority picker that goes with Accept (and sits under a ticket's description)."""
+    opts = "".join(f'<option value="{k}"{" selected" if k == current else ""}>{v}</option>' for k, v in PRIORITIES.items())
+    return f'<select id="pr-{tid}" class="as" aria-label="{label}" title="{label}">{opts}</select>'
 
 
 def assign_select(store, tid, current=None, label="Assign to"):
@@ -2185,6 +2207,9 @@ def ticket_timeline(store, t):
         elif e["field"] == "depends_on":
             text = (f'{esc(e["actor"])} said <a href="/t/{esc(e["new"])}">{esc(e["new"])}</a> must be done first' if e["new"]
                     else f'{esc(e["actor"])} removed the dependency on {esc(e["old"])}')
+        elif e["field"] == "priority":
+            label = PRIORITIES.get(int(e["new"]), e["new"]) if str(e["new"]).isdigit() else e["new"]
+            text = f'{esc(e["actor"])} set the priority to <b>{esc(label)}</b>'
         elif e["field"] == "epic_status":
             text = f'the epic is now <b>{EPIC_STATES.get(e["new"], e["new"])}</b> (after a change by {esc(e["actor"])})'
         elif e["field"] == "checklist":
@@ -2298,6 +2323,7 @@ def render_ticket(store, tid):
     if t["proposed"]:
         banners += (f'<div class="banner prop">Proposed by {esc(t["created_by"])}. '
                     + assign_select(store, t["id"], t["assignee"], "Assign its tickets to" if t["kind"] == "epic" else "Assign to")
+                    + " " + prio_select(t["id"], t["priority"])
                     + f' <button class="primary" onclick="review(TID,\'accept\',false)">Accept</button> '
                     + ("" if t["kind"] == "epic" else '<button onclick="review(TID,\'accept\',true)">Accept &amp; make ready</button> ')
                     + '<button onclick="review(TID,\'decline\')">Decline</button>'
@@ -2352,6 +2378,8 @@ def render_ticket(store, tid):
 <div class="row" style="margin-bottom:16px">{btns}</div>
 <div class="detail"><div>
  <div class="box"><div class="desc md">{wiki_html(store, t['description']) or '<span class="meta">No description.</span>'}</div></div>
+ <div class="row" style="margin-top:8px"><label class="meta" for="prio">Priority</label>
+  <select id="prio" class="as" onchange="setPrio(this.value)">{''.join(f'<option value="{k}"{" selected" if k == t["priority"] else ""}>{v}</option>' for k, v in PRIORITIES.items())}</select></div>
  {epic_box}
  <h2>Activity</h2><div class="tl" id="tl">{timeline}</div>
  <h2>Comment</h2><form class="stack box" id="cf">
@@ -2365,12 +2393,10 @@ def render_ticket(store, tid):
  <h2>Assigned to</h2><div class="box"><select id="who" aria-label="Assigned to"
   onchange="assign(this.value)">{assignee_options(store, t['assignee'])}</select></div>
  {side_links}
- <h2>Details</h2><div class="box"><dl class="kv"><dt>Priority</dt><dd>{PRIORITIES[t['priority']]}</dd>
-  <dt>Created</dt><dd>{when(t['created_at'])} by {esc(t['created_by'])}</dd><dt>Updated</dt><dd>{ago(t['updated_at'])}</dd></dl>
+ <h2>Details</h2><div class="box"><dl class="kv"><dt>Created</dt><dd>{when(t['created_at'])} by {esc(t['created_by'])}</dd><dt>Updated</dt><dd>{ago(t['updated_at'])}</dd></dl>
   <details style="margin-top:10px"><summary>Edit</summary><form class="stack" id="ef" style="margin-top:8px">
    <label>Title<input type="text" id="etitle" value="{esc(t['title'])}"></label>
    <label>Description<textarea id="edesc" rows="8">{esc(t['description'])}</textarea></label>
-   <label>Priority<select id="eprio">{''.join(f'<option value="{k}"{" selected" if k == t["priority"] else ""}>{v}</option>' for k, v in PRIORITIES.items())}</select></label>
    <button class="primary">Save</button></form></details></div>
 </aside></div>
 <script>
@@ -2404,9 +2430,11 @@ if (df) df.onsubmit = async (e) => {{ e.preventDefault();
 enterSends('cbody', 'cf');
 document.getElementById('ef').onsubmit = async (e) => {{
   e.preventDefault();
-  try {{ await api('PATCH', '/api/tickets/' + TID, {{title: $('etitle').value, description: $('edesc').value,
-    priority: +$('eprio').value}}); location.reload(); }} catch (err) {{ fail(err); }}
+  try {{ await api('PATCH', '/api/tickets/' + TID, {{title: $('etitle').value, description: $('edesc').value}});
+    location.reload(); }} catch (err) {{ fail(err); }}
 }};
+async function setPrio(v) {{ try {{ await api('PATCH', '/api/tickets/' + TID, {{priority: +v}}); location.reload(); }}
+  catch (err) {{ fail(err); }} }}
 </script>"""
     return page(f"{t['id']} {t['title']}", body, "", len(store.tickets(["review"])))
 
@@ -3443,7 +3471,7 @@ class Handler(BaseHTTPRequestHandler):
                     # be taken for the start of the next request on this connection.
                     d = self.body_json()
                     return self.json(200, store.review_proposal(tid, sub == "/accept", bool(d.get("ready")) and sub == "/accept",
-                                                                actor, role, d.get("assignee")))
+                                                                actor, role, d.get("assignee"), d.get("priority")))
                 if other:
                     raise ApiError(404, "not found")
                 if not sub and method == "GET":
