@@ -1498,7 +1498,7 @@ button,.btn{font:600 14px system-ui,sans-serif;padding:8px 14px;border-radius:7p
 button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
 button:focus-visible,a:focus-visible,textarea:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 input[type=text],input[type=search],textarea,select{width:100%;font:15px system-ui,sans-serif;padding:8px 10px;border-radius:7px;border:1px solid var(--line);background:var(--panel);color:var(--ink)}
-textarea{min-height:90px;resize:vertical}
+textarea{min-height:90px;resize:vertical;max-height:80vh}
 form.stack{display:grid;gap:8px}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 .list .item{display:flex;gap:12px;align-items:center;justify-content:space-between;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 14px;margin-bottom:8px}
@@ -1592,6 +1592,17 @@ async function upload(tid, file, commentId){
   if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.error || ('HTTP ' + r.status)); }
 }
 function fail(e){ alert(e.message); }
+// Text boxes grow with what's typed, up to 80% of the screen, then scroll.
+function fit(el){
+  if (!el || el.tagName !== 'TEXTAREA') return;
+  el.style.height = 'auto';
+  const max = Math.round(window.innerHeight * 0.8), want = el.scrollHeight + 2;
+  el.style.height = Math.min(want, max) + 'px';
+  el.style.overflowY = want > max ? 'auto' : 'hidden';
+}
+document.addEventListener('input', (e) => fit(e.target));
+document.addEventListener('DOMContentLoaded', () => document.querySelectorAll('textarea').forEach(fit));
+window.addEventListener('resize', () => document.querySelectorAll('textarea').forEach(fit));
 // Enter sends; Shift+Enter is a new line (and typing with an IME isn't interrupted).
 function enterSends(boxId, formId){
   const box = document.getElementById(boxId); if (!box) return;
@@ -2102,7 +2113,7 @@ LIVE_JS = """
   document.addEventListener('visibilitychange', () => { if (!document.hidden) live(); });
   // Your unsent comment is kept in this browser until you post it.
   const box = document.getElementById('cbody'), key = 'at-draft:' + TID;
-  try { const saved = localStorage.getItem(key); if (saved && !box.value) box.value = saved; } catch (e) {}
+  try { const saved = localStorage.getItem(key); if (saved && !box.value) { box.value = saved; fit(box); } } catch (e) {}
   box.addEventListener('input', () => {
     try { box.value ? localStorage.setItem(key, box.value) : localStorage.removeItem(key); } catch (e) {}
   });
@@ -2381,7 +2392,7 @@ $('mf').onsubmit = async (e) => {
   try {
     const m = await api('POST', '/api/chat/' + CID + '/messages', {body: text || '(attached files)'});
     for (const f of files) { btn.textContent = 'Uploading ' + f.name + '…'; await chatUpload(f, m.id); }
-    $('mbody').value = ''; $('mfiles').value = '';
+    $('mbody').value = ''; $('mfiles').value = ''; fit($('mbody'));
   } catch (err) { fail(err); }
   busy = false; btn.disabled = false; btn.textContent = 'Send';
   await poll(true);
