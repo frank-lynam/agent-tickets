@@ -974,6 +974,8 @@ class TicketsTest(unittest.TestCase):
         brief = self.call("GET", "/api", role=None)[1].decode()
         self.assertIn("## Staying reachable when you're idle", brief)
         self.assertIn("**Don't park work in in_progress:**", brief)
+        self.assertIn("**The loop: after every action, call it.**", brief)
+        self.assertIn("*A recurring check, as a safety net:*", brief)
         self.assertIn("/api/wait", self.call("GET", "/api/skill", role=None, token=tok)[1].decode())
 
     def test_read_receipts(self):

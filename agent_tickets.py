@@ -270,7 +270,7 @@ DEFAULT_GUIDANCE = """## How we work
 3. After each step, tick it off in your file, upload it again, and comment what you did and what happened, including errors and surprises.
 4. When something is visible (a page, a chart, a game), attach a screenshot or a short recording.
 5. Hand back with a comment that starts "Done" or "Needs a decision", then set the status to review.
-6. Between steps and when you're idle, ask GET /api/wait what to do next (chat, replies, your in-progress tickets, then ready ones) and keep it running in the background however your harness allows. Don't leave tickets in progress that you aren't working on: if you're waiting on a decision, move it to review and say what you need.
+6. After every action (a step, a hand-back, a chat reply), call GET /api/wait and do what it returns (chat, replies, your in-progress tickets, then ready ones). Never end a turn with nothing in hand: keep wait running in the background so it wakes you, and have a recurring check (cron, scheduled task) as a safety net. Don't leave tickets in progress that you aren't working on: if you're waiting on a decision, move it to review and say what you need.
 
 ## How much to write
 
@@ -3062,9 +3062,11 @@ enough, or a request fails in a way you don't understand. Errors come back as `{
 
 ## When you're idle
 
-Stay reachable: keep `GET /api/wait?timeout=50` running in the background, in a loop, using whatever your
-harness offers (a background command that wakes you when it returns, a scheduled check, a hook before you end
-a turn). It tells you what to do next, at once if there's anything: unread chat, replies on your tickets,
+After every action (a step, a hand-back, a chat reply), call `GET /api/wait?timeout=50` and do what it
+returns. Never end a turn with nothing in hand: keep it running in the background so it wakes you (a
+background command your harness reports when it finishes, a hook before you end a turn), plus a recurring
+check as a safety net (cron, a scheduled task, your harness's scheduler) that calls
+`GET /api/wait?timeout=1` every few minutes and wakes you if the reason isn't `timeout`. It tells you what to do next, at once if there's anything: unread chat, replies on your tickets,
 your in-progress tickets, your ready tickets (in that order). Do it, then call it again. Don't park work in
 in progress: if you're stuck on a decision, move it to review with what you need. Write down here how you set
 up the listener for your harness.
@@ -3265,10 +3267,27 @@ offers, and write down how in your skill.**
   decision or on someone else, move the ticket to review with a comment
   saying what you need, or release it to ready. Otherwise wait will keep
   handing it back to you (which is the point).
-- Run it whenever you'd otherwise sit idle, so that its returning wakes you:
-  for example a background command your harness tells you about when it
-  finishes, a scheduled wake-up that calls it, or a hook that checks before
-  you end a turn. Use whatever your harness supports; there's no one way.
+**The loop: after every action, call it.** Whenever you finish something
+(a step of a ticket, a hand-back, a chat reply, a ticket you proposed),
+your next move is `GET /api/wait`, and you do what it returns. Never end
+a turn or a session with nothing in hand: either you're working on what
+wait gave you, or wait is running in the background so that its
+returning wakes you.
+
+**Set up two things once, and write down how in your skill:**
+
+1. *A listener:* run wait in the background whenever you'd otherwise sit
+   idle, so its returning wakes you: for example a background command your
+   harness tells you about when it finishes, or a hook that runs before you
+   end a turn and calls it.
+2. *A recurring check, as a safety net:* something on a timer (a cron job,
+   a scheduled task, your harness's scheduler or loop feature) that every
+   few minutes calls `GET /api/wait?timeout=1` and, if the reason isn't
+   `timeout`, wakes you or starts a session to deal with it. That way a
+   listener that died, or a session that ended, can't leave you deaf.
+
+Use whatever your harness and machine support; there's no one way. If you
+can do neither, tell a human in chat.
 - When it returns: do what it says (chat first, then your tickets), then
   call it again. You can also call it any time as "what should I do next?".
 - If your harness can't run anything while you're idle, tell a human in
