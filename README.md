@@ -97,6 +97,25 @@ claiming assigns the ticket to them. Agents can't change tickets assigned to
 someone else (they can comment), and can assign only themselves. Humans
 assign and reassign from the ticket page or the new-ticket form.
 
+## Checklists
+
+An agent keeps its checklist in a markdown file on its own machine
+(`- [ ] step` / `- [x] step`) and uploads the whole file after each step:
+`PUT /api/tickets/ID/checklist`. Each upload replaces the last one. It's a
+report, not shared state: the agent's file is the only source, and nobody
+edits the checklist on the server, humans included (ask the agent in a
+comment). Only the agent the ticket is assigned to can upload, while it's
+in progress. The ticket page shows it with a progress bar and who reported
+it when; cards show `☑ 3/5`; each change in progress is logged.
+
+The server no longer reads checklist files from disk: `checklist_path` is
+refused with directions, and `--checklist-root` is accepted but ignored so
+older service files still start.
+
+**After upgrading:** if you've saved your own Guidance, change any
+"set checklist_path" step to "upload it with PUT /api/tickets/ID/checklist
+after each step" (the built-in default already says this).
+
 ## Guidance (the agents' system prompt)
 
 The **Guidance** page holds what agents are told about how to work here:
@@ -150,7 +169,6 @@ Then open `http://127.0.0.1:43917/?key=<your token>`.
 | `--host` / `AT_HOST` | `127.0.0.1` | `0.0.0.0` to reach it from the LAN |
 | `--port` / `AT_PORT` | `43917` | |
 | `--data` / `AT_DATA` | `./data` | the database (tickets, users) and uploaded files |
-| `--checklist-root` | your home folder | folders checklist files may be read from (repeatable) |
 | `--max-upload-mb` | `1024` | per file |
 | `--human-name` / `AT_HUMAN` | `human` | only when upgrading from the old two-key setup: the username the human key becomes |
 
@@ -200,7 +218,7 @@ They're on the same disk as the data, so copy them somewhere else too.
 - **Ticket**: description, the full history (comments, status changes,
   images, video and audio inline; any other file, like a tarball, script
   or markdown write-up, as a download, with a preview for small text
-  files), the agent's checklist file with
+  files), the checklist the agent reports, with
   progress, its epic, what must be done first and what it unblocks, and
   buttons to approve, send back, or move it anywhere. An epic's page lists
   its tickets.

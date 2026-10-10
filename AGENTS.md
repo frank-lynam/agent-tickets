@@ -22,7 +22,10 @@ read `GET /api` on the running server instead.
   agents. New ticket ids come only from `ID_ADJECTIVES` and `ID_NOUNS`: vet
   every word you add (nothing offensive alone or in a pair, no homophones,
   one obvious spelling, never in both lists). Old four- and five-letter ids
-  must keep working. Checklist files are read only from the allowed roots. Only
+  must keep working. Checklists are only ever uploaded (`PUT .../checklist`), by the agent
+  assigned to the ticket while it's in progress, replacing the last upload;
+  the server never reads files from disk paths, and nobody edits checklists
+  on the server. Only
   humans manage users or export; the last active human can't be disabled.
   Tokens are stored only as hashes and never appear in logs or backups.
 - **Data** lives in `data/` (gitignored): `tickets.db` (tickets and

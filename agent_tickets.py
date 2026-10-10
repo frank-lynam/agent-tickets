@@ -140,6 +140,44 @@ def new_id(taken, pick=random.choice):
     raise RuntimeError("no free ticket id")
 
 
+# --------------------------------------------------------------------------- checklists
+
+# An agent keeps its checklist in a markdown file on its own machine and
+# uploads the whole file after each step: a report, replacing the last one.
+# The file on the agent's machine is the only state; nobody edits it here.
+CHECKLIST_MAX = 100_000
+
+
+def parse_checklist(text):
+    """Items ("- [ ] step" / "- [x] step") and note lines from checklist markdown."""
+    out = {"items": [], "done": 0, "total": 0}
+    for line in text.splitlines():
+        m = re.match(r"\s*[-*]\s+\[([ xX])\]\s+(.*)", line)
+        if m:
+            done = m.group(1).lower() == "x"
+            out["items"].append({"done": done, "text": m.group(2)})
+            out["total"] += 1
+            out["done"] += done
+        elif line.strip():
+            out["items"].append({"text": line.strip(), "note": True})
+    return out
+
+
+def checklist_summary(t, items=False):
+    """Swap a ticket row's stored checklist columns for {"done", "total", "updated_by", "updated_at"}
+    (plus "items" and "text" when asked), or None when nothing's been uploaded."""
+    text = t.pop("checklist_md", None)
+    t.pop("checklist_path", None)
+    by, at = t.pop("checklist_by", None), t.pop("checklist_at", None)
+    if not text:
+        return None
+    p = parse_checklist(text)
+    out = {"done": p["done"], "total": p["total"], "updated_by": by, "updated_at": at}
+    if items:
+        out.update(items=p["items"], text=text)
+    return out
+
+
 # --------------------------------------------------------------------------- storage
 
 SCHEMA = """
@@ -199,7 +237,7 @@ CREATE INDEX IF NOT EXISTS events_ticket ON events(ticket_id, at);
 
 
 # Bumped (with a migration in Store.__init__) whenever the tables change.
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 TABLES = ("users", "settings", "tickets", "deps", "comments", "attachments", "events",
           "conversations", "chat_members", "messages", "chat_files", "wiki_pages", "wiki_revisions")
 KINDS = ("human", "agent")
@@ -208,12 +246,15 @@ USERNAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,31}")
 
 # The house rules agents get with every ticket they claim and at the top of
 # the /api briefing. Humans edit it on the Guidance page; this is the start.
+GONE = ("checklist_path is gone: keep your checklist on your machine and upload it with "
+        "PUT /api/tickets/ID/checklist after each step")
+
 DEFAULT_GUIDANCE = """## How we work
 
 0. Chat comes first. When a response carries a "chat" notice, read your unread messages and answer them before your next step on the ticket. Chat is for questions and planning that aren't about one ticket; anything about a ticket goes in a comment on that ticket.
 1. When you take a ticket, first post a one-line comment: you're starting, and you'll write a checklist.
-2. Write a markdown checklist of the steps ("- [ ] step") in a file, set it as the ticket's checklist_path, and post a short plan: what you'll do, and how you'll know it's done.
-3. After each step, tick it off in the checklist and comment what you did and what happened, including errors and surprises.
+2. Write a markdown checklist of the steps ("- [ ] step") in a file on your machine, upload it (PUT /api/tickets/ID/checklist), and post a short plan: what you'll do, and how you'll know it's done.
+3. After each step, tick it off in your file, upload it again, and comment what you did and what happened, including errors and surprises.
 4. When something is visible (a page, a chart, a game), attach a screenshot or a short recording.
 5. Hand back with a comment that starts "Done" or "Needs a decision", then set the status to review.
 
@@ -241,23 +282,25 @@ class Store:
     """The database and the uploaded files. One SQLite connection per thread;
     writes go through one lock so ids and status changes never race."""
 
-    def __init__(self, data_dir, checklist_roots):
+    def __init__(self, data_dir, checklist_roots=None):  # checklist_roots: no longer used
         self.dir = Path(data_dir).resolve()
         self.files = self.dir / "files"
         self.files.mkdir(parents=True, exist_ok=True)
         self.db_path = self.dir / "tickets.db"
-        self.roots = [Path(r).resolve() for r in checklist_roots]
         self.local = threading.local()
         self.write_lock = threading.Lock()
         db = self.db()
         db.executescript(SCHEMA)
         # 1 -> 2 added the users table, 2 -> 3 the settings table, 3 -> 4 the
         # deps table, 4 -> 5 the chat tables, 5 -> 6 the wiki tables (all
-        # created above); the columns are added here.
+        # created above); the columns are added here (6 -> 7: uploaded
+        # checklists; tickets.checklist_path is no longer used).
         for table, col, decl in (("tickets", "assignee", "TEXT"), ("users", "guidance", "TEXT"),
                                  ("tickets", "kind", "TEXT NOT NULL DEFAULT 'task'"), ("tickets", "epic_id", "TEXT"),
                                  ("tickets", "proposed", "INTEGER NOT NULL DEFAULT 0"),
-                                 ("tickets", "declined", "INTEGER NOT NULL DEFAULT 0")):
+                                 ("tickets", "declined", "INTEGER NOT NULL DEFAULT 0"),
+                                 ("tickets", "checklist_md", "TEXT"), ("tickets", "checklist_by", "TEXT"),
+                                 ("tickets", "checklist_at", "REAL")):
             if col not in {r[1] for r in db.execute(f"PRAGMA table_info({table})")}:
                 db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
         db.execute("CREATE INDEX IF NOT EXISTS tickets_assignee ON tickets(assignee, status)")
@@ -414,7 +457,9 @@ class Store:
             "WHERE d.ticket_id = ? AND p.status != 'done' ORDER BY p.id", (tid,))]
 
     def _links(self, t):
-        """Add what a list needs to show: blockers, the epic's title, an epic's progress."""
+        """Add what a list needs to show: blockers, the epic's title, an epic's progress, checklist progress."""
+        if "checklist_md" in t:
+            t["checklist"] = checklist_summary(t)
         t["blocked_by"] = self.blockers(t["id"])
         if t.get("epic_id"):
             row = self.db().execute("SELECT title FROM tickets WHERE id = ?", (t["epic_id"],)).fetchone()
@@ -437,7 +482,7 @@ class Store:
             "SELECT * FROM attachments WHERE ticket_id = ? ORDER BY created_at, id", (t["id"],))]
         t["events"] = [dict(r) for r in db.execute(
             "SELECT * FROM events WHERE ticket_id = ? ORDER BY at, id", (t["id"],))]
-        t["checklist"] = self.checklist(t["checklist_path"])
+        t["checklist"] = checklist_summary(t, items=True)
         t["depends_on"] = [dict(r) for r in db.execute(
             "SELECT p.id, p.title, p.status, p.declined FROM deps d JOIN tickets p ON p.id = d.depends_on "
             "WHERE d.ticket_id = ? ORDER BY p.id", (t["id"],))]
@@ -459,38 +504,6 @@ class Store:
         if not row:
             raise ApiError(404, "no such file")
         return dict(row)
-
-    def checklist(self, path):
-        """The checklist file an agent pointed the ticket at: its items
-        ("- [ ] ..." / "- [x] ...") and other lines, if it's readable and
-        under one of the allowed roots."""
-        if not path:
-            return None
-        out = {"path": path, "readable": False, "items": [], "done": 0, "total": 0}
-        try:
-            p = Path(path).expanduser().resolve()
-        except (OSError, RuntimeError):
-            out["error"] = "not a valid path"
-            return out
-        if not any(p == r or r in p.parents for r in self.roots):
-            out["error"] = "outside the allowed checklist folders"
-            return out
-        try:
-            text = p.read_text(errors="replace")[:200_000]
-        except OSError as e:
-            out["error"] = e.strerror or "can't read it"
-            return out
-        out["readable"] = True
-        for line in text.splitlines():
-            m = re.match(r"\s*[-*]\s+\[([ xX])\]\s+(.*)", line)
-            if m:
-                done = m.group(1).lower() == "x"
-                out["items"].append({"done": done, "text": m.group(2)})
-                out["total"] += 1
-                out["done"] += done
-            elif line.strip():
-                out["items"].append({"text": line.strip(), "note": True})
-        return out
 
     # --- writes
     def _event(self, db, tid, actor, role, field, old, new, now):
@@ -534,6 +547,8 @@ class Store:
             raise ApiError(403, f"ticket {t['id']} is assigned to {t['assignee']}: you can only comment on it")
 
     def create(self, data, actor, role):
+        if data.get("checklist_path"):
+            raise ApiError(400, GONE)
         title = str(data.get("title") or "").strip()
         if not title:
             raise ApiError(400, "a ticket needs a title")
@@ -571,11 +586,10 @@ class Store:
             tid = new_id(lambda x: db.execute("SELECT 1 FROM tickets WHERE id = ?", (x,)).fetchone())
             with db:
                 # Tickets an agent creates are proposals until a human accepts them.
-                db.execute("INSERT INTO tickets (id, title, description, status, priority, checklist_path, created_by, "
-                           "created_at, updated_at, assignee, kind, epic_id, proposed) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                db.execute("INSERT INTO tickets (id, title, description, status, priority, created_by, "
+                           "created_at, updated_at, assignee, kind, epic_id, proposed) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                            (tid, title, str(data.get("description") or ""), status, priority,
-                            data.get("checklist_path") or None, actor, now, now, assignee, kind, epic_id,
-                            1 if role == "agent" else 0))
+                            actor, now, now, assignee, kind, epic_id, 1 if role == "agent" else 0))
                 self._event(db, tid, actor, role, "proposed" if role == "agent" else "created", None, status, now)
                 for d in deps:
                     db.execute("INSERT OR IGNORE INTO deps (ticket_id, depends_on) VALUES (?, ?)", (tid, d))
@@ -584,10 +598,11 @@ class Store:
         return self._links(self.ticket(tid))
 
     def update(self, tid, data, actor, role):
-        fields = {k: data[k] for k in ("title", "description", "status", "priority", "checklist_path", "assignee",
-                                        "epic_id") if k in data}
+        if "checklist_path" in data:
+            raise ApiError(400, GONE)
+        fields = {k: data[k] for k in ("title", "description", "status", "priority", "assignee", "epic_id") if k in data}
         if not fields:
-            raise ApiError(400, "nothing to change (title, description, status, priority, checklist_path, assignee, epic_id)")
+            raise ApiError(400, "nothing to change (title, description, status, priority, assignee, epic_id)")
         if "assignee" in fields:
             fields["assignee"] = self._check_assignee(fields["assignee"])
         if "epic_id" in fields:
@@ -627,8 +642,6 @@ class Store:
             now = time.time()
             with db:
                 for k, v in fields.items():
-                    if v == "" and k == "checklist_path":
-                        v = None
                     if t[k] != v:
                         db.execute(f"UPDATE tickets SET {k} = ? WHERE id = ?", (v, t["id"]))
                         # Description edits are logged without their text.
@@ -636,6 +649,33 @@ class Store:
                                     None if k == "description" else v, now)
                 db.execute("UPDATE tickets SET updated_at = ? WHERE id = ?", (now, t["id"]))
         return self._links(self.ticket(t["id"]))
+
+    def put_checklist(self, tid, text, actor, role):
+        """The agent working a ticket reports its checklist: the whole file, replacing the last upload."""
+        t = self.ticket(tid)
+        if role != "agent":
+            raise ApiError(403, "checklists are reported by the agent working the ticket; ask it in a comment")
+        if not t["assignee"] or t["assignee"].lower() != actor.lower():
+            raise ApiError(403, f"only the agent working {t['id']} ({t['assignee'] or 'no one yet'}) reports its checklist")
+        if t["status"] != "in_progress":
+            raise ApiError(409, f"checklists are reported while a ticket is in progress; {t['id']} is {t['status']}")
+        if len(text) > CHECKLIST_MAX:
+            raise ApiError(413, "checklist too long")
+        text = text.strip()
+        if not text:
+            raise ApiError(400, "send the checklist's text as the body")
+        old = checklist_summary(dict(t))
+        new = parse_checklist(text)
+        if text != (t["checklist_md"] or ""):
+            now = time.time()
+            with self.write_lock:
+                db = self.db()
+                with db:
+                    db.execute("UPDATE tickets SET checklist_md = ?, checklist_by = ?, checklist_at = ?, updated_at = ? "
+                               "WHERE id = ?", (text, actor, now, now, t["id"]))
+                    self._event(db, t["id"], actor, role, "checklist", f"{old['done']}/{old['total']}" if old else None,
+                                f"{new['done']}/{new['total']}", now)
+        return {"checklist": self.detail(t["id"])["checklist"]}
 
     def review_proposal(self, tid, accept, ready, actor, role):
         """Accept (to the backlog, or ready) or decline (to done, marked
@@ -1511,6 +1551,8 @@ def card(t):
         extras.append(f'{t["comment_count"]} comment{"s" if t["comment_count"] != 1 else ""}')
     if t.get("attachment_count"):
         extras.append(f'{t["attachment_count"]} file{"s" if t["attachment_count"] != 1 else ""}')
+    if t.get("checklist") and t["checklist"]["total"]:
+        extras.append(f'☑ {t["checklist"]["done"]}/{t["checklist"]["total"]}')
     pr = '<span class="p1">High · </span>' if t["priority"] == 1 else ""
     if t.get("assignee"):
         extras.insert(0, f'<b>{esc(t["assignee"])}</b>')
@@ -1648,12 +1690,11 @@ def render_new(store, epic=None, prefill=("", "")):
 <div class="row"><label>Kind <select id="nt-kind"><option value="task">Ticket</option><option value="epic">Epic (a plan that groups tickets)</option></select></label>
 <label>Epic <select id="nt-epic">{epic_options(store, epic)}</select></label></div>
 <label>Must be done first (ticket ids, optional)<input type="text" id="nt-deps" placeholder="amber-otter, quiet-falcon"></label>
-<label>Checklist file (optional, a path on this machine)<input type="text" id="nt-ck" placeholder="/home/.../checklist.md"></label>
 <div><button class="primary">Create</button></div></form>
 <script>const $ = (id) => document.getElementById(id);
 $('nf').onsubmit = async (e) => {{ e.preventDefault();
  try {{ const t = await api('POST', '/api/tickets', {{title: $('nt-title').value, description: $('nt-desc').value,
-   status: $('nt-status').value, priority: +$('nt-prio').value, checklist_path: $('nt-ck').value || null,
+   status: $('nt-status').value, priority: +$('nt-prio').value,
    assignee: $('nt-who').value || null, kind: $('nt-kind').value, epic_id: $('nt-epic').value || null,
    depends_on: $('nt-deps').value}});
    location = '/t/' + t.id; }} catch (err) {{ fail(err); }} }};</script>"""
@@ -1814,6 +1855,8 @@ def render_ticket(store, tid):
         elif e["field"] == "depends_on":
             text = (f'{esc(e["actor"])} said <a href="/t/{esc(e["new"])}">{esc(e["new"])}</a> must be done first' if e["new"]
                     else f'{esc(e["actor"])} removed the dependency on {esc(e["old"])}')
+        elif e["field"] == "checklist":
+            text = f'{esc(e["actor"])} reported the checklist: {esc(e["new"])} done'
         elif e["field"] == "epic_id":
             text = (f'{esc(e["actor"])} moved it into epic <a href="/t/{esc(e["new"])}">{esc(e["new"])}</a>' if e["new"]
                     else f'{esc(e["actor"])} took it out of its epic')
@@ -1832,14 +1875,12 @@ def render_ticket(store, tid):
 
     ck = t["checklist"]
     if ck is None:
-        ckhtml = '<p class="meta">No checklist file.</p>'
-    elif not ck["readable"]:
-        ckhtml = f'<p class="meta">{esc(ck["path"])}</p><p class="err">{esc(ck.get("error", "unreadable"))}</p>'
+        ckhtml = '<p class="meta">None reported yet. The agent working the ticket uploads it as it goes.</p>'
     else:
         lis = "".join(f'<li class="note">{esc(i["text"])}</li>' if i.get("note") else
                       f'<li>{"<span class=x>☑</span>" if i["done"] else "☐"} {esc(i["text"])}</li>' for i in ck["items"])
         pct = round(100 * ck["done"] / ck["total"]) if ck["total"] else 0
-        ckhtml = (f'<p class="meta" style="overflow-wrap:anywhere">{esc(ck["path"])}</p>'
+        ckhtml = (f'<p class="meta">Reported by {esc(ck["updated_by"])} {ago(ck["updated_at"])}</p>'
                   + (f'<div class="meta">{ck["done"]} of {ck["total"]} done</div><div class="bar"><i style="width:{pct}%"></i></div>'
                      if ck["total"] else "") + f'<ul class="ck">{lis}</ul>')
 
@@ -1924,7 +1965,6 @@ def render_ticket(store, tid):
    <label>Title<input type="text" id="etitle" value="{esc(t['title'])}"></label>
    <label>Description<textarea id="edesc" rows="8">{esc(t['description'])}</textarea></label>
    <label>Priority<select id="eprio">{''.join(f'<option value="{k}"{" selected" if k == t["priority"] else ""}>{v}</option>' for k, v in PRIORITIES.items())}</select></label>
-   <label>Checklist file<input type="text" id="eck" value="{esc(t['checklist_path'] or '')}"></label>
    <button class="primary">Save</button></form></details></div>
 </aside></div>
 <script>
@@ -1954,7 +1994,7 @@ if (df) df.onsubmit = async (e) => {{ e.preventDefault();
 document.getElementById('ef').onsubmit = async (e) => {{
   e.preventDefault();
   try {{ await api('PATCH', '/api/tickets/' + TID, {{title: $('etitle').value, description: $('edesc').value,
-    priority: +$('eprio').value, checklist_path: $('eck').value}}); location.reload(); }} catch (err) {{ fail(err); }}
+    priority: +$('eprio').value}}); location.reload(); }} catch (err) {{ fail(err); }}
 }};
 </script>"""
     return page(f"{t['id']} {t['title']}", body, "", len(store.tickets(["review"])))
@@ -2308,6 +2348,9 @@ enough, or a request fails in a way you don't understand. Errors come back as `{
 ## Working a ticket
 
 - Comment as you go: `POST /api/tickets/ID/comments` `{{"body": "..."}}`.
+- Checklist: keep it in a markdown file on your machine ("- [ ] step"); after each step upload the whole
+  file: `PUT /api/tickets/ID/checklist` (body: the file's text, `Content-Type: text/markdown`). Each upload
+  replaces the last; your file is the source. Only while the ticket is yours and in progress.
 - Files: `POST /api/tickets/ID/attachments?filename=NAME&comment_id=N`, raw bytes as the body.
 - Hand back: a comment starting "Done" or "Needs a decision", then `PATCH /api/tickets/ID` `{{"status": "review"}}`.
 - You may set ready, in_progress and review; never backlog or done. Backlog, done and other people's
@@ -2410,9 +2453,12 @@ proposed tickets, in one step.
    history and the checklist.
 3. Work. Comment at milestones and attach evidence (screenshots, short
    recordings, logs).
-4. Optional: keep a markdown checklist file ("- [ ] step" / "- [x] step")
-   and point the ticket at it (`checklist_path`). Humans see it with a
-   progress bar.
+4. Keep a markdown checklist on your machine ("- [ ] step" / "- [x] step")
+   and upload the whole file after each step: `PUT /api/tickets/ID/checklist`
+   with its text as the body. Each upload replaces the last one; it's a
+   report for the humans (they see it with a progress bar), and your file
+   stays the source. Only you can upload it, while the ticket is assigned
+   to you and in progress.
 5. Hand back: post a comment, then `PATCH` the status to review. A good
    hand-off comment says:
    - **Done** or **Needs a decision** (first line, so it's clear which).
@@ -2467,13 +2513,14 @@ letters, like `KAMI`). Any case works, and a space for the hyphen in JSON.
     GET   /api/tickets               {"tickets": [...]}; filters: ?status=ready,in_progress  ?q=text
                                      ?assignee=me (or a name, or "none")  ?epic=ID  ?kind=epic  ?proposed=1
     GET   /api/tickets/ID            one ticket, with comments, attachments, events, checklist
-    POST  /api/tickets               {"title", "description", "priority": 1|2|3, "checklist_path",
+    POST  /api/tickets               {"title", "description", "priority": 1|2|3,
                                       "kind": "task"|"epic", "epic_id", "depends_on": ["amber-otter", ...]}
                                      -> the new ticket (a proposal, in the backlog)
     POST  /api/tickets/ID/deps       {"depends_on": "amber-otter"}: amber-otter must be done before ID
     DELETE /api/tickets/ID/deps/amber-otter   remove that dependency
-    PATCH /api/tickets/ID            any of {"status", "title", "description", "priority", "checklist_path", "assignee",
-                                      "epic_id"}
+    PATCH /api/tickets/ID            any of {"status", "title", "description", "priority", "assignee", "epic_id"}
+    PUT   /api/tickets/ID/checklist  your checklist's markdown as the body (or JSON {"text": "..."});
+                                     replaces the last upload
     POST  /api/tickets/ID/comments   {"body": "..."} -> the comment, with its "id"
     GET   /api/chat/unread           {"unread": N, "conversations": [{..., "messages": [unread ones]}]}
     GET   /api/chat                  {"conversations": [{"id", "name", "members", "unread", "last_message"}]}
@@ -2509,13 +2556,13 @@ A ticket looks like:
     {"id": "amber-otter", "title": "...", "description": "...", "status": "in_progress", "assignee": "agent-1",
      "kind": "task", "epic_id": "quiet-falcon", "epic_title": "...", "proposed": 0, "declined": 0,
      "blocked_by": [], "depends_on": [{"id": "stony-brook", "title": "...", "status": "done"}], "unblocks": [...],
-     "priority": 2, "checklist_path": "/home/me/work/plan.md", "created_by": "frank",
+     "priority": 2, "created_by": "frank",
      "created_at": 1760000000.0, "updated_at": 1760000300.0,
      "comments": [{"id": 12, "author": "frank", "role": "human", "body": "...", "created_at": ...}],
      "attachments": [{"id": 3, "comment_id": 12, "filename": "demo.mp4", "mime": "video/mp4",
                       "size": 123456, "url": "/files/3/demo.mp4", ...}],
      "events": [{"field": "status", "old": "ready", "new": "in_progress", "actor": "agent-1", "at": ...}],
-     "checklist": {"path": "...", "readable": true, "done": 2, "total": 5, "items": [...]}}
+     "checklist": {"done": 2, "total": 5, "items": [...], "text": "...", "updated_by": "agent-1", "updated_at": ...}}
 
 Times are Unix seconds. Errors are `{"error": "what went wrong"}` with an
 HTTP status: 400 bad request, 401 missing or bad token, 403 not allowed
@@ -2532,6 +2579,8 @@ for you, 404 no such ticket, 409 conflict, 413 too large.
     tar czf build.tar.gz dist/ && curl -s -H "Authorization: Bearer $TOKEN" \\
          --data-binary @build.tar.gz "$URL/api/tickets/amber-otter/attachments?filename=build.tar.gz"
     curl -s -H "Authorization: Bearer $TOKEN" -o build.tar.gz "$URL/files/7/build.tar.gz"
+    curl -s -X PUT -H "Authorization: Bearer $TOKEN" -H "Content-Type: text/markdown" \\
+         --data-binary @checklist.md "$URL/api/tickets/amber-otter/checklist"
     curl -s -X PATCH -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \\
          -d '{"status": "review"}' "$URL/api/tickets/amber-otter"
 
@@ -2709,7 +2758,7 @@ class Handler(BaseHTTPRequestHandler):
             if method != "GET" and not bearer and self.headers.get("X-Tickets") != "1":
                 raise ApiError(403, "missing X-Tickets header")
 
-            m = re.fullmatch(rf"/api/tickets/({ID_PATH})(/comments|/attachments|/deps|/accept|/decline)?(?:/({ID_PATH}))?",
+            m = re.fullmatch(rf"/api/tickets/({ID_PATH})(/comments|/attachments|/checklist|/deps|/accept|/decline)?(?:/({ID_PATH}))?",
                              path)
             if method == "GET" and path == "/":
                 return self.html(render_dashboard(store))
@@ -2856,6 +2905,17 @@ class Handler(BaseHTTPRequestHandler):
                     return self.json(200, store.detail(tid))
                 if not sub and method == "PATCH":
                     return self.json(200, store.update(tid, self.body_json(), actor, role))
+                if sub == "/checklist" and method == "PUT":
+                    n = int(self.headers.get("Content-Length") or 0)
+                    if n > CHECKLIST_MAX * 4:
+                        raise ApiError(413, "checklist too long")
+                    raw = self.rfile.read(n).decode("utf-8", "replace") if n else ""
+                    if (self.headers.get("Content-Type") or "").startswith("application/json"):
+                        try:
+                            raw = str((json.loads(raw or "{}") or {}).get("text") or "")
+                        except (ValueError, AttributeError):
+                            raise ApiError(400, 'send the checklist as text, or JSON {"text": "..."}')
+                    return self.json(200, store.put_checklist(tid, raw, actor, role))
                 if sub == "/comments" and method == "POST":
                     return self.json(201, store.comment(tid, self.body_json().get("body"), actor, role))
                 if sub == "/attachments" and method == "POST":
@@ -2998,8 +3058,8 @@ def main():
     ap.add_argument("--port", type=int, default=int(os.environ.get("AT_PORT", 43917)))
     ap.add_argument("--data", default=os.environ.get("AT_DATA", str(Path(__file__).resolve().parent / "data")),
                     help="folder for the database, uploads and keys")
-    ap.add_argument("--checklist-root", action="append", default=None,
-                    help="a folder checklist files may live in (repeatable; default: your home folder)")
+    # Checklists are uploaded now; still accepted so older service files start.
+    ap.add_argument("--checklist-root", action="append", default=None, help=argparse.SUPPRESS)
     ap.add_argument("--max-upload-mb", type=int, default=int(os.environ.get("AT_MAX_UPLOAD_MB", 1024)))
     ap.add_argument("--human-name", default=os.environ.get("AT_HUMAN", "human"),
                     help="upgrading from the old two-key setup: the username the human key becomes")
@@ -3048,8 +3108,7 @@ def main():
             sys.exit(e.msg)
         return
     srv = make_server(a.host, a.port, a.data, roots, a.max_upload_mb, a.human_name)
-    print(f"agent-tickets on http://{a.host}:{a.port}  data: {Path(a.data).resolve()}  checklists under: {', '.join(roots)}",
-          flush=True)
+    print(f"agent-tickets on http://{a.host}:{a.port}  data: {Path(a.data).resolve()}", flush=True)
     if srv.migrated:
         print(f"Turned the old keys.json into users: {', '.join(srv.migrated)} (same tokens).", flush=True)
     if not srv.store.users():

@@ -260,22 +260,45 @@ class TicketsTest(unittest.TestCase):
 
     # --- checklists
     def test_checklist(self):
-        ck = self.allowed / "plan.md"
-        ck.write_text("# Plan\n- [x] scaffold\n- [ ] tests\n* [X] docs\n")
-        t = self.new(checklist_path=str(ck))
-        c = self.j("GET", f"/api/tickets/{t['id']}")[1]["checklist"]
-        self.assertTrue(c["readable"])
-        self.assertEqual((c["done"], c["total"]), (2, 3))
-        outside = self.new(checklist_path="/etc/passwd")
-        c = self.j("GET", f"/api/tickets/{outside['id']}")[1]["checklist"]
-        self.assertFalse(c["readable"])
-        self.assertNotIn("root", json.dumps(c))
-        sneaky = self.new(checklist_path=str(self.allowed / ".." / ".." / "etc" / "passwd"))
-        self.assertFalse(self.j("GET", f"/api/tickets/{sneaky['id']}")[1]["checklist"]["readable"])
+        tok = self.j("POST", "/api/users", {"username": "agent-k", "kind": "agent"}, role="human")[1]["token"]
+        t = self.new("in_progress", assignee="agent-k")
+        put = lambda text, token=tok, role=None, ctype="text/markdown": self.j(
+            "PUT", f"/api/tickets/{t['id']}/checklist", role=role, token=token, raw=text.encode(),
+            headers={"Content-Type": ctype})
+        code, got = put("# Plan\n- [x] scaffold\n- [ ] tests\n* [X] docs\n")
+        self.assertEqual((code, got["checklist"]["done"], got["checklist"]["total"]), (200, 2, 3), got)
+        self.assertEqual(got["checklist"]["updated_by"], "agent-k")
+        self.assertEqual(got["checklist"]["items"][0], {"text": "# Plan", "note": True})
+        # Each upload replaces the last; JSON works too; the same text again changes nothing.
+        put("- [x] scaffold\n- [x] tests")
+        self.assertEqual(put(json.dumps({"text": "- [x] scaffold\n- [x] tests"}), ctype="application/json")[1]
+                         ["checklist"]["total"], 2)
+        events = [e for e in self.j("GET", f"/api/tickets/{t['id']}", role="human")[1]["events"] if e["field"] == "checklist"]
+        self.assertEqual([(e["old"], e["new"]) for e in events], [(None, "2/3"), ("2/3", "2/2")])
+        # Only the agent working it, while it's in progress.
+        self.assertEqual(put("- [ ] x", token=None, role="human")[0], 403)  # humans don't edit it
+        self.assertEqual(put("- [ ] x", token=self.keys["agent"])[0], 403)  # another agent
+        self.assertEqual(put("   ")[0], 400)
+        self.assertEqual(put("x" * (at.CHECKLIST_MAX + 1))[0], 413)
+        self.j("PATCH", f"/api/tickets/{t['id']}", {"status": "review"}, role=None, token=tok)
+        self.assertEqual(put("- [ ] late")[0], 409)
+        # Lists and pages show progress; the old path field is refused with directions.
+        listed = [x for x in self.j("GET", "/api/tickets?status=review", role="human")[1]["tickets"] if x["id"] == t["id"]][0]
+        self.assertEqual((listed["checklist"]["done"], "items" in listed["checklist"]), (2, False))
+        html = self.call("GET", f"/t/{t['id']}", role="human")[1].decode()
+        self.assertIn("2 of 2 done", html)
+        self.assertIn("reported the checklist: 2/2 done", html)
+        self.assertIn("☑ 2/2", self.call("GET", "/", role="human")[1].decode())
+        for method, path, body in (("POST", "/api/tickets", {"title": "x", "checklist_path": "/etc/passwd"}),
+                                   ("PATCH", f"/api/tickets/{t['id']}", {"checklist_path": "/etc/passwd"})):
+            code, err = self.j(method, path, body, role="human")
+            self.assertEqual(code, 400)
+            self.assertIn("PUT /api/tickets/ID/checklist", err["error"])
+        self.assertIsNone(self.j("GET", f"/api/tickets/{self.new()['id']}")[1]["checklist"])
 
     # --- backups
     def test_export_and_restore(self):
-        t = self.new("in_progress", title="Back me up", checklist_path=str(self.allowed / "x.md"))
+        t = self.new("in_progress", title="Back me up")
         c = self.j("POST", f"/api/tickets/{t['id']}/comments", {"body": "progress"})[1]
         clip = bytes(range(256)) * 20
         self.j("POST", f"/api/tickets/{t['id']}/attachments?filename=clip.mp4&comment_id={c['id']}", raw=clip,
