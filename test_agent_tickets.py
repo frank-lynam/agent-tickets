@@ -1130,7 +1130,7 @@ class TicketsTest(unittest.TestCase):
     def test_new_page_kind_first(self):
         html = self.call("GET", "/new", role="human")[1].decode()
         self.assertLess(html.index('class="kinds"'), html.index('id="nt-title"'))  # the kind comes first
-        self.assertEqual(html.count('class="row task-only"') + html.count('class="task-only"'), 3)
+        self.assertEqual(len(re.findall(r'class="[^"]*task-only', html)), 3)
         # An epic created with ticket-only fields ignores them: backlog, no assignee.
         e = self.j("POST", "/api/tickets", {"title": "Plan", "kind": "epic", "status": "ready", "assignee": "tester"},
                    role="human")[1]
@@ -1210,6 +1210,21 @@ class TicketsTest(unittest.TestCase):
         self.assertEqual(me(), 1)
         self.j("POST", f"/api/chat/{g['id']}/read", {}, role=None, token=tok)
         self.assertEqual(me(), 0)
+
+    def test_dependency_suggestions(self):
+        e = self.new("backlog", title="Suggest plan", kind="epic")
+        a = self.new("ready", title="suggest me", epic_id=e["id"])
+        done = self.new("ready", title="finished one", epic_id=e["id"])
+        self.j("PATCH", f"/api/tickets/{done['id']}", {"status": "done"}, role="human")
+        c = self.new("ready", title="the one with deps", epic_id=e["id"])
+        page = self.call("GET", f"/t/{c['id']}", role="human")[1].decode()
+        line = [l for l in page.splitlines() if l.startswith("const DEP_CANDIDATES = ")][0]
+        cands = {x["id"]: x for x in json.loads(line[len("const DEP_CANDIDATES = "):-1])}
+        self.assertEqual(cands[a["id"]]["epic"], e["id"])
+        self.assertNotIn(done["id"], cands)  # finished tickets aren't offered
+        self.assertNotIn(e["id"], cands)     # nor epics
+        self.assertIn("depPicker($('dep')", page)
+        self.assertIn("depPicker($('nt-deps')", self.call("GET", "/new", role="human")[1].decode())
 
     def test_skill(self):
         code, body, h = self.call("GET", "/api/skill", role="agent", headers={"Host": "tickets.example:43917"})

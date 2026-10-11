@@ -1721,6 +1721,12 @@ html[data-role=guest] :is(#cf,#mf,#sf,#ef,#df,#wf,#am,#nf,#uf,details:has(#ef),a
 nav a[href="/new"],button[onclick]:not(.navx):not([onclick^="copyWikiLink"]):not([onclick^="pickTheme"]):not([onclick="location.reload()"])){display:none!important}
 html[data-role=guest] :is(.row:has(> #prio),h2:has(+ #cf),a[href^="/new"],a[href^="/wiki-new"]){display:none!important}
 html[data-role=guest] select{pointer-events:none;opacity:.75}
+.acw{position:relative}
+.ac{position:absolute;z-index:40;top:100%;left:0;right:0;margin-top:2px;max-height:280px;overflow:auto;background:var(--panel);
+border:1px solid var(--line);border-radius:8px;box-shadow:0 6px 18px rgba(0,0,0,.18);font-size:14px}
+.ac-h{padding:6px 10px 2px;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--dim)}
+.ac-i{padding:7px 10px;cursor:pointer}.ac-i.on,.ac-i:hover{background:var(--prog-bg)}
+.ac-i .id{margin-right:4px}
 .kinds{display:grid;grid-template-columns:1fr 1fr;gap:8px}
 .kinds button{display:grid;gap:2px;text-align:left;padding:10px 12px;border-width:2px;font-weight:400}
 .kinds button b{font-size:16px}
@@ -2206,6 +2212,68 @@ def epic_options(store, current=None):
     return "".join(opts)
 
 
+def dep_candidates(store):
+    """Open tickets that could be a predecessor, for the dependency pickers (as a <script> line)."""
+    rows = [{"id": r["id"], "title": r["title"], "status": r["status"], "epic": r["epic_id"]}
+            for r in store.db().execute(
+                "SELECT id, title, status, epic_id FROM tickets WHERE kind = 'task' AND status != 'done' "
+                "ORDER BY updated_at DESC LIMIT 600")]
+    return "const DEP_CANDIDATES = " + json.dumps(rows).replace("</", "<\\/") + ";"
+
+
+# A dropdown for the dependency fields: the open tickets in the same epic as soon
+# as you're in the field, then any open ticket whose id or title matches what you
+# type (same epic first). Arrows and Enter, or a click, choose one.
+DEP_PICKER_JS = """
+function depPicker(input, opts){
+  const menu = document.createElement('div');
+  menu.className = 'ac'; menu.hidden = true; menu.setAttribute('role', 'listbox');
+  input.parentNode.insertBefore(menu, input.nextSibling);
+  input.setAttribute('autocomplete', 'off'); input.setAttribute('aria-autocomplete', 'list');
+  let items = [], at = -1;
+  const word = () => opts.multi ? input.value.split(',').pop().trim() : input.value.trim();
+  const chosen = () => opts.multi ? input.value.split(',').map(x => x.trim().toLowerCase()).filter(Boolean) : [];
+  function show(){
+    const q = word().toLowerCase(), epic = opts.epic(), skip = new Set([...opts.exclude(), ...chosen()]);
+    const fit = DEP_CANDIDATES.filter(c => !skip.has(c.id.toLowerCase()) && (q
+      ? c.id.toLowerCase().includes(q) || c.title.toLowerCase().includes(q) : epic && c.epic === epic));
+    fit.sort((a, b) => (b.epic === epic && !!epic) - (a.epic === epic && !!epic));
+    items = fit.slice(0, 12); at = items.length ? 0 : -1;
+    if (!items.length) { menu.hidden = true; return; }
+    let html = '', group = null;
+    items.forEach((c, i) => {
+      const g = epic && c.epic === epic ? 'In this epic' : 'Other open tickets';
+      if (g !== group) { html += '<div class="ac-h">' + g + '</div>'; group = g; }
+      html += '<div class="ac-i" role="option" data-i="' + i + '"><span class="id">' + c.id + '</span> ' +
+        c.title.replace(/[&<>]/g, ch => ({'&': '&amp;', '<': '&lt;', '>': '&gt;'}[ch])) +
+        ' <span class="meta">' + c.status.replace('_', ' ') + '</span></div>';
+    });
+    menu.innerHTML = html; menu.hidden = false; mark();
+  }
+  function mark(){ menu.querySelectorAll('.ac-i').forEach(el => el.classList.toggle('on', +el.dataset.i === at)); }
+  function pick(i){
+    const c = items[i]; if (!c) return;
+    if (opts.multi) { const parts = input.value.split(','); parts.pop(); parts.push(' ' + c.id);
+      input.value = parts.map(x => x.trim()).filter(Boolean).join(', ') + ', '; }
+    else input.value = c.id;
+    menu.hidden = true; input.focus();
+    if (opts.onPick) opts.onPick(c); else show();
+  }
+  input.addEventListener('focus', show);
+  input.addEventListener('input', show);
+  input.addEventListener('blur', () => setTimeout(() => { menu.hidden = true; }, 150));
+  menu.addEventListener('mousedown', (e) => { const el = e.target.closest('.ac-i'); if (el) { e.preventDefault(); pick(+el.dataset.i); } });
+  input.addEventListener('keydown', (e) => {
+    if (menu.hidden) return;
+    if (e.key === 'ArrowDown') { at = Math.min(items.length - 1, at + 1); mark(); e.preventDefault(); }
+    else if (e.key === 'ArrowUp') { at = Math.max(0, at - 1); mark(); e.preventDefault(); }
+    else if (e.key === 'Enter' && at >= 0) { e.preventDefault(); pick(at); }
+    else if (e.key === 'Escape') { menu.hidden = true; }
+  });
+}
+"""
+
+
 NEW_JS = """
 const $ = (id) => document.getElementById(id);
 // Ticket or epic: an epic is a plan that groups tickets, so the ticket-only fields go away.
@@ -2227,6 +2295,7 @@ $('nf').onsubmit = async (e) => {
   try { const t = await api('POST', '/api/tickets', data); location = '/t/' + t.id; } catch (err) { fail(err); }
 };
 setKind('task');
+depPicker($('nt-deps'), {multi: true, epic: () => $('nt-epic').value, exclude: () => []});
 """
 
 
@@ -2246,9 +2315,10 @@ def render_new(store, epic=None, prefill=("", "")):
 <label>Priority <select id="nt-prio"><option value="1">High</option><option value="2" selected>Normal</option><option value="3">Low</option></select></label>
 <label>Assign to <select id="nt-who">{assignee_options(store)}</select></label></div>
 <div class="row task-only"><label>Epic <select id="nt-epic">{epic_options(store, epic)}</select></label></div>
-<label class="task-only">Must be done first (ticket ids, optional)<input type="text" id="nt-deps" placeholder="amber-otter, quiet-falcon"></label>
+<label class="task-only acw">Must be done first (optional: pick from the list, or type ids or words)
+<input type="text" id="nt-deps" placeholder="amber-otter, quiet-falcon"></label>
 <div><button class="primary" id="nt-go">Create ticket</button></div></form>
-<script>{NEW_JS}</script>"""
+<script>{dep_candidates(store)}{DEP_PICKER_JS}{NEW_JS}</script>"""
     return page("New ticket", body, "/new", len(store.tickets(["review"])))
 
 
@@ -2598,8 +2668,9 @@ def render_ticket(store, tid):
         side_links = (f'<h2>Epic</h2><div class="box"><select id="epic" aria-label="Epic" onchange="setEpic(this.value)">'
                       f'{epic_options(store, t["epic_id"])}</select></div>'
                       f'<h2>Must be done first</h2><div class="box">{link_list(t["depends_on"], True)}'
-                      f'<form class="row" id="df"><input type="text" id="dep" placeholder="ticket id" aria-label="Add a predecessor" '
-                      f'style="flex:1;min-width:90px"><button>Add</button></form></div>'
+                      f'<form class="row" id="df"><span class="acw" style="flex:1;min-width:120px"><input type="text" id="dep" '
+                      f'placeholder="pick or type an id or words" aria-label="Add a predecessor"></span><button>Add</button></form>'
+                      f'</div>'
                       f'<h2>Unblocks</h2><div class="box">{link_list(t["unblocks"])}</div>')
 
     s = t["status"]
@@ -2682,6 +2753,11 @@ const df = document.getElementById('df');
 if (df) df.onsubmit = async (e) => {{ e.preventDefault();
   try {{ await api('POST', '/api/tickets/' + TID + '/deps', {{depends_on: $('dep').value.trim()}}); location.reload(); }}
   catch (err) {{ fail(err); }} }};
+{dep_candidates(store) if t["kind"] == "task" else ""}
+if (df) {{ {DEP_PICKER_JS}
+  depPicker($('dep'), {{epic: () => {json.dumps(t["epic_id"] or "")},
+    exclude: () => {json.dumps([t["id"].lower()] + [d["id"].lower() for d in t["depends_on"]])},
+    onPick: () => df.requestSubmit()}}); }}
 {PROPOSAL_JS}
 {LIVE_JS}
 enterSends('cbody', 'cf');
