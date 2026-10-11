@@ -1243,10 +1243,32 @@ class Store:
             f"WHERE d.ticket_id = t.id AND p.status != 'done') ORDER BY t.priority, t.created_at",
             (status, user) if assigned else (status,))]
 
+    def comments_owed(self, user, tid=None):
+        """The user's open tickets (or just `tid`) with comments from humans posted since the user last
+        commented there: they stay until the user replies on the ticket. [{"id", "title", "status",
+        "new_comments", "from", "why"}], newest activity first."""
+        sql = ("SELECT t.id, t.title, t.status, COUNT(c.id) AS n, GROUP_CONCAT(DISTINCT c.author) AS who, "
+               "MAX(c.id) AS last FROM tickets t JOIN comments c ON c.ticket_id = t.id "
+               "WHERE t.assignee = ? COLLATE NOCASE AND t.status != 'done' AND t.kind = 'ticket' AND c.role = 'human' "
+               "AND c.author != ? COLLATE NOCASE AND c.id > COALESCE((SELECT MAX(m.id) FROM comments m "
+               "WHERE m.ticket_id = t.id AND m.author = ? COLLATE NOCASE), 0)")
+        args = [user, user, user]
+        if tid:
+            sql += " AND t.id = ?"
+            args.append(tid)
+        out = []
+        for r in self.db().execute(sql + " GROUP BY t.id ORDER BY last DESC", args):
+            who = ", ".join(sorted(set((r["who"] or "").split(","))))
+            out.append({"id": r["id"], "title": r["title"], "status": r["status"], "new_comments": r["n"],
+                        "from": who.split(", "),
+                        "why": f"{who} commented ({r['n']} new): read it and reply on the ticket"})
+        return out
+
     def wait_for(self, user, timeout, queue=False):
-        """What `user` should do next, as soon as there's anything: unread chat; replies or changes on
-        their tickets since the call began; their in-progress tickets; their ready tickets; with `queue`,
-        anyone's ready tickets. Only when there's none of that does it wait (up to `timeout` seconds)."""
+        """What `user` should do next, as soon as there's anything: chat they owe; humans' comments on
+        their tickets they haven't replied to; other changes to their tickets since the call began; their
+        in-progress and ready tickets; with `queue`, anyone's ready tickets. Only when there's none of that
+        does it wait (up to `timeout` seconds)."""
         marks, end = self._marks(), time.time() + timeout
         steps = [("queue", lambda: self.outstanding(user, "ready", assigned=False) if queue else [],
                   "ready for anyone: take it with POST /api/next")]
@@ -1254,6 +1276,9 @@ class Store:
             notice = self.chat_notice(user)
             if notice:
                 return {"reason": "chat", "chat": notice, "tickets": []}
+            owed = self.comments_owed(user)
+            if owed:
+                return {"reason": "comments", "chat": None, "tickets": owed}
             news = self.news_for(user, marks, queue)
             if news:
                 return {"reason": "tickets", "chat": None, "tickets": news}
@@ -1839,6 +1864,7 @@ dl.kv{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;margin:0;font-siz
 dl.kv dt{color:var(--dim)}dl.kv dd{margin:0;overflow-wrap:anywhere}
 .err{color:var(--review)}
 .cbtns{gap:6px}
+.unanswered{margin:8px 4px 0;color:var(--review)}
 button.cancel{margin-left:auto;color:var(--review);border-color:transparent;background:transparent}
 a.wl.missing{color:var(--review);text-decoration-style:dashed}
 .wlink{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:4px 0 0}
@@ -2783,6 +2809,10 @@ def render_ticket(store, tid):
                            f'<button data-move="{"backlog" if t["cancelled"] or t["declined"] else "in_progress"}">Comment &amp; reopen</button>')
     else:
         comment_buttons = '<button class="primary" id="csend">Comment</button>'
+    owed = store.comments_owed(t["assignee"], t["id"]) if t["assignee"] and s != "done" else []
+    unanswered = (f'<p class="meta unanswered">{esc(t["assignee"])} hasn\'t answered '
+                  f'{"your latest comment" if owed[0]["new_comments"] == 1 else str(owed[0]["new_comments"]) + " comments"} '
+                  f'yet.</p>' if owed and store.user(t["assignee"])["kind"] == "agent" else "")
     if s == "review" and t["kind"] == "ticket" and not t["proposed"]:
         handoff = next((c["body"] for c in reversed(t["comments"]) if c["role"] == "agent"), "")
         first = handoff.strip().lower()
@@ -2816,7 +2846,7 @@ def render_ticket(store, tid):
   <select id="prio" class="as" onchange="setPrio(this.value)">{''.join(f'<option value="{k}"{" selected" if k == t["priority"] else ""}>{v}</option>' for k, v in PRIORITIES.items())}</select></div>
  {epic_box}
  <h2>Activity</h2><div class="tl" id="tl">{timeline}</div>
- <h2>Comment</h2><form class="stack box" id="cf">
+ {unanswered}<h2>Comment</h2><form class="stack box" id="cf">
   <textarea id="cbody" placeholder="Feedback, a decision, or a question for the agent (Enter posts it as a comment only; Shift+Enter for a new line)" aria-label="Comment"></textarea>
   <div class="row"><input type="file" id="cfiles" multiple aria-label="Attach files"></div>
   <div class="row cbtns">{comment_buttons}</div></form>
@@ -3295,6 +3325,8 @@ enough, or a request fails in a way you don't understand. Errors come back as `{
   "already in progress" (you put it there). Only other people's in-progress tickets are comment-only. Each
   ticket from the API has a `what_now` line saying what it means for you; follow it.
 - Comment as you go: `POST /api/tickets/ID/comments` `{{"body": "..."}}`.
+- A human's comment on your ticket waits for your reply: `/api/wait` returns it (reason `comments`) and the
+  ticket shows `new_comments`, until you comment on that ticket. Read it, act on it, reply (even briefly).
 - Checklist: keep it in a markdown file on your machine ("- [ ] step"); after each step upload the whole
   file: `PUT /api/tickets/ID/checklist` (body: the file's text, `Content-Type: text/markdown`). Each upload
   replaces the last; your file is the source. Only while the ticket is yours and in progress.
@@ -3483,6 +3515,13 @@ proposed tickets, in one step.
    `/api/wait` keeps handing your in-progress tickets back to you.
 7. After review a human may move it back to in_progress or ready with a
    comment saying what to change. Read their comment first.
+8. **A human's comment on your ticket waits for your reply.** Whenever a
+   human comments on a ticket assigned to you (not done), it stays on your
+   list until you comment on that ticket: `/api/wait` returns it (reason
+   `comments`) right after chat, the ticket shows `"new_comments": N`, and
+   its `what_now` starts with who left them. Read them, act on them, and
+   reply, even briefly ("Got it, doing that next"). Other agents' comments
+   don't need a reply.
 
 ## Chat
 
@@ -3520,10 +3559,14 @@ offers, and write down how in your skill.**
   anything, it returns at once, the first of these that applies:
   1. `{"reason": "chat", "chat": {...}}`: there's chat in your inbox. Answer it
      (or mark it read).
-  2. `{"reason": "tickets", "tickets": [{"id", "title", "status", "why"}]}`:
+  2. `{"reason": "comments", "tickets": [{"id", "title", "status", "new_comments", "from", "why"}]}`:
+     a human commented on one of your tickets and you haven't replied there
+     yet. Read the new comments (`GET /api/tickets/ID`) and reply on the
+     ticket. They stay on this list until you do, even a short reply.
+  3. `{"reason": "tickets", "tickets": [{"id", "title", "status", "why"}]}`:
      while you were waiting, someone else commented on or changed a ticket
      assigned to you, or assigned you one. Read it and act on it.
-  3. `{"reason": "in_progress" or "ready", "tickets": [...]}`: your work,
+  4. `{"reason": "in_progress" or "ready", "tickets": [...]}`: your work,
      in the order to do it: your in-progress and ready tickets, **highest
      priority first; at the same priority, ones you've started before ones
      you haven't, then the nearest to done** (by checklist, `"progress":
@@ -3531,14 +3574,14 @@ offers, and write down how in your skill.**
      Work the list top down: continue the first if it's in progress, or
      start it if it's ready. Finish what you've started before taking new
      work.
-  4. `{"reason": "queue", "tickets": [...]}`: only with `&queue=1`:
+  5. `{"reason": "queue", "tickets": [...]}`: only with `&queue=1`:
      unassigned ready tickets. Take one with `POST /api/next`.
   Only when none of these applies does it wait, and it returns the moment
   one does, or `{"reason": "timeout"}` when time is up (then call it
   again). Blocked tickets never count. The longest timeout is 300 seconds;
   keep it under 100 if a proxy sits in front of this server (many cut long
   requests), and loop.
-- Because of 1 and 3, it returns straight away until you've dealt with
+- Because of 1, 2 and 4, it returns straight away until you've dealt with
   them: answer chat, and finish your in-progress tickets or hand them
   back. **Don't park work in in_progress:** if you're stuck waiting on a
   decision or on someone else, move the ticket to review with a comment
@@ -3624,7 +3667,7 @@ silently. Errors are `{"error": "..."}`.
 Start here
 
     GET    /api                        this briefing (no token needed); GET /api/skill: a SKILL.md for it
-    GET    /api/me                     {"username", "kind", "guidance", "chat_inbox", "prefs"}
+    GET    /api/me                     {"username", "kind", "guidance", "chat_inbox", "comments_to_answer", "prefs"}
     GET    /api/wait?timeout=50        what to do now: chat, replies, your work in order (see above)
     POST   /api/next                   take a new ticket: {"ticket": ... or null, "guidance", "in_progress"
                                        (any you've already started: finish those first), "note"}
@@ -3758,6 +3801,10 @@ def docs_for(store, actor, role):
     if unread:
         lines.append(f"**You have {unread} chat message{'s' if unread != 1 else ''} to answer. Reply first:** "
                      "`GET /api/chat/inbox`.")
+    owed = store.comments_owed(actor)
+    if owed:
+        lines.append("**Comments from humans waiting for your reply** (reply on each ticket):")
+        lines += [f"- {o['id']}: {o['title']} ({o['why'].split(':')[0]})" for o in owed]
     lines.append(f"Tickets: {counts.get('ready', 0)} ready, {counts.get('in_progress', 0)} in progress, "
                  f"{counts.get('review', 0)} waiting for review, {counts.get('backlog', 0)} in the backlog.")
     if mine:
@@ -3871,6 +3918,15 @@ class Handler(BaseHTTPRequestHandler):
                 if isinstance(t, dict) and "status" in t and "id" in t and "kind" in t:
                     t["what_now"] = what_now(t, actor)
                     mine = (t.get("assignee") or "").lower() == actor.lower()
+                    if mine and t["status"] != "done" and t["kind"] == "ticket":
+                        owed = self.server.store.comments_owed(actor, t["id"])
+                        t["new_comments"] = owed[0]["new_comments"] if owed else 0
+                        if owed:
+                            o = owed[0]
+                            t["what_now"] = (f"{', '.join(o['from'])} left {o['new_comments']} new comment"
+                                             f"{'s' if o['new_comments'] != 1 else ''} here: read "
+                                             f"{'them' if o['new_comments'] != 1 else 'it'} and reply on this ticket "
+                                             f"first. Then: " + t["what_now"])
                     if mine and t["status"] == "in_progress" and t["kind"] == "ticket":
                         nudge = self.server.store.comment_nudge(t["id"], actor)
                         if nudge:
@@ -4090,6 +4146,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json(200, {"username": actor, "kind": role, "guidance": store.guidance_for(actor),
                                        "chat_inbox": (sum(len(c["messages"]) for c in store.chat_attention(actor))
                                                        if role == "agent" else store.unread_total(actor)),
+                                       "comments_to_answer": sum(o["new_comments"] for o in store.comments_owed(actor)),
                                        "prefs": store.prefs(actor)})
             if path == "/api/me/prefs":
                 if method == "GET":

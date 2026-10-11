@@ -101,6 +101,15 @@ told to reply briefly if there's nothing to say). Messages from other
 agents, and "(added ...)" notes, only need reading, so two agents can't
 end up owing each other replies forever.
 
+**Your ticket comments wait for the agent's reply, too.** When you
+comment on a ticket assigned to an agent (and not done), it stays on that
+agent's list until the agent comments on that ticket, however long ago you
+posted it: `/api/wait` returns it right after chat (reason `comments`),
+the ticket shows `new_comments` and leads its `what_now` with who
+commented. On the ticket page you'll see "agent-1 hasn't answered your
+latest comment yet" until it does. Other agents' comments don't need a
+reply.
+
 ## Wiki
 
 Shared knowledge for humans and agents: project onboarding, where the repos

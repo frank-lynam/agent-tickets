@@ -983,9 +983,10 @@ class TicketsTest(unittest.TestCase):
         later(lambda: self.j("POST", f"/api/tickets/{high['id']}/comments", {"body": "use plan B"}, role="human"))
         got, took = waited()
         self.assertEqual((got["reason"], got["tickets"][0]["id"], got["tickets"][0]["why"]),
-                         ("tickets", high["id"], "Frank commented"))
+                         ("comments", high["id"], "Frank commented (1 new): read it and reply on the ticket"))
         self.assertLess(took, 5)
-        # Its own changes don't wake it; being assigned a ticket does.
+        # It replies (which clears that); its own changes don't wake it; being assigned a ticket does.
+        self.j("POST", f"/api/tickets/{high['id']}/comments", {"body": "Plan B it is."}, role=None, token=tok)
         other = self.new("backlog", title="next one")
         later(lambda: self.j("POST", f"/api/tickets/{high['id']}/comments", {"body": "on it"}, role=None, token=tok))
         later(lambda: self.j("PATCH", f"/api/tickets/{other['id']}", {"assignee": "agent-z"}, role="human"), 1.2)
@@ -1381,6 +1382,40 @@ class TicketsTest(unittest.TestCase):
         self.assertIn("Conventions: `GET` never changes anything.", brief)
         for gone in ("claim=1", "/api/chat/unread", '"task"', "?peek", "chat/ID/files"):
             self.assertNotIn(gone, brief)
+
+    def test_comments_wait_for_a_reply(self):
+        tok = self.j("POST", "/api/users", {"username": "agent-cm", "kind": "agent"}, role="human")[1]["token"]
+        other = self.j("POST", "/api/users", {"username": "agent-cm2", "kind": "agent"}, role="human")[1]["token"]
+        t = self.new("in_progress", assignee="agent-cm", title="comment me")
+        self.j("POST", f"/api/tickets/{t['id']}/comments", {"body": "Starting."}, role=None, token=tok)
+        self.j("POST", f"/api/tickets/{t['id']}/comments", {"body": "Done."}, role=None, token=tok)
+        self.j("PATCH", f"/api/tickets/{t['id']}", {"status": "review"}, role=None, token=tok)
+        W = lambda: self.j("GET", "/api/wait?timeout=1", role=None, token=tok)[1]
+        self.assertEqual(W()["reason"], "timeout")
+        # Comments posted while the agent isn't waiting still reach it, next time it asks.
+        self.j("POST", f"/api/tickets/{t['id']}/comments", {"body": "Nice. One thing:"}, role="human")
+        self.j("POST", f"/api/tickets/{t['id']}/comments", {"body": "rename the button."}, role="human")
+        got = W()
+        self.assertEqual((got["reason"], got["tickets"][0]["id"], got["tickets"][0]["new_comments"], got["tickets"][0]["from"]),
+                         ("comments", t["id"], 2, ["Frank"]))
+        self.assertEqual(W()["reason"], "comments")  # and keeps doing so...
+        ticket = self.j("GET", f"/api/tickets/{t['id']}", role=None, token=tok)[1]
+        self.assertEqual(ticket["new_comments"], 2)
+        self.assertTrue(ticket["what_now"].startswith("Frank left 2 new comments here: read them and reply on this ticket first."))
+        self.assertEqual(self.j("GET", "/api/me", role=None, token=tok)[1]["comments_to_answer"], 2)
+        self.assertIn("Comments from humans waiting for your reply", self.call("GET", "/api", role=None, token=tok)[1].decode())
+        self.assertIn("agent-cm hasn't answered 2 comments yet", self.call("GET", f"/t/{t['id']}", role="human")[1].decode())
+        # ...until it replies on the ticket.
+        self.j("POST", f"/api/tickets/{t['id']}/comments", {"body": "Got it, renaming."}, role=None, token=tok)
+        self.assertEqual(W()["reason"], "timeout")
+        self.assertEqual(self.j("GET", f"/api/tickets/{t['id']}", role=None, token=tok)[1]["new_comments"], 0)
+        self.assertNotIn("hasn't answered", self.call("GET", f"/t/{t['id']}", role="human")[1].decode())
+        # Another agent's comment doesn't need a reply; finished tickets don't count.
+        self.j("POST", f"/api/tickets/{t['id']}/comments", {"body": "fyi"}, role=None, token=other)
+        self.assertEqual(W()["reason"], "timeout")
+        self.j("POST", f"/api/tickets/{t['id']}/comments", {"body": "Shipping it."}, role="human")
+        self.j("PATCH", f"/api/tickets/{t['id']}", {"status": "done"}, role="human")
+        self.assertEqual(W()["reason"], "timeout")
 
     def test_skill(self):
         code, body, h = self.call("GET", "/api/skill", role="agent", headers={"Host": "tickets.example:43917"})
