@@ -24,6 +24,9 @@ backlog or done tickets (comments are always allowed). Only a hash of each
 token is stored. API docs: GET /api.
 """
 import argparse
+import email.message
+import email.parser
+import email.policy
 import hashlib
 import html
 import io
@@ -3200,7 +3203,9 @@ enough, or a request fails in a way you don't understand. Errors come back as `{
 - Checklist: keep it in a markdown file on your machine ("- [ ] step"); after each step upload the whole
   file: `PUT /api/tickets/ID/checklist` (body: the file's text, `Content-Type: text/markdown`). Each upload
   replaces the last; your file is the source. Only while the ticket is yours and in progress.
-- Files: `POST /api/tickets/ID/attachments?filename=NAME&comment_id=N`, raw bytes as the body.
+- Files: `curl -F file=@notes.md -F comment_id=N "$URL/api/tickets/ID/attachments"`, or the raw bytes with the
+  name in the URL: `curl --data-binary @notes.md "$URL/api/tickets/ID/attachments?filename=notes.md&comment_id=N"`.
+  Always give the real file name (no name: refused). Chat files: the same, at `/api/chat/ID/files` with `message_id`.
 - Hand back: a comment starting "Done" or "Needs a decision", then `PATCH /api/tickets/ID` `{{"status": "review"}}`.
 - You may set ready, in_progress and review; never backlog or done. Backlog, done and other people's
   tickets: comment only. Blocked tickets (predecessors not done) can't start; comment instead. A ticket's
@@ -3545,9 +3550,18 @@ letters, like `KAMI`). Any case works, and a space for the hyphen in JSON.
 Priorities: 1 high, 2 normal, 3 low.
 
 **Files**: attach anything: screenshots, recordings, audio, but also
-tarballs of build output, scripts, patches, markdown write-ups, logs. Send
-the raw bytes with a sensible `filename` (the extension sets the type when
-you don't send a Content-Type). Images, audio and video play on the ticket
+tarballs of build output, scripts, patches, markdown write-ups, logs.
+Every file needs a real name (its extension sets the type). Two ways to
+send one, both fine:
+
+- raw bytes, named in the URL:
+  `curl --data-binary @notes.md "$URL/api/tickets/ID/attachments?filename=notes.md&comment_id=12"`
+  (or name it with an `X-Filename: notes.md` header);
+- a form, the way browsers upload:
+  `curl -F file=@notes.md -F comment_id=12 "$URL/api/tickets/ID/attachments"`.
+
+A raw upload without a name is refused (400) with these instructions.
+The response has the stored `filename` and its `url`; check it. Images, audio and video play on the ticket
 page; everything else is a download, and small text files (scripts,
 markdown, logs) also get a preview there. Download any attachment with
 `GET` on its `url` (same token). Files are kept on the server with the
@@ -3751,6 +3765,48 @@ class Handler(BaseHTTPRequestHandler):
                 "<main>", '<main><p class="banner prop guest-note">Read-only guest: you can look at everything, but not '
                           'change anything.</p>', 1)
         self.send(200, body, "text/html; charset=utf-8", {"Cache-Control": "no-store"})
+
+    UPLOAD_HELP = ('send the raw bytes as the body with the name in the URL, e.g. '
+                   'curl --data-binary @report.pdf "URL?filename=report.pdf" (or an X-Filename header), '
+                   'or send it as a form: curl -F file=@report.pdf URL')
+    FORM_MAX = 100 << 20
+
+    def read_upload(self, query):
+        """(filename, mime, size, stream, form fields) for an upload. Either the raw bytes, named by
+        ?filename=, an X-Filename header or a Content-Disposition header; or a multipart form (curl -F)
+        with one file in it, plus optional fields such as comment_id or message_id."""
+        size = int(self.headers.get("Content-Length") or -1)
+        if size < 0:
+            raise ApiError(411, "send the file with a Content-Length")
+        ctype = self.headers.get("Content-Type") or ""
+        if ctype.lower().startswith("multipart/form-data"):
+            if size > self.FORM_MAX:
+                raise ApiError(413, "forms are limited to 100 MB; send bigger files as raw bytes: "
+                                    "curl --data-binary @big.tar.gz \"URL?filename=big.tar.gz\"")
+            if size > self.server.max_upload:
+                raise ApiError(413, f"file is larger than the {self.server.max_upload // (1 << 20)} MB limit")
+            data = self.rfile.read(size)
+            msg = email.parser.BytesParser(policy=email.policy.HTTP).parsebytes(
+                b"Content-Type: " + ctype.encode("latin-1", "replace") + b"\r\nMIME-Version: 1.0\r\n\r\n" + data)
+            found, fields = None, {}
+            for part in (msg.iter_parts() if msg.is_multipart() else []):
+                name, blob = part.get_filename(), part.get_payload(decode=True) or b""
+                if name and found is None:
+                    found = (name, part.get_content_type(), blob)
+                elif part.get_param("name", header="content-disposition"):
+                    fields[part.get_param("name", header="content-disposition")] = blob.decode("utf-8", "replace").strip()
+            if not found:
+                raise ApiError(400, "that form has no file in it: " + self.UPLOAD_HELP)
+            name, mime, blob = found
+            return name, mime, len(blob), io.BytesIO(blob), fields
+        name = (query.get("filename") or [""])[0] or self.headers.get("X-Filename") or ""
+        if not name and self.headers.get("Content-Disposition"):
+            m = email.message.Message()
+            m["Content-Disposition"] = self.headers["Content-Disposition"]
+            name = m.get_filename() or ""
+        if not name.strip():
+            raise ApiError(400, "no file name: " + self.UPLOAD_HELP)
+        return name, ctype, size, self.rfile, {}
 
     def body_json(self):
         n = int(self.headers.get("Content-Length") or 0)
@@ -4005,12 +4061,12 @@ class Handler(BaseHTTPRequestHandler):
                 if sub == "/comments" and method == "POST":
                     return self.json(201, store.comment(tid, self.body_json().get("body"), actor, role))
                 if sub == "/attachments" and method == "POST":
-                    size = int(self.headers.get("Content-Length") or -1)
-                    if size < 0:
-                        raise ApiError(411, "send the file with a Content-Length")
-                    cid = (query.get("comment_id") or [None])[0]
-                    a = store.add_attachment(tid, (query.get("filename") or ["upload"])[0], self.headers.get("Content-Type"),
-                                             size, self.rfile, int(cid) if cid else None, actor, role, self.server.max_upload)
+                    name, mime, size, stream, fields = self.read_upload(query)
+                    cid = (query.get("comment_id") or [fields.get("comment_id") or ""])[0]
+                    if cid and not cid.isdigit():
+                        raise ApiError(400, "comment_id is a comment's number")
+                    a = store.add_attachment(tid, name, mime, size, stream, int(cid) if cid else None, actor, role,
+                                             self.server.max_upload)
                     return self.json(201, a)
             raise ApiError(404, "not found")
         except ApiError as e:
@@ -4051,13 +4107,11 @@ class Handler(BaseHTTPRequestHandler):
                 store.mark_read(store.conversation(cid)["id"], actor)
                 return self.json(200, {"unread": store.unread_total(actor)})
             if sub == "/files" and method == "POST":
-                size = int(self.headers.get("Content-Length") or -1)
-                if size < 0:
-                    raise ApiError(411, "send the file with a Content-Length")
-                mid = (query.get("message_id") or [""])[0]
+                name, mime, size, stream, fields = self.read_upload(query)
+                mid = (query.get("message_id") or [fields.get("message_id") or ""])[0]
                 return self.json(201, store.add_chat_file(
-                    cid, int(mid) if mid.isdigit() else None, (query.get("filename") or ["upload"])[0],
-                    self.headers.get("Content-Type"), size, self.rfile, actor, role, self.server.max_upload))
+                    cid, int(mid) if mid.isdigit() else None, name, mime, size, stream, actor, role,
+                    self.server.max_upload))
         raise ApiError(404, "not found")
 
     def serve_export(self):

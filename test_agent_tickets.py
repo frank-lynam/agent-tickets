@@ -253,6 +253,32 @@ class TicketsTest(unittest.TestCase):
         self.assertIn("echo &#x27;&lt;b&gt;hi&lt;/b&gt;&#x27;", html)
         self.assertIn("# Findings", html)
 
+    def test_upload_names(self):
+        t = self.new("in_progress")
+        c = self.j("POST", f"/api/tickets/{t['id']}/comments", {"body": "files"})[1]
+        # A form upload (curl -F): the real name and bytes, and its fields.
+        boundary = "XyZ123"
+        form = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"comment_id\"\r\n\r\n{c['id']}\r\n"
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"notes.md\"\r\n"
+                f"Content-Type: application/octet-stream\r\n\r\n# Notes\n- a\n\r\n--{boundary}--\r\n").encode()
+        code, a = self.j("POST", f"/api/tickets/{t['id']}/attachments", raw=form,
+                         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+        self.assertEqual((code, a["filename"], a["mime"], a["comment_id"]), (201, "notes.md", "text/markdown", c["id"]))
+        self.assertEqual(self.call("GET", a["url"])[1], b"# Notes\n- a\n")
+        # Raw bytes named by a header.
+        self.assertEqual(self.j("POST", f"/api/tickets/{t['id']}/attachments", raw=b"x",
+                                headers={"X-Filename": "x.log"})[1]["filename"], "x.log")
+        # No name at all: refused, with directions (no more files called "upload").
+        code, err = self.j("POST", f"/api/tickets/{t['id']}/attachments", raw=b"x")
+        self.assertEqual(code, 400)
+        self.assertIn("curl -F file=@", err["error"])
+        self.assertIn("?filename=", err["error"])
+        code, err = self.j("POST", f"/api/tickets/{t['id']}/attachments",
+                           raw=f"--{boundary}\r\nContent-Disposition: form-data; name=\"x\"\r\n\r\n1\r\n--{boundary}--\r\n".encode(),
+                           headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+        self.assertEqual(code, 400)
+        self.assertIn("no file in it", err["error"])
+
     def test_upload_limit(self):
         t = self.new()
         self.assertEqual(self.j("POST", f"/api/tickets/{t['id']}/attachments?filename=big.bin",
