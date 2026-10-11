@@ -322,7 +322,10 @@ They're on the same disk as the data, so copy them somewhere else too.
   comments, files, events and checklist uploads appear within a few
   seconds without a reload, and if the ticket itself changes (status,
   assignee, title...) a banner offers a refresh. Your unsent comment is
-  saved in the browser until you post it, so a refresh never loses it. An epic's page lists
+  saved in the browser until you post it, so a refresh never loses it.
+  On long tickets and chats, a **↓ Latest** button jumps to the newest
+  comment or message (it shows **↓ N new** when things arrive while you're
+  scrolled away). An epic's page lists
   its tickets.
 - **New** (+ New): pick **Ticket** or **Epic** first; an epic only needs a
   title and description, so the ticket-only fields (status, priority,

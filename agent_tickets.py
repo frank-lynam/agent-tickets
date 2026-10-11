@@ -1883,6 +1883,8 @@ a.wl.missing{color:var(--review);text-decoration-style:dashed}
 .msg .mk{margin-left:6px;text-decoration:none;font-size:12px;opacity:.75}
 html[data-tts="1"] .c,html[data-tts="1"] .msg,html[data-tts="1"] .desc{cursor:pointer}
 .speaking{outline:3px solid var(--accent);outline-offset:2px}
+button.latest{position:fixed;z-index:35;right:max(16px,env(safe-area-inset-right));padding:8px 14px;border-radius:999px;
+background:var(--accent);color:var(--accent-ink);border-color:var(--accent);box-shadow:0 4px 14px rgba(0,0,0,.25);font-size:14px}
 .receipt{margin:6px 2px 0;text-align:right}.receipt .unseen{color:var(--review)}
 .composer{position:sticky;bottom:0;margin-top:14px;padding:10px 0 4px;background:var(--bg)}
 .composer textarea{min-height:64px}
@@ -1994,6 +1996,39 @@ document.addEventListener('click', (e) => {
       && !e.shiftKey && a.getAttribute('href')[0] !== '#') document.documentElement.classList.add('working');
 });
 window.addEventListener('pageshow', () => { leaving = false; document.documentElement.classList.remove('working'); });
+// Long tickets and chats: a "Latest" button while the newest comment or message is off screen,
+// counting what arrives while you're scrolled away.
+document.addEventListener('DOMContentLoaded', () => {
+  const list = document.getElementById('msgs') || document.getElementById('tl');
+  if (!list) return;
+  const composer = document.getElementById('mf');  // chat's message box, stuck to the bottom
+  const btn = document.createElement('button');
+  btn.type = 'button'; btn.className = 'latest'; btn.hidden = true; btn.setAttribute('aria-label', 'Go to the latest');
+  document.body.appendChild(btn);
+  let fresh = 0;
+  const bottomLimit = () => composer ? composer.getBoundingClientRect().top : innerHeight;
+  function update(){
+    const last = list.lastElementChild;
+    const away = !!last && last.getBoundingClientRect().bottom > bottomLimit() + 4;
+    if (!away) fresh = 0;
+    btn.hidden = !away;
+    btn.textContent = fresh ? '↓ ' + fresh + ' new' : '↓ Latest';
+    btn.style.bottom = (composer ? Math.round(innerHeight - bottomLimit()) + 12 : 16) + 'px';
+  }
+  btn.addEventListener('click', () => {
+    const smooth = !(window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches);
+    if (composer) window.scrollTo({top: document.body.scrollHeight, behavior: smooth ? 'smooth' : 'auto'});
+    else list.lastElementChild.scrollIntoView({block: 'center', behavior: smooth ? 'smooth' : 'auto'});
+    fresh = 0;
+  });
+  new MutationObserver((changes) => {
+    if (!btn.hidden) fresh += changes.reduce((n, c) => n + [...c.addedNodes].filter(x => x.nodeType === 1).length, 0);
+    update();
+  }).observe(list, {childList: true});
+  addEventListener('scroll', update, {passive: true});
+  addEventListener('resize', update);
+  update();
+});
 async function api(method, url, body){
   const el = markBusy();
   try {
