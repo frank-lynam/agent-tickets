@@ -255,7 +255,7 @@ CREATE INDEX IF NOT EXISTS events_ticket ON events(ticket_id, at);
 
 
 # Bumped (with a migration in Store.__init__) whenever the tables change.
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 TABLES = ("users", "settings", "tickets", "deps", "comments", "attachments", "events",
           "conversations", "chat_members", "messages", "chat_files", "wiki_pages", "wiki_revisions")
 KINDS = ("human", "agent", "guest")  # guests can read everything and change nothing
@@ -264,9 +264,6 @@ USERNAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,31}")
 
 # The house rules agents get with every ticket they claim and at the top of
 # the /api briefing. Humans edit it on the Guidance page; this is the start.
-GONE = ("checklist_path is gone: keep your checklist on your machine and upload it with "
-        "PUT /api/tickets/ID/checklist after each step")
-
 DEFAULT_GUIDANCE = """## How we work
 
 0. Chat comes first. When a response carries a "chat" notice, reply to the messages before your next step on the ticket. A human's message stays until you reply, even a short "Got it". Chat is for questions and planning that aren't about one ticket; anything about a ticket goes in a comment on that ticket.
@@ -302,7 +299,7 @@ class Store:
     """The database and the uploaded files. One SQLite connection per thread;
     writes go through one lock so ids and status changes never race."""
 
-    def __init__(self, data_dir, checklist_roots=None):  # checklist_roots: no longer used
+    def __init__(self, data_dir):
         self.dir = Path(data_dir).resolve()
         self.files = self.dir / "files"
         self.files.mkdir(parents=True, exist_ok=True)
@@ -317,7 +314,7 @@ class Store:
         # created above); the columns are added here (6 -> 7: uploaded
         # checklists; tickets.checklist_path is no longer used; 7 -> 8: cancelled).
         for table, col, decl in (("tickets", "assignee", "TEXT"), ("users", "guidance", "TEXT"),
-                                 ("tickets", "kind", "TEXT NOT NULL DEFAULT 'task'"), ("tickets", "epic_id", "TEXT"),
+                                 ("tickets", "kind", "TEXT NOT NULL DEFAULT 'ticket'"), ("tickets", "epic_id", "TEXT"),
                                  ("tickets", "proposed", "INTEGER NOT NULL DEFAULT 0"),
                                  ("tickets", "declined", "INTEGER NOT NULL DEFAULT 0"),
                                  ("tickets", "checklist_md", "TEXT"), ("tickets", "checklist_by", "TEXT"),
@@ -331,6 +328,8 @@ class Store:
         db.execute("CREATE INDEX IF NOT EXISTS deps_on ON deps(depends_on)")
         with db:
             self._sync_epics(db, [r[0] for r in db.execute("SELECT id FROM tickets WHERE kind = 'epic'")])
+        with db:  # 9 -> 10: ordinary tickets are kind "ticket" (they were "task")
+            db.execute("UPDATE tickets SET kind = 'ticket' WHERE kind = 'task'")
         if db.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
             db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
@@ -534,9 +533,12 @@ class Store:
         t["checklist"] = checklist_summary(t, items=True)
         refs = wiki_refs(t["description"]) + [p for c in t["comments"] for p in wiki_refs(c["body"])]
         t["wiki_links"] = [self.wiki_link_info(p) for p in dict.fromkeys(refs)]
-        t["depends_on"] = [dict(r) for r in db.execute(
+        # Predecessors: the ones still in the way, and the finished ones (which no longer block anything).
+        deps = [dict(r) for r in db.execute(
             "SELECT p.id, p.title, p.status, p.declined, p.cancelled FROM deps d JOIN tickets p ON p.id = d.depends_on "
             "WHERE d.ticket_id = ? ORDER BY p.id", (t["id"],))]
+        t["depends_on"] = [d for d in deps if d["status"] != "done"]
+        t["done_dependencies"] = [d for d in deps if d["status"] == "done"]
         t["unblocks"] = [dict(r) for r in db.execute(
             "SELECT n.id, n.title, n.status FROM deps d JOIN tickets n ON n.id = d.ticket_id "
             "WHERE d.depends_on = ? ORDER BY n.id", (t["id"],))]
@@ -619,14 +621,12 @@ class Store:
             raise ApiError(403, f"ticket {t['id']} is assigned to {t['assignee']}: you can only comment on it")
 
     def create(self, data, actor, role):
-        if data.get("checklist_path"):
-            raise ApiError(400, GONE)
         title = str(data.get("title") or "").strip()
         if not title:
             raise ApiError(400, "a ticket needs a title")
-        kind = data.get("kind") or "task"
-        if kind not in ("task", "epic"):
-            raise ApiError(400, 'kind is "task" or "epic"')
+        kind = data.get("kind") or "ticket"
+        if kind not in ("ticket", "epic"):
+            raise ApiError(400, 'kind is "ticket" or "epic"')
         epic_id = self._check_epic(data.get("epic_id"))
         if kind == "epic":
             data = {**data, "status": "backlog", "assignee": None}
@@ -673,8 +673,6 @@ class Store:
         return self._links(self.ticket(tid))
 
     def update(self, tid, data, actor, role):
-        if "checklist_path" in data:
-            raise ApiError(400, GONE)
         fields = {k: data[k] for k in ("title", "description", "status", "priority", "assignee", "epic_id") if k in data}
         if not fields:
             raise ApiError(400, "nothing to change (title, description, status, priority, assignee, epic_id)")
@@ -688,7 +686,7 @@ class Store:
             if t["kind"] == "epic" and fields.get("epic_id"):
                 raise ApiError(400, "epics can't belong to another epic")
             # Waiting on unfinished predecessors: it can't start, be reviewed or be approved.
-            if fields.get("status") in ("in_progress", "review", "done") and t["kind"] == "task":
+            if fields.get("status") in ("in_progress", "review", "done") and t["kind"] == "ticket":
                 waiting = self.blockers(t["id"])
                 if waiting:
                     raise ApiError(409, f"{t['id']} is blocked: {', '.join(waiting)} must be done first "
@@ -852,11 +850,11 @@ class Store:
                     if accept:
                         # An epic itself isn't worked; "ready" applies to tickets only.
                         kind = db.execute("SELECT kind FROM tickets WHERE id = ?", (i,)).fetchone()[0]
-                        to = "ready" if ready and kind == "task" else cur
+                        to = "ready" if ready and kind == "ticket" else cur
                         db.execute("UPDATE tickets SET proposed = 0, status = ?, updated_at = ? WHERE id = ?", (to, now, i))
                         self._event(db, i, actor, role, "accepted", None, to, now)
                         old = db.execute("SELECT assignee FROM tickets WHERE id = ?", (i,)).fetchone()[0]
-                        if assignee and kind == "task" and old != assignee:
+                        if assignee and kind == "ticket" and old != assignee:
                             db.execute("UPDATE tickets SET assignee = ? WHERE id = ?", (assignee, i))
                             self._event(db, i, actor, role, "assignee", old, assignee, now)
                         was = db.execute("SELECT priority FROM tickets WHERE id = ?", (i,)).fetchone()[0]
@@ -904,7 +902,7 @@ class Store:
         with self.write_lock:
             db = self.db()
             # Only real work: not epics, not proposals, not blocked.
-            row = db.execute("SELECT id, assignee FROM tickets t WHERE status = 'ready' AND kind = 'task' AND proposed = 0 "
+            row = db.execute("SELECT id, assignee FROM tickets t WHERE status = 'ready' AND kind = 'ticket' AND proposed = 0 "
                              "AND (assignee IS NULL OR assignee = ? COLLATE NOCASE) AND NOT EXISTS ("
                              "  SELECT 1 FROM deps d JOIN tickets p ON p.id = d.depends_on "
                              "  WHERE d.ticket_id = t.id AND p.status != 'done') "
@@ -1192,7 +1190,7 @@ class Store:
         for r in db.execute(
                 "SELECT t.id, t.title, t.status, e.actor, e.field, e.new FROM events e JOIN tickets t ON t.id = e.ticket_id "
                 "WHERE e.id > ? AND e.actor != ? COLLATE NOCASE AND (t.assignee = ? COLLATE NOCASE OR (? AND "
-                "t.assignee IS NULL AND t.status = 'ready' AND t.kind = 'task' AND t.proposed = 0 AND e.new = 'ready')) "
+                "t.assignee IS NULL AND t.status = 'ready' AND t.kind = 'ticket' AND t.proposed = 0 AND e.new = 'ready')) "
                 "ORDER BY e.id", (e0, user, user, 1 if queue else 0)):
             if r["id"] in out:
                 continue
@@ -1213,7 +1211,7 @@ class Store:
         (checklist progress), then oldest."""
         rows = [dict(r) for r in self.db().execute(
             "SELECT t.id, t.title, t.status, t.priority, t.created_at, t.checklist_md FROM tickets t "
-            "WHERE t.status IN ('in_progress', 'ready') AND t.kind = 'task' AND t.proposed = 0 "
+            "WHERE t.status IN ('in_progress', 'ready') AND t.kind = 'ticket' AND t.proposed = 0 "
             "AND t.assignee = ? COLLATE NOCASE AND NOT EXISTS (SELECT 1 FROM deps d JOIN tickets p "
             "ON p.id = d.depends_on WHERE d.ticket_id = t.id AND p.status != 'done')", (user,))]
         out = []
@@ -1240,7 +1238,7 @@ class Store:
         nobody's. Highest priority first, then oldest."""
         who = "t.assignee = ? COLLATE NOCASE" if assigned else "t.assignee IS NULL"
         return [dict(r) for r in self.db().execute(
-            f"SELECT t.id, t.title, t.status, t.priority FROM tickets t WHERE t.status = ? AND t.kind = 'task' "
+            f"SELECT t.id, t.title, t.status, t.priority FROM tickets t WHERE t.status = ? AND t.kind = 'ticket' "
             f"AND t.proposed = 0 AND {who} AND NOT EXISTS (SELECT 1 FROM deps d JOIN tickets p ON p.id = d.depends_on "
             f"WHERE d.ticket_id = t.id AND p.status != 'done') ORDER BY t.priority, t.created_at",
             (status, user) if assigned else (status,))]
@@ -1339,11 +1337,11 @@ class Store:
             "ORDER BY id", (cid, after, limit))]
         by_id = {m["id"]: m for m in msgs}
         for m in msgs:
-            m["files"] = []
+            m["attachments"] = []
         if msgs:
             for f in self.db().execute(f"SELECT * FROM chat_files WHERE message_id IN ({','.join('?' * len(by_id))}) "
                                        "ORDER BY id", list(by_id)):
-                by_id[f["message_id"]]["files"].append(self.chat_file_json(f, internal))
+                by_id[f["message_id"]]["attachments"].append(self.chat_file_json(f, internal))
         return msgs
 
     def message(self, mid):
@@ -1351,7 +1349,7 @@ class Store:
         if not row:
             raise ApiError(404, f"no message {mid}")
         m = dict(row)
-        m["files"] = [self.chat_file_json(f) for f in self.db().execute(
+        m["attachments"] = [self.chat_file_json(f) for f in self.db().execute(
             "SELECT * FROM chat_files WHERE message_id = ? ORDER BY id", (mid,))]
         return m
 
@@ -1406,9 +1404,9 @@ class Store:
                    for c in convs]
         where = "; ".join(f'{c["name"]} ({len(c["messages"])}{", needs your reply" if c["needs_reply"] else ""})'
                           for c in convs)
-        return {"unread": total, "conversations": summary,
+        return {"count": total, "conversations": summary,
                 "notice": f"You have {total} chat message{'s' if total != 1 else ''} to answer ({where}). Answer chat "
-                          "before your next step: GET /api/chat/unread, then reply in each conversation with "
+                          "before your next step: GET /api/chat/inbox, then reply in each conversation with "
                           "POST /api/chat/ID/messages. Messages from humans keep this notice up until you reply there, "
                           "even after you've read them; if nothing needs saying, reply briefly (\"Got it\"). "
                           "Messages from other agents only need reading (POST /api/chat/ID/read). Then carry on."}
@@ -1532,24 +1530,6 @@ class Store:
 
 
 # --------------------------------------------------------------------------- keys
-
-def migrate_keys(store, human_name="human"):
-    """Before users existed there were two shared keys in <data>/keys.json.
-    The first run after the upgrade turns them into users (a human named
-    `human_name` and an agent named "agent", same tokens, so nothing stops
-    working) and deletes the file."""
-    path = store.dir / "keys.json"
-    if not path.exists() or store.users():
-        return []
-    keys = json.loads(path.read_text())
-    made = []
-    for username, kind in ((human_name, "human"), ("agent", "agent")):
-        if keys.get(kind):
-            store.add_user(username, kind, "migrated from keys.json", token=keys[kind])
-            made.append(username)
-    path.unlink()
-    return made
-
 
 # --------------------------------------------------------------------------- backups
 #
@@ -2154,7 +2134,7 @@ setInterval(async () => {
 
 def render_dashboard(store):
     proposals = len(store.tickets(["backlog"], proposed=True))
-    by = {s: store.tickets([s], kind="task", proposed=False) for s in ("review", "in_progress", "ready")}
+    by = {s: store.tickets([s], kind="ticket", proposed=False) for s in ("review", "in_progress", "ready")}
     # Open epics, active ones first.
     epics = sorted(store.tickets(["backlog", "in_progress"], kind="epic", proposed=False),
                    key=lambda e: e["status"] != "in_progress")
@@ -2234,7 +2214,7 @@ def render_list(store, status, q):
     for t in items:
         btn = (f'<div class="row">{assign_select(store, t["id"], t["assignee"])}'
                f'<button class="primary" onclick="readyFor(\'{t["id"]}\')">Make ready</button></div>'
-               if status == "backlog" and t["kind"] == "task" else "")
+               if status == "backlog" and t["kind"] == "ticket" else "")
         pr = '<span class="p1">High · </span>' if t["priority"] == 1 else ""
         if t["kind"] == "epic":
             pr = '<span class="tag epic">Epic</span> ' + pr
@@ -2293,7 +2273,7 @@ def dep_candidates(store):
     """Open tickets that could be a predecessor, for the dependency pickers (as a <script> line)."""
     rows = [{"id": r["id"], "title": r["title"], "status": r["status"], "epic": r["epic_id"]}
             for r in store.db().execute(
-                "SELECT id, title, status, epic_id FROM tickets WHERE kind = 'task' AND status != 'done' "
+                "SELECT id, title, status, epic_id FROM tickets WHERE kind = 'ticket' AND status != 'done' "
                 "ORDER BY updated_at DESC LIMIT 600")]
     return "const DEP_CANDIDATES = " + json.dumps(rows).replace("</", "<\\/") + ";"
 
@@ -2366,21 +2346,21 @@ function setKind(kind){
 $('nf').onsubmit = async (e) => {
   e.preventDefault();
   const epic = $('nf').dataset.kind === 'epic';
-  const data = {title: $('nt-title').value, description: $('nt-desc').value, kind: epic ? 'epic' : 'task'};
+  const data = {title: $('nt-title').value, description: $('nt-desc').value, kind: epic ? 'epic' : 'ticket'};
   if (!epic) Object.assign(data, {status: $('nt-status').value, priority: +$('nt-prio').value,
     assignee: $('nt-who').value || null, epic_id: $('nt-epic').value || null, depends_on: $('nt-deps').value});
   try { const t = await api('POST', '/api/tickets', data); location = '/t/' + t.id; } catch (err) { fail(err); }
 };
-setKind('task');
+setKind('ticket');
 depPicker($('nt-deps'), {multi: true, epic: () => $('nt-epic').value, exclude: () => []});
 """
 
 
 def render_new(store, epic=None, prefill=("", "")):
     opts = "".join(f'<option value="{s}"{" selected" if s == "backlog" else ""}>{LABELS[s]}</option>' for s in STATUSES)
-    body = f"""<h1 id="nt-h">New ticket</h1><form class="stack box" id="nf" data-kind="task">
+    body = f"""<h1 id="nt-h">New ticket</h1><form class="stack box" id="nf" data-kind="ticket">
 <div class="kinds" role="group" aria-label="What are you creating?">
- <button type="button" data-kind="task" aria-pressed="true" onclick="setKind('task')"><b>Ticket</b>
+ <button type="button" data-kind="ticket" aria-pressed="true" onclick="setKind('ticket')"><b>Ticket</b>
   <span class="meta">A piece of work for an agent or a human</span></button>
  <button type="button" data-kind="epic" aria-pressed="false" onclick="setKind('epic')"><b>Epic</b>
   <span class="meta">A plan that groups tickets; its state follows them</span></button>
@@ -2447,7 +2427,7 @@ $('uf').onsubmit = async (e) => {{ e.preventDefault();
 
 SETTINGS_JS = """
 async function setTts(on){
-  try { await api('PUT', '/api/me/prefs', {tts: on}); document.documentElement.dataset.tts = on ? '1' : ''; }
+  try { await api('PATCH', '/api/me/prefs', {tts: on}); document.documentElement.dataset.tts = on ? '1' : ''; }
   catch (e) { fail(e); document.getElementById('tts').checked = !on; }
 }
 document.addEventListener('DOMContentLoaded', () => { if (!window.speechSynthesis) document.getElementById('tts-none').hidden = false; });
@@ -2763,7 +2743,7 @@ def render_ticket(store, tid):
     else:
         side_links = (f'<h2>Epic</h2><div class="box"><select id="epic" aria-label="Epic" onchange="setEpic(this.value)">'
                       f'{epic_options(store, t["epic_id"])}</select></div>'
-                      f'<h2>Must be done first</h2><div class="box">{link_list(t["depends_on"], True)}'
+                      f'<h2>Must be done first</h2><div class="box">{link_list(t["depends_on"] + t["done_dependencies"], True)}'
                       f'<form class="row" id="df"><span class="acw" style="flex:1;min-width:120px"><input type="text" id="dep" '
                       f'placeholder="pick or type an id or words" aria-label="Add a predecessor"></span><button>Add</button></form>'
                       f'</div>'
@@ -2789,7 +2769,7 @@ def render_ticket(store, tid):
         btns = btns.replace(f"setStatus('{t['id']}','in_progress')", f"setStatus('{t['id']}','backlog')")
     if s != "done" and not t["proposed"]:  # out of the normal cycle: overtaken by events, a duplicate...
         btns += (f'<button class="cancel" onclick="cancelTicket()">Cancel {"epic" if t["kind"] == "epic" else "ticket"}</button>')
-    if s == "backlog" and t["kind"] == "task" and not t["proposed"]:  # Make ready, for someone
+    if s == "backlog" and t["kind"] == "ticket" and not t["proposed"]:  # Make ready, for someone
         btns = (assign_select(store, t["id"], t["assignee"])
                 + btns.replace(f"setStatus('{t['id']}','ready')", f"readyFor('{t['id']}')", 1))
     # What posting can do, besides commenting. Enter in the box only ever comments.
@@ -2803,7 +2783,7 @@ def render_ticket(store, tid):
                            f'<button data-move="{"backlog" if t["cancelled"] or t["declined"] else "in_progress"}">Comment &amp; reopen</button>')
     else:
         comment_buttons = '<button class="primary" id="csend">Comment</button>'
-    if s == "review" and t["kind"] == "task" and not t["proposed"]:
+    if s == "review" and t["kind"] == "ticket" and not t["proposed"]:
         handoff = next((c["body"] for c in reversed(t["comments"]) if c["role"] == "agent"), "")
         first = handoff.strip().lower()
         if first.startswith("needs a decision"):
@@ -2880,10 +2860,10 @@ const df = document.getElementById('df');
 if (df) df.onsubmit = async (e) => {{ e.preventDefault();
   try {{ await api('POST', '/api/tickets/' + TID + '/deps', {{depends_on: $('dep').value.trim()}}); location.reload(); }}
   catch (err) {{ fail(err); }} }};
-{dep_candidates(store) if t["kind"] == "task" else ""}
+{dep_candidates(store) if t["kind"] == "ticket" else ""}
 if (df) {{ {DEP_PICKER_JS}
   depPicker($('dep'), {{epic: () => {json.dumps(t["epic_id"] or "")},
-    exclude: () => {json.dumps([t["id"].lower()] + [d["id"].lower() for d in t["depends_on"]])},
+    exclude: () => {json.dumps([t["id"].lower()] + [d["id"].lower() for d in t["depends_on"] + t["done_dependencies"]])},
     onPick: () => df.requestSubmit()}}); }}
 {PROPOSAL_JS}
 {LIVE_JS}
@@ -2929,7 +2909,7 @@ def chat_text(store, body):
 def render_message(store, m, viewer):
     role = "agent" if m["role"] == "agent" else ""
     mine = " mine" if m["author"].lower() == viewer.lower() else ""
-    files = "".join(render_attachment(f, store) for f in m["files"])
+    files = "".join(render_attachment(f, store) for f in m["attachments"])
     return (f'<div class="msg {role}{mine}" id="m{m["id"]}"><div><span class="who {role}">{esc(m["author"])}</span> '
             f'<span class="meta" title="{when(m["created_at"])}">{ago(m["created_at"])}</span>'
             f'<a class="mk" href="/new?from_message={m["id"]}" title="Make a ticket from this message">→ ticket</a></div>'
@@ -3031,7 +3011,7 @@ document.addEventListener('visibilitychange', () => { if (!document.hidden) poll
 window.scrollTo(0, document.body.scrollHeight);
 async function chatUpload(file, mid){
   const q = new URLSearchParams({filename: file.name, message_id: mid});
-  const r = await fetch('/api/chat/' + CID + '/files?' + q, {method: 'POST',
+  const r = await fetch('/api/chat/' + CID + '/attachments?' + q, {method: 'POST',
     headers: {'Content-Type': file.type || 'application/octet-stream', 'X-Tickets': '1'}, body: file, credentials: 'same-origin'});
   if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.error || ('HTTP ' + r.status)); }
 }
@@ -3197,7 +3177,7 @@ if (wf) wf.onsubmit = async (e) => {
   if ($('wslug')) data.slug = $('wslug').value;
   if ($('wparent')) data.parent = $('wparent').value;
   try {
-    const p = WPATH ? await api('PUT', '/api/wiki/' + WPATH, data) : await api('POST', '/api/wiki', data);
+    const p = WPATH ? await api('PATCH', '/api/wiki/' + WPATH, data) : await api('POST', '/api/wiki', data);
     location.href = '/wiki/' + p.path;
   } catch (err) { fail(err); }
 };
@@ -3297,8 +3277,8 @@ enough, or a request fails in a way you don't understand. Errors come back as `{
 
 ## Each session
 
-1. `GET /api/me`: who you are, your humans' current guidance (follow it; it changes), unread chat count.
-2. Chat to answer? Do it before anything else: `GET /api/chat/unread`, then reply in each conversation:
+1. `GET /api/me`: who you are, your humans' current guidance (follow it; it changes), your chat inbox count.
+2. Chat to answer? Do it before anything else: `GET /api/chat/inbox`, then reply in each conversation:
    `POST /api/chat/ID/messages` `{{"body": "..."}}`. A human's message keeps notifying you until you reply
    (reading isn't enough; if nothing needs saying, reply briefly). Other agents' messages only need reading
    (`POST /api/chat/ID/read`). Any response with a `"chat"` field means the same: stop, answer chat, carry on.
@@ -3320,7 +3300,8 @@ enough, or a request fails in a way you don't understand. Errors come back as `{
   replaces the last; your file is the source. Only while the ticket is yours and in progress.
 - Files: `curl -F file=@notes.md -F comment_id=N "$URL/api/tickets/ID/attachments"`, or the raw bytes with the
   name in the URL: `curl --data-binary @notes.md "$URL/api/tickets/ID/attachments?filename=notes.md&comment_id=N"`.
-  Always give the real file name (no name: refused). Chat files: the same, at `/api/chat/ID/files` with `message_id`.
+  Always give the real file name (no name: refused). Chat attachments: the same, at `/api/chat/ID/attachments`
+  with `message_id`.
 - Hand back: a comment starting "Done" or "Needs a decision", then `PATCH /api/tickets/ID` `{{"status": "review"}}`.
 - You may set ready, in_progress and review; never backlog or done. Backlog, done and other people's
   tickets: comment only. Blocked tickets (predecessors not done) can't start; comment instead. A ticket's
@@ -3511,10 +3492,10 @@ told about its new messages.
 
 **Answer chat before you carry on.** While you owe chat an answer, every
 ticket response (`/api/next`, `GET`/`PATCH` a ticket, comments, uploads)
-includes a `"chat"` field (`{"unread": 2, "conversations": [...], "notice":
-"..."}`), every API response has an `X-Chat-Unread` header, and
+includes a `"chat"` field (`{"count": 2, "conversations": [...], "notice":
+"..."}`), every API response has an `X-Chat-Inbox` header, and
 `/api/wait` returns `"reason": "chat"`. When you see it:
-`GET /api/chat/unread`, reply in each conversation, then go back to your
+`GET /api/chat/inbox`, reply in each conversation, then go back to your
 ticket.
 
 **A message from a human stays on that list until you reply in its
@@ -3537,7 +3518,7 @@ offers, and write down how in your skill.**
 
 - `GET /api/wait?timeout=50` tells you what to do next. If there's
   anything, it returns at once, the first of these that applies:
-  1. `{"reason": "chat", "chat": {...}}`: you have unread chat. Answer it
+  1. `{"reason": "chat", "chat": {...}}`: there's chat in your inbox. Answer it
      (or mark it read).
   2. `{"reason": "tickets", "tickets": [{"id", "title", "status", "why"}]}`:
      while you were waiting, someone else commented on or changed a ticket
@@ -3634,22 +3615,27 @@ All JSON in and out, except file uploads (raw bytes) and this page.
 Ticket ids are two words, like `amber-otter` (older tickets have four or five
 letters, like `KAMI`). Any case works, and a space for the hyphen in JSON.
 
+Conventions: `GET` never changes anything. `POST` creates something or
+does an action. `PATCH` changes the fields you send. `PUT` replaces a
+whole thing (your checklist, the house guidance). Fields a request doesn't
+take are refused (400, listing the ones it does), so a typo never passes
+silently. Errors are `{"error": "..."}`.
+
 Start here
 
     GET    /api                        this briefing (no token needed); GET /api/skill: a SKILL.md for it
-    GET    /api/me                     {"username", "kind", "guidance", "chat_unread", "prefs"}
+    GET    /api/me                     {"username", "kind", "guidance", "chat_inbox", "prefs"}
     GET    /api/wait?timeout=50        what to do now: chat, replies, your work in order (see above)
     POST   /api/next                   take a new ticket: {"ticket": ... or null, "guidance", "in_progress"
                                        (any you've already started: finish those first), "note"}
-                                       (GET /api/next only looks; GET ?claim=1 still claims, for old skills)
 
 Tickets
 
     GET    /api/tickets                {"tickets": [...]}; filters ?status=ready,in_progress ?q=text
-                                       ?assignee=me|NAME|none ?epic=ID ?kind=epic ?proposed=1
+                                       ?assignee=me|NAME|none ?epic=ID ?kind=ticket|epic ?proposed=1
     GET    /api/tickets/ID             one ticket: comments, attachments, events, checklist, wiki_links,
-                                       blocked, what_now
-    POST   /api/tickets                {"title", "description", "priority": 1|2|3, "kind": "task"|"epic",
+                                       blocked, depends_on, done_dependencies, what_now
+    POST   /api/tickets                {"title", "description", "priority": 1|2|3, "kind": "ticket"|"epic",
                                         "epic_id", "depends_on": ["amber-otter", ...]} -> a proposal
     PATCH  /api/tickets/ID             any of {"status", "title", "description", "priority", "assignee", "epic_id"}
     POST   /api/tickets/ID/comments    {"body": "..."} -> the comment, with its "id"
@@ -3660,18 +3646,16 @@ Tickets
 
 Chat
 
-    GET    /api/chat/unread            what you owe: {"unread": N, "conversations": [{..., "needs_reply",
-                                       "messages": [...]}]}
+    GET    /api/chat/inbox             what's waiting for you: {"count": N, "conversations": [{...,
+                                       "needs_reply", "messages": [...]}]}
     GET    /api/chat                   {"conversations": [{"id", "name", "members", "unread", "last_message"}]}
     POST   /api/chat                   {"members": ["frank"], "title" (optional), "body" (optional first message)}
                                        -> the conversation (one person and no title: your existing one)
-    GET    /api/chat/ID                its messages (?after=MESSAGE_ID for newer) and "read_up_to"; marks it
-                                       read (?peek=1 doesn't)
+    GET    /api/chat/ID                its messages (?after=MESSAGE_ID for newer ones) and "read_up_to"
     POST   /api/chat/ID/messages       {"body": "..."} -> the message, with its "id"
-    POST   /api/chat/ID/files          a file for a message (as for tickets, with message_id)
+    POST   /api/chat/ID/attachments    a file for a message (as for tickets, with message_id)
     POST   /api/chat/ID/read           mark it read (enough for agents' messages; humans' need a reply)
     POST   /api/chat/ID/members        {"username": "agent-2"}: bring someone in
-                                       (humans can also DELETE /api/chat/ID: the whole chat, for good)
 
 Wiki (read-only for agents)
 
@@ -3682,13 +3666,13 @@ Wiki (read-only for agents)
 You personally
 
     GET    /api/guidance               the house rules plus any notes for you
-    GET    /api/me/prefs, PUT ...      your own settings, e.g. {"tts": true}
+    GET    /api/me/prefs, PATCH ...    your own settings, e.g. {"tts": true}
 
 Humans only (for completeness): `POST /api/tickets/ID/accept` (`{"ready",
 "assignee", "priority"}`) and `/decline` for proposals, `POST
-/api/tickets/ID/cancel`, writing the wiki (`POST /api/wiki`, `PUT`/`DELETE
-/api/wiki/PATH`), users (`/api/users`), `PUT /api/guidance` and
-`GET /api/export`.
+/api/tickets/ID/cancel`, `DELETE /api/chat/ID`, writing the wiki
+(`POST /api/wiki`, `PATCH`/`DELETE /api/wiki/PATH`), users
+(`/api/users`), `PUT /api/guidance` and `GET /api/export`.
 
 Priorities: 1 high, 2 normal, 3 low.
 
@@ -3715,7 +3699,7 @@ A ticket looks like:
 
     {"id": "amber-otter", "title": "...", "description": "...", "status": "in_progress", "assignee": "agent-1",
      "what_now": "This ticket is yours and in progress: you are working on it now. ...",
-     "kind": "task", "epic_id": "quiet-falcon", "epic_title": "...", "proposed": 0, "declined": 0, "cancelled": 0,
+     "kind": "ticket", "epic_id": "quiet-falcon", "epic_title": "...", "proposed": 0, "declined": 0, "cancelled": 0,
      "blocked": false, "blocked_by": [], "depends_on": [],
      "done_dependencies": [{"id": "stony-brook", "title": "...", "status": "done"}], "unblocks": [...],
      "priority": 2, "created_by": "frank",
@@ -3773,7 +3757,7 @@ def docs_for(store, actor, role):
     lines = [f"\n## Right now\n", f"You're signed in as **{actor}** ({role})."]
     if unread:
         lines.append(f"**You have {unread} chat message{'s' if unread != 1 else ''} to answer. Reply first:** "
-                     "`GET /api/chat/unread`.")
+                     "`GET /api/chat/inbox`.")
     lines.append(f"Tickets: {counts.get('ready', 0)} ready, {counts.get('in_progress', 0)} in progress, "
                  f"{counts.get('review', 0)} waiting for review, {counts.get('backlog', 0)} in the backlog.")
     if mine:
@@ -3830,6 +3814,12 @@ def what_now(t, me):
     return "In the backlog: not cleared for work yet. Don't work on it; you can comment."
 
 
+# What each request body may contain.
+TICKET_NEW = ("title", "description", "status", "priority", "assignee", "kind", "epic_id", "depends_on")
+TICKET_EDIT = ("title", "description", "status", "priority", "assignee", "epic_id")
+WIKI_FIELDS = ("title", "body", "parent", "slug")
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "agent-tickets"
     sys_version = ""
@@ -3881,21 +3871,15 @@ class Handler(BaseHTTPRequestHandler):
                 if isinstance(t, dict) and "status" in t and "id" in t and "kind" in t:
                     t["what_now"] = what_now(t, actor)
                     mine = (t.get("assignee") or "").lower() == actor.lower()
-                    if mine and t["status"] == "in_progress" and t["kind"] == "task":
+                    if mine and t["status"] == "in_progress" and t["kind"] == "ticket":
                         nudge = self.server.store.comment_nudge(t["id"], actor)
                         if nudge:
                             t["what_now"] += " Note: " + nudge + "."
-                    # Finished predecessors don't block: keep them out of depends_on so nobody thinks they do.
-                    if isinstance(t.get("depends_on"), list):
-                        t["done_dependencies"] = [d for d in t["depends_on"] if d.get("status") == "done"]
-                        t["depends_on"] = [d for d in t["depends_on"] if d.get("status") != "done"]
-                    if "blocked_by" in t:
-                        t["blocked"] = bool(t["blocked_by"])
         if role == "agent" and code < 400:
             # Agents are told about unread chat on every response, and asked to answer it first.
             notice = self.server.store.chat_notice(actor)
             if notice:
-                extra["X-Chat-Unread"] = str(notice["unread"])
+                extra["X-Chat-Inbox"] = str(notice["count"])
                 if isinstance(obj, dict) and not getattr(self, "req_path", "").startswith("/api/chat"):
                     obj = {**obj, "chat": notice}
         self.send(code, json.dumps(obj, default=str), "application/json; charset=utf-8", extra)
@@ -3956,7 +3940,8 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "no file name: " + self.UPLOAD_HELP)
         return name, ctype, size, self.rfile, {}
 
-    def body_json(self):
+    def body_json(self, allowed=None):
+        """The request's JSON object. With `allowed`, any other field is refused (a typo shouldn't be ignored)."""
         n = int(self.headers.get("Content-Length") or 0)
         if n > 2_000_000:
             raise ApiError(413, "request too large")
@@ -3967,6 +3952,11 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "body isn't JSON")
         if not isinstance(data, dict):
             raise ApiError(400, "body should be a JSON object")
+        if allowed is not None:
+            extra = sorted(set(data) - set(allowed))
+            if extra:
+                raise ApiError(400, f"unknown field{'s' if len(extra) > 1 else ''} {', '.join(extra)}; "
+                                    + (f"this takes: {', '.join(allowed)}" if allowed else "this takes no fields"))
         return data
 
     # --- routing
@@ -4021,7 +4011,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.end_headers()
             # Guests read; the only thing they can change is their own display settings.
             if role == "guest" and (method not in ("GET", "HEAD") and path != "/api/me/prefs"
-                                    or path in ("/new", "/wiki-new") or (path == "/api/next" and query.get("claim"))):
+                                    or path in ("/new", "/wiki-new")):
                 raise ApiError(403, "guests can read but not change anything")
             # Changes made with the cookie must come from our own pages.
             if method != "GET" and not bearer and self.headers.get("X-Tickets") != "1":
@@ -4086,9 +4076,9 @@ class Handler(BaseHTTPRequestHandler):
                 if method == "GET":
                     return self.json(200, store.wiki_page(sub))
                 if method == "POST" and not sub:
-                    return self.json(201, store.wiki_create(self.body_json(), actor, role))
-                if method in ("PUT", "PATCH") and sub:
-                    return self.json(200, store.wiki_update(sub, self.body_json(), actor, role))
+                    return self.json(201, store.wiki_create(self.body_json(WIKI_FIELDS), actor, role))
+                if method == "PATCH" and sub:
+                    return self.json(200, store.wiki_update(sub, self.body_json(WIKI_FIELDS), actor, role))
                 if method == "DELETE" and sub:
                     return self.json(200, store.wiki_delete(sub, actor, role))
             um = re.fullmatch(r"/api/users(?:/([^/]+))?(/token)?", path)
@@ -4098,13 +4088,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self.html(render_users(store, actor))
             if method == "GET" and path == "/api/me":
                 return self.json(200, {"username": actor, "kind": role, "guidance": store.guidance_for(actor),
-                                       "chat_unread": (sum(len(c["messages"]) for c in store.chat_attention(actor))
+                                       "chat_inbox": (sum(len(c["messages"]) for c in store.chat_attention(actor))
                                                        if role == "agent" else store.unread_total(actor)),
                                        "prefs": store.prefs(actor)})
             if path == "/api/me/prefs":
                 if method == "GET":
                     return self.json(200, store.prefs(actor))
-                if method in ("PUT", "PATCH"):
+                if method == "PATCH":
                     return self.json(200, store.set_prefs(actor, self.body_json()))
             if path == "/api/guidance":
                 if method == "GET":
@@ -4112,7 +4102,7 @@ class Handler(BaseHTTPRequestHandler):
                 if method == "PUT":
                     if role != "human":
                         raise ApiError(403, "only humans set the guidance")
-                    text = self.body_json().get("guidance")
+                    text = self.body_json(("guidance",)).get("guidance")
                     if text is None:
                         store.db().execute("DELETE FROM settings WHERE key = 'guidance'")
                         store.db().commit()
@@ -4133,13 +4123,13 @@ class Handler(BaseHTTPRequestHandler):
                 if not name and method == "GET":
                     return self.json(200, {"users": store.users()})
                 if not name and method == "POST":
-                    d = self.body_json()
+                    d = self.body_json(("username", "kind"))
                     user, token = store.add_user(d.get("username"), d.get("kind") or "agent", actor)
                     return self.json(201, {"user": user, "token": token})
                 if name and tok and method == "POST":
                     return self.json(200, {"user": store.user(name), "token": store.new_user_token(name)})
                 if name and not tok and method == "PATCH":
-                    d = self.body_json()
+                    d = self.body_json(("disabled", "guidance"))
                     if "disabled" not in d and "guidance" not in d:
                         raise ApiError(400, 'send {"disabled": true|false} and/or {"guidance": "notes for this user"}')
                     if "guidance" in d:
@@ -4153,12 +4143,11 @@ class Handler(BaseHTTPRequestHandler):
                 if role != "human":
                     raise ApiError(403, "only humans can export")
                 return self.serve_export()
-            if path == "/api/next" and method in ("GET", "POST"):
-                # POST claims (GET ?claim=1 too, for older skills); GET alone only looks.
-                if method == "POST":
-                    self.body_json()
-                claim = method == "POST" or bool((query.get("claim") or [""])[0])
-                t = store.claim_next(actor, role, claim)
+            if path == "/api/next" and method == "GET":
+                raise ApiError(405, "take a ticket with POST /api/next; to see what to do, GET /api/wait")
+            if path == "/api/next" and method == "POST":
+                self.body_json(())
+                t = store.claim_next(actor, role, True)
                 out = {"ticket": t, "guidance": store.guidance_for(actor)}
                 started = [w for w in store.work_for(actor) if w["status"] == "in_progress" and (not t or w["id"] != t["id"])]
                 if started:
@@ -4183,20 +4172,20 @@ class Handler(BaseHTTPRequestHandler):
                         kind=(query.get("kind") or [None])[0], epic=(query.get("epic") or [None])[0],
                         proposed=None if prop is None else prop in ("1", "true", "yes"))})
                 if method == "POST":
-                    return self.json(201, store.create(self.body_json(), actor, role))
+                    return self.json(201, store.create(self.body_json(TICKET_NEW), actor, role))
             if m:
                 tid, sub, other = m.group(1), m.group(2), m.group(3)
                 if sub == "/deps" and method == "POST" and not other:
-                    return self.json(200, store.add_dep(tid, str(self.body_json().get("depends_on") or ""), actor, role))
+                    return self.json(200, store.add_dep(tid, str(self.body_json(("depends_on",)).get("depends_on") or ""), actor, role))
                 if sub == "/deps" and method == "DELETE" and other:
                     return self.json(200, store.remove_dep(tid, other, actor, role))
                 if sub == "/cancel" and method == "POST" and not other:
-                    self.body_json()
+                    self.body_json(())
                     return self.json(200, store.cancel(tid, actor, role))
                 if sub in ("/accept", "/decline") and method == "POST" and not other:
                     # Always read the body, even for decline: left unread, it would
                     # be taken for the start of the next request on this connection.
-                    d = self.body_json()
+                    d = self.body_json(("ready", "assignee", "priority") if sub == "/accept" else ())
                     return self.json(200, store.review_proposal(tid, sub == "/accept", bool(d.get("ready")) and sub == "/accept",
                                                                 actor, role, d.get("assignee"), d.get("priority")))
                 if other:
@@ -4204,7 +4193,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not sub and method == "GET":
                     return self.json(200, store.detail(tid))
                 if not sub and method == "PATCH":
-                    return self.json(200, store.update(tid, self.body_json(), actor, role))
+                    return self.json(200, store.update(tid, self.body_json(TICKET_EDIT), actor, role))
                 if sub == "/checklist" and method == "PUT":
                     n = int(self.headers.get("Content-Length") or 0)
                     if n > CHECKLIST_MAX * 4:
@@ -4217,7 +4206,7 @@ class Handler(BaseHTTPRequestHandler):
                             raise ApiError(400, 'send the checklist as text, or JSON {"text": "..."}')
                     return self.json(200, store.put_checklist(tid, raw, actor, role))
                 if sub == "/comments" and method == "POST":
-                    return self.json(201, store.comment(tid, self.body_json().get("body"), actor, role))
+                    return self.json(201, store.comment(tid, self.body_json(("body",)).get("body"), actor, role))
                 if sub == "/attachments" and method == "POST":
                     name, mime, size, stream, fields = self.read_upload(query)
                     cid = (query.get("comment_id") or [fields.get("comment_id") or ""])[0]
@@ -4243,13 +4232,13 @@ class Handler(BaseHTTPRequestHandler):
             if method == "GET":
                 return self.json(200, {"conversations": store.conversations(actor), "unread": store.unread_total(actor)})
             if method == "POST":
-                cid = store.start_conversation(self.body_json(), actor, role)
+                cid = store.start_conversation(self.body_json(("members", "title", "body")), actor, role)
                 return self.json(201, store.conversation_detail(cid, actor, mark=False))
-        if path == "/api/chat/unread" and method == "GET":
+        if path == "/api/chat/inbox" and method == "GET":
             # Agents: everything they still owe (human messages until they reply). Humans: unread.
             convs = store.chat_attention(actor) if role == "agent" else store.unread(actor)
-            return self.json(200, {"unread": sum(len(c["messages"]) for c in convs), "conversations": convs})
-        m = re.fullmatch(r"/api/chat/(\d+)(/messages|/files|/members|/read)?", path)
+            return self.json(200, {"count": sum(len(c["messages"]) for c in convs), "conversations": convs})
+        m = re.fullmatch(r"/api/chat/(\d+)(/messages|/attachments|/members|/read)?", path)
         if m:
             cid, sub = int(m.group(1)), m.group(2)
             if not sub and method == "DELETE":
@@ -4257,16 +4246,16 @@ class Handler(BaseHTTPRequestHandler):
             if not sub and method == "GET":
                 after = (query.get("after") or ["0"])[0]
                 return self.json(200, store.conversation_detail(cid, actor, int(after) if after.isdigit() else 0,
-                                                                mark=not query.get("peek")))
+                                                                mark=False))
             if sub == "/messages" and method == "POST":
-                return self.json(201, store.post_message(cid, self.body_json().get("body"), actor, role))
+                return self.json(201, store.post_message(cid, self.body_json(("body",)).get("body"), actor, role))
             if sub == "/members" and method == "POST":
-                return self.json(200, store.add_member(cid, str(self.body_json().get("username") or ""), actor, role))
+                return self.json(200, store.add_member(cid, str(self.body_json(("username",)).get("username") or ""), actor, role))
             if sub == "/read" and method == "POST":
-                self.body_json()
+                self.body_json(())
                 store.mark_read(store.conversation(cid)["id"], actor)
                 return self.json(200, {"unread": store.unread_total(actor)})
-            if sub == "/files" and method == "POST":
+            if sub == "/attachments" and method == "POST":
                 name, mime, size, stream, fields = self.read_upload(query)
                 mid = (query.get("message_id") or [fields.get("message_id") or ""])[0]
                 return self.json(201, store.add_chat_file(
@@ -4344,11 +4333,10 @@ class Handler(BaseHTTPRequestHandler):
                 left -= len(chunk)
 
 
-def make_server(host, port, data_dir, checklist_roots, max_upload_mb=1024, human_name="human"):
+def make_server(host, port, data_dir, max_upload_mb=1024):
     srv = ThreadingHTTPServer((host, port), Handler)
     srv.daemon_threads = True
-    srv.store = Store(data_dir, checklist_roots)
-    srv.migrated = migrate_keys(srv.store, human_name)
+    srv.store = Store(data_dir)
     srv.max_upload = max_upload_mb << 20
     return srv
 
@@ -4359,11 +4347,7 @@ def main():
     ap.add_argument("--port", type=int, default=int(os.environ.get("AT_PORT", 43917)))
     ap.add_argument("--data", default=os.environ.get("AT_DATA", str(Path(__file__).resolve().parent / "data")),
                     help="folder for the database, uploads and keys")
-    # Checklists are uploaded now; still accepted so older service files start.
-    ap.add_argument("--checklist-root", action="append", default=None, help=argparse.SUPPRESS)
     ap.add_argument("--max-upload-mb", type=int, default=int(os.environ.get("AT_MAX_UPLOAD_MB", 1024)))
-    ap.add_argument("--human-name", default=os.environ.get("AT_HUMAN", "human"),
-                    help="upgrading from the old two-key setup: the username the human key becomes")
     ap.add_argument("--add-user", metavar="NAME", help="add a user, print their token, and exit")
     ap.add_argument("--kind", choices=KINDS, default="agent", help="with --add-user: human or agent (default agent)")
     ap.add_argument("--new-token", metavar="NAME", help="give a user a new token (the old one stops working) and exit")
@@ -4376,22 +4360,20 @@ def main():
     ap.add_argument("--import", dest="import_", metavar="FILE", help="restore a backup into the data folder and exit")
     ap.add_argument("--replace", action="store_true", help="with --import: delete the tickets already there first")
     a = ap.parse_args()
-    roots = a.checklist_root or [str(Path.home())]
     if a.export:
-        dest, counts, pruned = export_to(Store(a.data, roots), a.export, a.keep)
+        dest, counts, pruned = export_to(Store(a.data), a.export, a.keep)
         print(f"Backed up to {dest}: " + ", ".join(f"{n} {t}" for t, n in counts.items())
               + (f" (removed {pruned} old backup{'s' if pruned != 1 else ''})" if pruned else ""))
         return
     if a.import_:
         try:
-            counts = import_archive(Store(a.data, roots), a.import_, a.replace)
+            counts = import_archive(Store(a.data), a.import_, a.replace)
         except (ValueError, OSError, KeyError, tarfile.TarError) as e:
             sys.exit(f"Import failed: {e}")
         print(f"Restored from {a.import_}: " + ", ".join(f"{n} {t}" for t, n in counts.items()))
         return
     if a.add_user or a.new_token or a.disable or a.enable or a.list_users:
-        store = Store(a.data, roots)
-        migrate_keys(store, a.human_name)
+        store = Store(a.data)
         try:
             if a.add_user:
                 u, token = store.add_user(a.add_user, a.kind, "command line")
@@ -4408,10 +4390,8 @@ def main():
         except ApiError as e:
             sys.exit(e.msg)
         return
-    srv = make_server(a.host, a.port, a.data, roots, a.max_upload_mb, a.human_name)
+    srv = make_server(a.host, a.port, a.data, a.max_upload_mb)
     print(f"agent-tickets on http://{a.host}:{a.port}  data: {Path(a.data).resolve()}", flush=True)
-    if srv.migrated:
-        print(f"Turned the old keys.json into users: {', '.join(srv.migrated)} (same tokens).", flush=True)
     if not srv.store.users():
         print("No users yet. Add yourself: python3 agent_tickets.py --add-user NAME --kind human", flush=True)
     srv.serve_forever()

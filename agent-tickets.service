@@ -3,7 +3,7 @@ Description=agent-tickets: ticket tracker for AI agents
 After=network-online.target
 
 [Service]
-ExecStart=/usr/bin/python3 %h/workspace/agent-tickets/agent_tickets.py --human-name Frank
+ExecStart=/usr/bin/python3 %h/workspace/agent-tickets/agent_tickets.py
 WorkingDirectory=%h/workspace/agent-tickets
 Restart=on-failure
 RestartSec=5

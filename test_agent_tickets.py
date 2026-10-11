@@ -22,7 +22,7 @@ class TicketsTest(unittest.TestCase):
         root = Path(cls.tmp.name)
         cls.allowed = root / "work"
         cls.allowed.mkdir()
-        cls.srv = at.make_server("127.0.0.1", 0, root / "data", [str(cls.allowed)], max_upload_mb=1)
+        cls.srv = at.make_server("127.0.0.1", 0, root / "data", max_upload_mb=1)
         cls.url = f"http://127.0.0.1:{cls.srv.server_address[1]}"
         cls.keys = {"human": cls.srv.store.add_user("Frank", "human", "test")[1],
                     "agent": cls.srv.store.add_user("tester", "agent", "test")[1]}
@@ -121,7 +121,8 @@ class TicketsTest(unittest.TestCase):
         a = self.new("backlog", title="new one")
         spaced = a["id"].replace("-", " ").title()
         b = self.new("backlog", title="after both", depends_on=f"kamo, {spaced}")
-        self.assertEqual(sorted(d["id"] for d in self.j("GET", f"/api/tickets/{b['id']}", role="human")[1]["depends_on"]),
+        got = self.j("GET", f"/api/tickets/{b['id']}", role="human")[1]
+        self.assertEqual(sorted(d["id"] for d in got["depends_on"] + got["done_dependencies"]),
                          sorted(["KAMO", a["id"]]))
         self.assertEqual(self.j("DELETE", f"/api/tickets/{b['id']}/deps/{a['id']}", role="human")[0], 200)
         # Both kinds link from chat; look-alike hyphenated words don't.
@@ -185,7 +186,7 @@ class TicketsTest(unittest.TestCase):
         got, lock = [], threading.Lock()
 
         def worker():
-            code, r = self.j("GET", "/api/next?claim=1")
+            code, r = self.j("POST", "/api/next", {})
             if r["ticket"] and r["ticket"]["id"] in ids:
                 with lock:
                     got.append(r["ticket"]["id"])
@@ -324,7 +325,7 @@ class TicketsTest(unittest.TestCase):
                                    ("PATCH", f"/api/tickets/{t['id']}", {"checklist_path": "/etc/passwd"})):
             code, err = self.j(method, path, body, role="human")
             self.assertEqual(code, 400)
-            self.assertIn("PUT /api/tickets/ID/checklist", err["error"])
+            self.assertIn("unknown field checklist_path", err["error"])
         self.assertIsNone(self.j("GET", f"/api/tickets/{self.new()['id']}")[1]["checklist"])
 
     # --- backups
@@ -346,7 +347,7 @@ class TicketsTest(unittest.TestCase):
                 self.assertEqual((doc["format"], doc["version"]), ("agent-tickets-export", 1))
                 self.assertIn("files/", " ".join(tar.getnames()))
             # Restore into a fresh data folder: every row and file comes back as it was.
-            fresh = at.Store(Path(tmp) / "data", [str(self.allowed)])
+            fresh = at.Store(Path(tmp) / "data")
             counts = at.import_archive(fresh, backup)
             self.assertEqual(counts["tickets"], len(doc["tables"]["tickets"]))
             src = self.srv.store
@@ -376,7 +377,7 @@ class TicketsTest(unittest.TestCase):
 
     def test_bad_backups_are_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
-            store = at.Store(Path(tmp) / "data", [tmp])
+            store = at.Store(Path(tmp) / "data")
             def archive(doc, extra=None):
                 p = Path(tmp) / "x.tar.gz"
                 with tarfile.open(p, "w:gz") as tar:
@@ -440,26 +441,12 @@ class TicketsTest(unittest.TestCase):
 
     def test_last_human_cant_be_disabled(self):
         with tempfile.TemporaryDirectory() as tmp:
-            store = at.Store(Path(tmp) / "data", [tmp])
+            store = at.Store(Path(tmp) / "data")
             store.add_user("only", "human", "test")
             with self.assertRaises(at.ApiError):
                 store.set_disabled("only", True)
             store.add_user("second", "human", "test")
             self.assertTrue(store.set_disabled("only", True)["disabled"])
-
-    def test_old_keys_become_users(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            data = Path(tmp) / "data"
-            data.mkdir()
-            (data / "keys.json").write_text(json.dumps({"human": "old-human-key", "agent": "old-agent-key"}))
-            srv = at.make_server("127.0.0.1", 0, data, [tmp], human_name="Frank")
-            try:
-                self.assertEqual(srv.migrated, ["Frank", "agent"])
-                self.assertFalse((data / "keys.json").exists())
-                self.assertEqual(srv.store.user_by_token("old-human-key")["username"], "Frank")
-                self.assertEqual(srv.store.user_by_token("old-agent-key")["kind"], "agent")
-            finally:
-                srv.server_close()
 
     def test_briefing(self):
         # Public: no token needed, and it explains the workflow.
@@ -496,12 +483,12 @@ class TicketsTest(unittest.TestCase):
         self.assertEqual(for_a["assignee"], "agent-a")  # stored with the user's own spelling
         self.assertEqual(self.j("POST", "/api/tickets", {"title": "x", "assignee": "nobody"}, role="human")[0], 404)
         # agent-a gets its own ticket first (despite lower priority), then the unassigned one, never b's.
-        n1 = self.j("GET", "/api/next?claim=1", role=None, token=a1)[1]
+        n1 = self.j("POST", "/api/next", {}, role=None, token=a1)[1]
         self.assertEqual(n1["ticket"]["id"], for_a["id"])
         self.assertIn("How we work", n1["guidance"])
-        n2 = self.j("GET", "/api/next?claim=1", role=None, token=a1)[1]["ticket"]
+        n2 = self.j("POST", "/api/next", {}, role=None, token=a1)[1]["ticket"]
         self.assertEqual((n2["id"], n2["assignee"]), (loose["id"], "agent-a"))
-        self.assertIsNone(self.j("GET", "/api/next?claim=1", role=None, token=a1)[1]["ticket"])
+        self.assertIsNone(self.j("POST", "/api/next", {}, role=None, token=a1)[1]["ticket"])
         # Someone else's ticket: comment yes, change no.
         self.assertEqual(self.j("PATCH", f"/api/tickets/{for_b['id']}", {"status": "in_progress"}, role=None, token=a1)[0], 403)
         self.assertEqual(self.j("POST", f"/api/tickets/{for_b['id']}/comments", {"body": "fyi"}, role=None, token=a1)[0], 201)
@@ -598,7 +585,7 @@ class TicketsTest(unittest.TestCase):
         self.assertEqual(self.j("PATCH", f"/api/tickets/{e['id']}", {"status": "done"}, role="human")[0], 400)
         self.assertEqual(self.j("POST", f"/api/tickets/{e['id']}/comments", {"body": "plan ok"}, role=None, token=tok)[0], 201)
         self.j("PATCH", f"/api/tickets/{s1['id']}", {"assignee": "agent-e"}, role="human")
-        n = self.j("GET", "/api/next?claim=1", role=None, token=tok)[1]["ticket"]
+        n = self.j("POST", "/api/next", {}, role=None, token=tok)[1]["ticket"]
         self.assertEqual(n["id"], s1["id"])
         # Declining an epic declines its proposed tickets.
         e2 = self.j("POST", "/api/tickets", {"title": "Plan B", "kind": "epic"}, role=None, token=tok)[1]
@@ -622,8 +609,8 @@ class TicketsTest(unittest.TestCase):
             self.assertIn(first["id"], err["error"])
         self.assertEqual(self.j("POST", f"/api/tickets/{then['id']}/comments", {"body": "idea"}, role=None, token=tok)[0], 201)
         # /api/next skips it despite its higher priority.
-        self.assertEqual(self.j("GET", "/api/next?claim=1", role=None, token=tok)[1]["ticket"]["id"], first["id"])
-        self.assertNotEqual((self.j("GET", "/api/next", role=None, token=tok)[1]["ticket"] or {}).get("id"), then["id"])
+        self.assertEqual(self.j("POST", "/api/next", {}, role=None, token=tok)[1]["ticket"]["id"], first["id"])
+        self.assertNotIn(then["id"], [w["id"] for w in self.j("GET", "/api/wait?timeout=1", role=None, token=tok)[1]["tickets"]])
         self.assertIn("Blocked", self.call("GET", f"/t/{then['id']}", role="human")[1].decode())
         # Loops are refused; so are dependencies on epics.
         self.assertEqual(self.j("POST", f"/api/tickets/{first['id']}/deps", {"depends_on": then["id"]}, role="human")[0], 409)
@@ -636,7 +623,7 @@ class TicketsTest(unittest.TestCase):
         # Done predecessor: unblocked, and claimable.
         self.j("PATCH", f"/api/tickets/{first['id']}", {"status": "review"}, role=None, token=tok)
         self.j("PATCH", f"/api/tickets/{first['id']}", {"status": "done"}, role="human")
-        self.assertEqual(self.j("GET", "/api/next?claim=1", role=None, token=tok)[1]["ticket"]["id"], then["id"])
+        self.assertEqual(self.j("POST", "/api/next", {}, role=None, token=tok)[1]["ticket"]["id"], then["id"])
         got = self.j("GET", f"/api/tickets/{first['id']}", role="human")[1]
         self.assertEqual([u["id"] for u in got["unblocks"]], [then["id"]])
         # Removing a dependency unblocks too (the human's override).
@@ -647,9 +634,10 @@ class TicketsTest(unittest.TestCase):
         self.j("POST", f"/api/tickets/{third['id']}/deps", {"depends_on": first["id"]}, role="human")
         with tempfile.TemporaryDirectory() as tmp:
             at.export_archive(self.srv.store, Path(tmp) / "b.tar.gz")
-            other = at.Store(Path(tmp) / "data", [tmp])
+            other = at.Store(Path(tmp) / "data")
             at.import_archive(other, Path(tmp) / "b.tar.gz")
-            self.assertEqual([x["id"] for x in other.detail(third["id"])["depends_on"]], [first["id"]])
+            got = other.detail(third["id"])
+            self.assertEqual([x["id"] for x in got["depends_on"] + got["done_dependencies"]], [first["id"]])
 
     # --- chat
     def test_chat(self):
@@ -663,17 +651,17 @@ class TicketsTest(unittest.TestCase):
         # Any ticket response tells the agent, until it answers.
         code, got, h = self.call("PATCH", f"/api/tickets/{t['id']}", {"status": "in_progress"}, role=None, token=tok)
         got = json.loads(got)
-        self.assertEqual((got["status"], got["chat"]["unread"], h["X-Chat-Unread"]), ("in_progress", 1, "1"))
+        self.assertEqual((got["status"], got["chat"]["count"], h["X-Chat-Inbox"]), ("in_progress", 1, "1"))
         self.assertIn("Answer chat", got["chat"]["notice"])
-        self.assertEqual(self.j("GET", "/api/next", role=None, token=tok)[1]["chat"]["conversations"][0]["id"], c["id"])
+        self.assertEqual(self.j("GET", f"/api/tickets/{t['id']}", role=None, token=tok)[1]["chat"]["conversations"][0]["id"], c["id"])
         self.assertIn("chat message to answer", self.call("GET", "/api", role=None, token=tok)[1].decode())
-        self.assertEqual(self.j("GET", "/api/me", role=None, token=tok)[1]["chat_unread"], 1)
-        unread = self.j("GET", "/api/chat/unread", role=None, token=tok)[1]
-        self.assertEqual((unread["unread"], unread["conversations"][0]["messages"][0]["author"]), (1, "Frank"))
+        self.assertEqual(self.j("GET", "/api/me", role=None, token=tok)[1]["chat_inbox"], 1)
+        unread = self.j("GET", "/api/chat/inbox", role=None, token=tok)[1]
+        self.assertEqual((unread["count"], unread["conversations"][0]["messages"][0]["author"]), (1, "Frank"))
         self.assertNotIn("chat", unread)  # chat endpoints don't nag about themselves
         # It answers, with a file; the notice is gone, and Frank now has one unread.
         m = self.j("POST", f"/api/chat/{c['id']}/messages", {"body": "ZZZZ. Notes attached."}, role=None, token=tok)[1]
-        f = self.j("POST", f"/api/chat/{c['id']}/files?filename=notes.md&message_id={m['id']}", raw=b"# Notes\n- a\n",
+        f = self.j("POST", f"/api/chat/{c['id']}/attachments?filename=notes.md&message_id={m['id']}", raw=b"# Notes\n- a\n",
                    role=None, token=tok)[1]
         self.assertEqual(f["mime"], "text/markdown")
         self.assertNotIn("chat", self.j("GET", f"/api/tickets/{t['id']}", role=None, token=tok)[1])
@@ -706,9 +694,9 @@ class TicketsTest(unittest.TestCase):
         # Wide open: anyone reads and posts; adding someone tells them (once).
         self.assertEqual(self.j("GET", f"/api/chat/{c['id']}", role=None, token=other)[0], 200)
         self.j("POST", f"/api/chat/{g['id']}/members", {"username": "agent-o"}, role="human")
-        self.assertEqual(self.j("GET", "/api/chat/unread", role=None, token=other)[1]["unread"], 1)
+        self.assertEqual(self.j("GET", "/api/chat/inbox", role=None, token=other)[1]["count"], 1)
         self.j("POST", f"/api/chat/{g['id']}/read", {}, role=None, token=other)
-        self.assertEqual(self.j("GET", "/api/me", role=None, token=other)[1]["chat_unread"], 0)
+        self.assertEqual(self.j("GET", "/api/me", role=None, token=other)[1]["chat_inbox"], 0)
         # A ticket from a message.
         new = self.call("GET", f"/new?from_message={m['id']}", role="human")[1].decode()
         self.assertIn("&gt; ZZZZ. Notes attached.", new)
@@ -718,11 +706,11 @@ class TicketsTest(unittest.TestCase):
         # Backups carry conversations, messages and their files.
         with tempfile.TemporaryDirectory() as tmp:
             at.export_archive(self.srv.store, Path(tmp) / "b.tar.gz")
-            restored = at.Store(Path(tmp) / "data", [tmp])
+            restored = at.Store(Path(tmp) / "data")
             at.import_archive(restored, Path(tmp) / "b.tar.gz")
             msgs = restored.messages(c["id"], internal=True)
-            self.assertEqual(msgs[1]["files"][0]["filename"], "notes.md")
-            self.assertTrue((restored.files / msgs[1]["files"][0]["_path"]).is_file())
+            self.assertEqual(msgs[1]["attachments"][0]["filename"], "notes.md")
+            self.assertTrue((restored.files / msgs[1]["attachments"][0]["_path"]).is_file())
 
     # --- wiki
     def test_wiki(self):
@@ -746,15 +734,15 @@ class TicketsTest(unittest.TestCase):
         self.assertIn("projects/fitness-pizza/deploy", json.dumps(tree))
         self.assertEqual(self.j("GET", "/api/wiki?q=deploy.sh", role=None, token=tok)[1]["results"][0]["path"],
                          "projects/fitness-pizza/deploy")
-        for method, path, body in (("POST", "/api/wiki", {"title": "x"}), ("PUT", "/api/wiki/projects", {"body": "x"}),
+        for method, path, body in (("POST", "/api/wiki", {"title": "x"}), ("PATCH", "/api/wiki/projects", {"body": "x"}),
                                    ("DELETE", "/api/wiki/projects/deploy", None)):
             self.assertEqual(self.j(method, path, body, role=None, token=tok)[0], 403, path)
         self.assertEqual(self.call("GET", "/wiki-new", role=None, token=tok)[0], 403)
         # Edits keep history; rename and move change the path; no moving under itself.
-        self.j("PUT", "/api/wiki/projects/fitness-pizza", {"body": fp["body"] + "\nMore."}, role="human")
-        moved = self.j("PUT", "/api/wiki/projects/deploy", {"parent": "", "slug": "deploying"}, role="human")[1]
+        self.j("PATCH", "/api/wiki/projects/fitness-pizza", {"body": fp["body"] + "\nMore."}, role="human")
+        moved = self.j("PATCH", "/api/wiki/projects/deploy", {"parent": "", "slug": "deploying"}, role="human")[1]
         self.assertEqual(moved["path"], "deploying")
-        self.assertEqual(self.j("PUT", "/api/wiki/projects", {"parent": "projects/fitness-pizza"}, role="human")[0], 409)
+        self.assertEqual(self.j("PATCH", "/api/wiki/projects", {"parent": "projects/fitness-pizza"}, role="human")[0], 409)
         self.assertEqual(len(self.srv.store.wiki_revisions(fp["id"])), 2)
         # Only leaf pages can be deleted.
         self.assertEqual(self.j("DELETE", "/api/wiki/projects/fitness-pizza", role="human")[0], 409)
@@ -781,10 +769,10 @@ class TicketsTest(unittest.TestCase):
         sections = [line for line in brief.splitlines() if line.startswith("Wiki sections:")]
         self.assertIn("Projects (`projects`)", sections[0])
         late = mk(title="Later section")[1]
-        self.j("PUT", "/api/wiki/projects", {"parent": late["path"]}, role="human")
+        self.j("PATCH", "/api/wiki/projects", {"parent": late["path"]}, role="human")
         with tempfile.TemporaryDirectory() as tmp:
             at.export_archive(self.srv.store, Path(tmp) / "b.tar.gz")
-            restored = at.Store(Path(tmp) / "data", [tmp])
+            restored = at.Store(Path(tmp) / "data")
             at.import_archive(restored, Path(tmp) / "b.tar.gz")
             self.assertEqual(restored.wiki_page("later-section/projects/fitness-pizza/deploy")["title"], "Deploy")
 
@@ -838,7 +826,8 @@ class TicketsTest(unittest.TestCase):
         self.assertEqual(self.j("GET", f"/api/tickets/{k['id']}", role="human")[1]["assignee"], "agent-r")
         # Declining ignores it.
         d = self.j("POST", "/api/tickets", {"title": "Nah"}, role=None, token=tok)[1]
-        self.assertIsNone(self.j("POST", f"/api/tickets/{d['id']}/decline", {"assignee": "agent-r"}, role="human")[1]["assignee"])
+        self.assertEqual(self.j("POST", f"/api/tickets/{d['id']}/decline", {"assignee": "agent-r"}, role="human")[0], 400)
+        self.assertIsNone(self.j("POST", f"/api/tickets/{d['id']}/decline", {}, role="human")[1]["assignee"])
         # Make ready for someone, in one step; the pages offer the picker.
         b = self.new("backlog", title="Later")
         got = self.j("PATCH", f"/api/tickets/{b['id']}", {"status": "ready", "assignee": "agent-r"}, role="human")[1]
@@ -1011,12 +1000,12 @@ class TicketsTest(unittest.TestCase):
         # Chat comes before everything, and keeps returning at once until it's read.
         later(lambda: self.j("POST", "/api/chat", {"members": ["agent-z"], "body": "got a sec?"}, role="human"))
         got, _ = waited()
-        self.assertEqual((got["reason"], got["chat"]["unread"]), ("chat", 1))
+        self.assertEqual((got["reason"], got["chat"]["count"]), ("chat", 1))
         self.assertEqual(W()["reason"], "chat")
-        for c in self.j("GET", "/api/chat/unread", role=None, token=tok)[1]["conversations"]:
+        for c in self.j("GET", "/api/chat/inbox", role=None, token=tok)[1]["conversations"]:
             self.j("POST", f"/api/chat/{c['id']}/read", {}, role=None, token=tok)
         self.assertEqual(W("/api/wait?timeout=1")["reason"], "chat")  # read isn't enough: a human asked
-        for c in self.j("GET", "/api/chat/unread", role=None, token=tok)[1]["conversations"]:
+        for c in self.j("GET", "/api/chat/inbox", role=None, token=tok)[1]["conversations"]:
             self.j("POST", f"/api/chat/{c['id']}/messages", {"body": "Got it"}, role=None, token=tok)
         self.assertEqual(W("/api/wait?timeout=1")["reason"], "timeout")
         # The briefing and skill teach it.
@@ -1032,7 +1021,10 @@ class TicketsTest(unittest.TestCase):
         c = self.j("POST", "/api/chat", {"members": ["agent-rr"], "body": "ping"}, role="human")[1]
         html = self.call("GET", f"/chat/{c['id']}", role="human")[1].decode()
         self.assertIn("Not read yet by agent-rr", html)
-        conv = self.j("GET", f"/api/chat/{c['id']}", role=None, token=tok)[1]  # reading it marks it read
+        conv = self.j("GET", f"/api/chat/{c['id']}", role=None, token=tok)[1]  # GET changes nothing...
+        self.assertIn("Not read yet by agent-rr", self.call("GET", f"/chat/{c['id']}", role="human")[1].decode())
+        self.j("POST", f"/api/chat/{c['id']}/read", {}, role=None, token=tok)  # ...marking it read does
+        conv = self.j("GET", f"/api/chat/{c['id']}", role=None, token=tok)[1]
         self.assertEqual(conv["read_up_to"]["Frank"], conv["messages"][-1]["id"])
         html = self.call("GET", f"/chat/{c['id']}", role="human")[1].decode()
         self.assertIn("Read by agent-rr", html)
@@ -1096,7 +1088,7 @@ class TicketsTest(unittest.TestCase):
         # Out-of-step epics (from before this rule) are fixed when the server starts.
         with self.srv.store.db() as db:
             db.execute("UPDATE tickets SET status = 'backlog' WHERE id = ?", (e["id"],))
-        at.Store(self.srv.store.dir, [])
+        at.Store(self.srv.store.dir)
         self.assertEqual(state(), "active")  # parts d and r are still open
 
     def test_nav_and_settings(self):
@@ -1123,14 +1115,14 @@ class TicketsTest(unittest.TestCase):
     def test_tts_mode(self):
         self.assertEqual(self.j("GET", "/api/me/prefs", role="human")[1], {"tts": False})
         self.assertNotIn('<html lang="en" data-tts="1">', self.call("GET", "/", role="human")[1].decode())
-        self.assertEqual(self.j("PUT", "/api/me/prefs", {"tts": True}, role="human")[1], {"tts": True})
-        self.assertEqual(self.j("PUT", "/api/me/prefs", {"loud": True}, role="human")[0], 400)
+        self.assertEqual(self.j("PATCH", "/api/me/prefs", {"tts": True}, role="human")[1], {"tts": True})
+        self.assertEqual(self.j("PATCH", "/api/me/prefs", {"loud": True}, role="human")[0], 400)
         self.assertIn('<html lang="en" data-tts="1">', self.call("GET", "/", role="human")[1].decode())
         self.assertIn('id="tts" style="width:22px;height:22px" checked', self.call("GET", "/settings", role="human")[1].decode())
         self.assertEqual(self.j("GET", "/api/me", role="human")[1]["prefs"], {"tts": True})
         # It's per user: the agent's pages aren't affected.
         self.assertNotIn('<html lang="en" data-tts="1">', self.call("GET", "/settings", role="agent")[1].decode())
-        self.j("PUT", "/api/me/prefs", {"tts": False}, role="human")
+        self.j("PATCH", "/api/me/prefs", {"tts": False}, role="human")
 
     def test_guest(self):
         guest = self.j("POST", "/api/users", {"username": "visitor", "kind": "guest"}, role="human")[1]["token"]
@@ -1140,7 +1132,7 @@ class TicketsTest(unittest.TestCase):
         g = lambda m, path, body=None: self.j(m, path, body, role=None, token=guest)
         # Reads work.
         for path in ("/api/tickets", f"/api/tickets/{t['id']}", "/api/chat", f"/api/chat/{c['id']}", "/api/wiki",
-                     "/api/wiki/guest-readable", "/api/me", "/api/next"):
+                     "/api/wiki/guest-readable", "/api/me", "/api/wait?timeout=1"):
             self.assertEqual(g("GET", path)[0], 200, path)
         for path in ("/", f"/t/{t['id']}", "/backlog", "/done", "/chat", f"/chat/{c['id']}", "/wiki", "/settings"):
             self.assertEqual(self.call("GET", path, role=None, token=guest)[0], 200, path)
@@ -1149,12 +1141,12 @@ class TicketsTest(unittest.TestCase):
                               ("POST", f"/api/tickets/{t['id']}/comments", {"body": "x"}),
                               ("POST", f"/api/tickets/{t['id']}/cancel", {}), ("POST", f"/api/chat/{c['id']}/messages", {"body": "x"}),
                               ("POST", "/api/chat", {"title": "x"}), ("POST", "/api/wiki", {"title": "x"}),
-                              ("GET", "/api/next?claim=1", None)):
+                              ("POST", "/api/next", {})):
             self.assertEqual(g(m, path, body)[0], 403, path)
         self.assertEqual(self.call("GET", "/new", role=None, token=guest)[0], 403)
         self.assertEqual(self.call("GET", "/users", role=None, token=guest)[0], 403)
         # Their own display settings are theirs.
-        self.assertEqual(g("PUT", "/api/me/prefs", {"tts": True})[0], 200)
+        self.assertEqual(g("PATCH", "/api/me/prefs", {"tts": True})[0], 200)
         # Guests aren't assignable or chat members, and aren't offered as either.
         self.assertEqual(self.j("PATCH", f"/api/tickets/{t['id']}", {"assignee": "visitor"}, role="human")[0], 400)
         self.assertEqual(self.j("POST", "/api/chat", {"members": ["visitor"]}, role="human")[0], 400)
@@ -1182,7 +1174,7 @@ class TicketsTest(unittest.TestCase):
         self.assertTrue(say(a1).startswith("Assigned to you and ready: start it"))
         self.assertTrue(say(a2).startswith("Ready, but assigned to agent-w1"))
         # Claiming: the ticket that comes back says it's yours to work, now.
-        got = self.j("GET", "/api/next?claim=1", role=None, token=a1)[1]["ticket"]
+        got = self.j("POST", "/api/next", {}, role=None, token=a1)[1]["ticket"]
         self.assertEqual(got["id"], t["id"])
         self.assertTrue(got["what_now"].startswith("This ticket is yours and in progress: you are working on it now"))
         self.assertEqual(say(a2), "agent-w1 is working on this: you can only comment.")
@@ -1214,23 +1206,24 @@ class TicketsTest(unittest.TestCase):
         got = self.j("GET", f"/api/tickets/{then['id']}", role=None, token=tok)[1]
         self.assertEqual((got["blocked"], got["depends_on"], len(got["done_dependencies"])), (False, [], 2))
         self.assertFalse(got["what_now"].startswith("Blocked"))
-        # Humans' view keeps the full list.
-        self.assertEqual(len(self.j("GET", f"/api/tickets/{then['id']}", role="human")[1]["depends_on"]), 2)
+        # Everyone sees the same shape.
+        human = self.j("GET", f"/api/tickets/{then['id']}", role="human")[1]
+        self.assertEqual((human["depends_on"], len(human["done_dependencies"]), human["blocked"]), ([], 2, False))
         self.assertIn("**A\npredecessor that's done no longer blocks anything.**", self.call("GET", "/api", role=None)[1].decode())
 
     def test_chat_until_replied(self):
         tok = self.j("POST", "/api/users", {"username": "agent-rp", "kind": "agent"}, role="human")[1]["token"]
         other = self.j("POST", "/api/users", {"username": "agent-rq", "kind": "agent"}, role="human")[1]["token"]
-        me = lambda: self.j("GET", "/api/me", role=None, token=tok)[1]["chat_unread"]
+        me = lambda: self.j("GET", "/api/me", role=None, token=tok)[1]["chat_inbox"]
         c = self.j("POST", "/api/chat", {"members": ["agent-rp"], "body": "Can you check the deploy?"}, role="human")[1]
         self.assertEqual(me(), 1)
         # Reading it (opening the conversation, or marking it read) doesn't clear it.
         self.j("GET", f"/api/chat/{c['id']}", role=None, token=tok)
         self.j("POST", f"/api/chat/{c['id']}/read", {}, role=None, token=tok)
-        notice = self.j("GET", "/api/next", role=None, token=tok)[1]["chat"]
-        self.assertEqual((notice["unread"], notice["conversations"][0]["needs_reply"]), (1, True))
+        notice = self.j("GET", "/api/tickets", role=None, token=tok)[1]["chat"]
+        self.assertEqual((notice["count"], notice["conversations"][0]["needs_reply"]), (1, True))
         self.assertIn("until you reply there", notice["notice"])
-        self.assertEqual(self.j("GET", "/api/chat/unread", role=None, token=tok)[1]["conversations"][0]["needs_reply"], True)
+        self.assertEqual(self.j("GET", "/api/chat/inbox", role=None, token=tok)[1]["conversations"][0]["needs_reply"], True)
         # Humans still see it as read (the receipt), whatever the agent owes.
         self.assertIn("Read by agent-rp", self.call("GET", f"/chat/{c['id']}", role="human")[1].decode())
         # Replying clears it; a new human message brings it back.
@@ -1269,9 +1262,10 @@ class TicketsTest(unittest.TestCase):
         tok = self.j("POST", "/api/users", {"username": "agent-cc", "kind": "agent"}, role="human")[1]["token"]
         first = self.new("ready", title="cc first", assignee="agent-cc", priority=1)
         second = self.new("ready", title="cc second", assignee="agent-cc", priority=1)
-        # GET only looks; POST claims.
-        peek = self.j("GET", "/api/next", role=None, token=tok)[1]["ticket"]
-        self.assertEqual((peek["id"], peek["status"]), (first["id"], "ready"))
+        # POST takes a ticket; GET is refused with directions.
+        code, err = self.j("GET", "/api/next", role=None, token=tok)
+        self.assertEqual(code, 405)
+        self.assertIn("POST /api/next", err["error"])
         got = self.j("POST", "/api/next", {}, role=None, token=tok)[1]
         self.assertEqual((got["ticket"]["id"], got["ticket"]["status"]), (first["id"], "in_progress"))
         self.assertNotIn("in_progress", got)  # nothing else under way
@@ -1326,7 +1320,7 @@ class TicketsTest(unittest.TestCase):
     def test_delete_chat(self):
         tok = self.j("POST", "/api/users", {"username": "agent-dc", "kind": "agent"}, role="human")[1]["token"]
         c = self.j("POST", "/api/chat", {"members": ["agent-dc"], "body": "temporary"}, role="human")[1]
-        f = self.j("POST", f"/api/chat/{c['id']}/files?filename=x.txt", raw=b"bye", role="human")[1]
+        f = self.j("POST", f"/api/chat/{c['id']}/attachments?filename=x.txt", raw=b"bye", role="human")[1]
         path = self.srv.store.files / self.srv.store.chat_file(f["id"])["path"]
         self.assertTrue(path.is_file())
         self.assertIn("deleteChat()", self.call("GET", f"/chat/{c['id']}", role="human")[1].decode())
@@ -1334,7 +1328,7 @@ class TicketsTest(unittest.TestCase):
         self.assertEqual(self.j("DELETE", f"/api/chat/{c['id']}", role="human")[1]["deleted"], c["id"])
         self.assertEqual(self.j("GET", f"/api/chat/{c['id']}", role="human")[0], 404)
         self.assertFalse(path.exists())
-        self.assertEqual(self.j("GET", "/api/me", role=None, token=tok)[1]["chat_unread"], 0)  # nothing owed any more
+        self.assertEqual(self.j("GET", "/api/me", role=None, token=tok)[1]["chat_inbox"], 0)  # nothing owed any more
 
     def test_page_scripts_parse(self):
         """Every script the pages carry is valid JavaScript (a stray quote breaks a whole page). Needs node."""
@@ -1356,6 +1350,37 @@ class TicketsTest(unittest.TestCase):
             for i, js in enumerate(re.findall(r"<script>(.*?)</script>", html, re.S)):
                 r = subprocess.run(["node", "--check", "-"], input=js, text=True, capture_output=True)
                 self.assertEqual(r.returncode, 0, f"{path} script {i}: {r.stderr}")
+
+    def test_api_conventions(self):
+        tok = self.j("POST", "/api/users", {"username": "agent-cv", "kind": "agent"}, role="human")[1]["token"]
+        t = self.new("ready", title="conventions")
+        # Typos are refused, naming what's accepted.
+        code, err = self.j("PATCH", f"/api/tickets/{t['id']}", {"titel": "oops"}, role="human")
+        self.assertEqual(code, 400)
+        self.assertIn("unknown field titel", err["error"])
+        self.assertIn("title", err["error"])
+        self.assertEqual(self.j("POST", f"/api/tickets/{t['id']}/comments", {"body": "x", "author": "me"}, role="human")[0], 400)
+        self.assertEqual(self.j("POST", f"/api/tickets/{t['id']}/cancel", {"why": "dup"}, role="human")[0], 400)
+        # Ordinary tickets are kind "ticket".
+        self.assertEqual(t["kind"], "ticket")
+        self.assertEqual(self.j("POST", "/api/tickets", {"title": "x", "kind": "task"}, role="human")[0], 400)
+        # Chat attachments are named like ticket ones; GET never marks anything read.
+        c = self.j("POST", "/api/chat", {"members": ["agent-cv"], "body": "see file"}, role="human")[1]
+        mid = c["messages"][0]["id"]
+        self.assertEqual(self.j("POST", f"/api/chat/{c['id']}/attachments?filename=a.txt&message_id={mid}", raw=b"a",
+                                role="human")[0], 201)
+        msg = self.j("GET", f"/api/chat/{c['id']}", role=None, token=tok)[1]["messages"][0]
+        self.assertEqual(msg["attachments"][0]["filename"], "a.txt")
+        self.assertEqual(self.j("GET", "/api/me", role=None, token=tok)[1]["chat_inbox"], 1)
+        self.assertEqual(self.j("GET", "/api/chat/inbox", role=None, token=tok)[1]["count"], 1)
+        # PATCH changes fields; the wiki has no PUT.
+        self.j("POST", "/api/wiki", {"title": "Conv"}, role="human")
+        self.assertEqual(self.j("PUT", "/api/wiki/conv", {"body": "x"}, role="human")[0], 404)
+        self.assertEqual(self.j("PATCH", "/api/wiki/conv", {"body": "x"}, role="human")[0], 200)
+        brief = self.call("GET", "/api", role=None)[1].decode()
+        self.assertIn("Conventions: `GET` never changes anything.", brief)
+        for gone in ("claim=1", "/api/chat/unread", '"task"', "?peek", "chat/ID/files"):
+            self.assertNotIn(gone, brief)
 
     def test_skill(self):
         code, body, h = self.call("GET", "/api/skill", role="agent", headers={"Host": "tickets.example:43917"})
@@ -1380,7 +1405,7 @@ class TicketsTest(unittest.TestCase):
               INSERT INTO tickets VALUES ('KAMI', 'old', '', 'ready', 2, NULL, 'frank', 1, 1);
               PRAGMA user_version = 1;""")
             db.close()
-            store = at.Store(data, [tmp])
+            store = at.Store(data)
             self.assertIsNone(store.ticket("KAMI")["assignee"])
             self.assertEqual(store.db().execute("PRAGMA user_version").fetchone()[0], at.SCHEMA_VERSION)
 

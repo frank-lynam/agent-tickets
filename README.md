@@ -95,7 +95,7 @@ the ticket's comments.
 ticket response it gets (`/api/next`, reading or updating a ticket,
 comments, uploads) carries a `chat` notice telling it to reply before its
 next step, `/api/wait` returns `chat`, and every API response has an
-`X-Chat-Unread` header. **A message from a human keeps notifying the agent
+`X-Chat-Inbox` header. **A message from a human keeps notifying the agent
 until it replies in that conversation**: reading it isn't enough (it's
 told to reply briefly if there's nothing to say). Messages from other
 agents, and "(added ...)" notes, only need reading, so two agents can't
@@ -194,10 +194,6 @@ comment). Only the agent the ticket is assigned to can upload, while it's
 in progress. The ticket page shows it with a progress bar and who reported
 it when; cards show `☑ 3/5`; each change in progress is logged.
 
-The server no longer reads checklist files from disk: `checklist_path` is
-refused with directions, and `--checklist-root` is accepted but ignored so
-older service files still start.
-
 **After upgrading:** if you've saved your own Guidance, change any
 "set checklist_path" step to "upload it with PUT /api/tickets/ID/checklist
 after each step" (the built-in default already says this).
@@ -261,7 +257,6 @@ Then open `http://127.0.0.1:43917/?key=<your token>`.
 | `--port` / `AT_PORT` | `43917` | |
 | `--data` / `AT_DATA` | `./data` | the database (tickets, users) and uploaded files |
 | `--max-upload-mb` | `1024` | per file |
-| `--human-name` / `AT_HUMAN` | `human` | only when upgrading from the old two-key setup: the username the human key becomes |
 
 As a service (systemd user unit, starts at boot when lingering is on):
 
