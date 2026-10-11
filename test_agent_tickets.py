@@ -144,6 +144,10 @@ class TicketsTest(unittest.TestCase):
         tid = t["id"]
         self.assertEqual(self.j("PATCH", f"/api/tickets/{tid}", {"status": "in_progress"})[1]["status"], "in_progress")
         self.assertEqual(self.j("PATCH", f"/api/tickets/{tid}", {"status": "done"})[0], 403)
+        code, err = self.j("PATCH", f"/api/tickets/{tid}", {"status": "review"})  # no comment yet: refused
+        self.assertEqual(code, 409)
+        self.assertIn('"Done" or "Needs a decision"', err["error"])
+        self.j("POST", f"/api/tickets/{tid}/comments", {"body": "Done. All green."})
         self.assertEqual(self.j("PATCH", f"/api/tickets/{tid}", {"status": "review"})[1]["status"], "review")
         # The human approves; then the agent can only comment.
         self.assertEqual(self.j("PATCH", f"/api/tickets/{tid}", {"status": "done"}, role="human")[1]["status"], "done")
@@ -306,6 +310,7 @@ class TicketsTest(unittest.TestCase):
         self.assertEqual(put("- [ ] x", token=self.keys["agent"])[0], 403)  # another agent
         self.assertEqual(put("   ")[0], 400)
         self.assertEqual(put("x" * (at.CHECKLIST_MAX + 1))[0], 413)
+        self.j("POST", f"/api/tickets/{t['id']}/comments", {"body": "Done."}, role=None, token=tok)
         self.j("PATCH", f"/api/tickets/{t['id']}", {"status": "review"}, role=None, token=tok)
         self.assertEqual(put("- [ ] late")[0], 409)
         # Lists and pages show progress; the old path field is refused with directions.
@@ -462,7 +467,7 @@ class TicketsTest(unittest.TestCase):
         self.assertEqual(code, 200)
         text = body.decode()
         self.assertIn("text/markdown", h["Content-Type"])
-        for must in ("backlog -> ready -> in_progress -> review -> done", "/api/next?claim=1", "Needs a decision",
+        for must in ("backlog -> ready -> in_progress -> review -> done", "POST /api/next", "Needs a decision",
                      "Authorization: Bearer"):
             self.assertIn(must, text)
         self.assertNotIn("Right now", text)
@@ -503,7 +508,8 @@ class TicketsTest(unittest.TestCase):
         # Agents assign only themselves (or no one).
         self.assertEqual(self.j("PATCH", f"/api/tickets/{n2['id']}", {"assignee": "agent-b"}, role=None, token=a1)[0], 403)
         self.assertIsNone(self.j("PATCH", f"/api/tickets/{n2['id']}", {"assignee": None}, role=None, token=a1)[1]["assignee"])
-        # Starting an unassigned ticket assigns it.
+        # Starting an unassigned ticket assigns it. (Releasing one needs a word about where you got to.)
+        self.j("POST", f"/api/tickets/{n2['id']}/comments", {"body": "Releasing: not started."}, role=None, token=a1)
         self.assertEqual(self.j("PATCH", f"/api/tickets/{n2['id']}", {"status": "ready"}, role=None, token=a1)[0], 200)
         started = self.j("PATCH", f"/api/tickets/{n2['id']}", {"status": "in_progress"}, role=None, token=a2)[1]
         self.assertEqual(started["assignee"], "agent-b")
@@ -871,6 +877,7 @@ class TicketsTest(unittest.TestCase):
         self.assertIn("Cancel ticket", page)
         self.assertEqual(self.j("POST", f"/api/tickets/{t['id']}/cancel", {}, role=None, token=tok)[0], 403)
         # The agent (which has handed it back) is woken and told to stop.
+        self.j("POST", f"/api/tickets/{t['id']}/comments", {"body": "Needs a decision."}, role=None, token=tok)
         self.j("PATCH", f"/api/tickets/{t['id']}", {"status": "review"}, role=None, token=tok)
         threading.Timer(0.4, lambda: self.j("POST", f"/api/tickets/{t['id']}/cancel", {}, role="human")).start()
         woke = self.j("GET", "/api/wait?timeout=20", role=None, token=tok)[1]
@@ -962,11 +969,14 @@ class TicketsTest(unittest.TestCase):
         got, took = waited()
         self.assertEqual((got["reason"], [t["id"] for t in got["tickets"]]),
                          ("in_progress", [high["id"], queued["id"], near["id"], low["id"]]))
-        self.assertEqual(got["tickets"][0]["why"], "yours and in progress: keep working on it")
+        self.assertTrue(got["tickets"][0]["why"].startswith("yours and in progress: keep working on it"))
+        self.assertIn("you haven't commented since you started it", got["tickets"][0]["why"])
         self.assertEqual([t["progress"] for t in got["tickets"]], [None, None, "2/3", "1/3"])
         self.assertLess(took, 2)
+        self.j("POST", f"/api/tickets/{near['id']}/comments", {"body": "Done."}, role=None, token=tok)
         self.j("PATCH", f"/api/tickets/{near['id']}", {"status": "review"}, role=None, token=tok)
-        for t in (high, low):  # handed back
+        for t in (high, low):  # handed back, with a hand-off comment
+            self.j("POST", f"/api/tickets/{t['id']}/comments", {"body": "Done."}, role=None, token=tok)
             self.j("PATCH", f"/api/tickets/{t['id']}", {"status": "review"}, role=None, token=tok)
         got = W()
         self.assertEqual((got["reason"], got["tickets"][0]["id"]), ("ready", queued["id"]))
@@ -996,6 +1006,7 @@ class TicketsTest(unittest.TestCase):
         # Sent back to in progress: from then on it's work to do.
         self.j("PATCH", f"/api/tickets/{high['id']}", {"status": "in_progress"}, role="human")
         self.assertEqual(W()["reason"], "in_progress")
+        self.j("POST", f"/api/tickets/{high['id']}/comments", {"body": "Done, with plan B."}, role=None, token=tok)
         self.j("PATCH", f"/api/tickets/{high['id']}", {"status": "review"}, role=None, token=tok)
         # Chat comes before everything, and keeps returning at once until it's read.
         later(lambda: self.j("POST", "/api/chat", {"members": ["agent-z"], "body": "got a sec?"}, role="human"))
@@ -1178,6 +1189,7 @@ class TicketsTest(unittest.TestCase):
         # Lists, updates and other states.
         listed = [x for x in self.j("GET", "/api/tickets?status=in_progress", role=None, token=a1)[1]["tickets"] if x["id"] == t["id"]]
         self.assertIn("yours and in progress", listed[0]["what_now"])
+        self.j("POST", f"/api/tickets/{t['id']}/comments", {"body": "Done."}, role=None, token=a1)
         self.assertIn("waiting for a human", self.j("PATCH", f"/api/tickets/{t['id']}", {"status": "review"}, role=None, token=a1)[1]["what_now"])
         waiting = self.new("ready", title="after it", depends_on=t["id"])
         self.assertTrue(self.j("GET", f"/api/tickets/{waiting['id']}", role=None, token=a2)[1]["what_now"].startswith(f"Blocked until {t['id']} is done"))
@@ -1252,6 +1264,40 @@ class TicketsTest(unittest.TestCase):
         self.assertNotIn(e["id"], cands)     # nor epics
         self.assertIn("depPicker($('dep')", page)
         self.assertIn("depPicker($('nt-deps')", self.call("GET", "/new", role="human")[1].decode())
+
+    def test_claiming_and_commenting(self):
+        tok = self.j("POST", "/api/users", {"username": "agent-cc", "kind": "agent"}, role="human")[1]["token"]
+        first = self.new("ready", title="cc first", assignee="agent-cc", priority=1)
+        second = self.new("ready", title="cc second", assignee="agent-cc", priority=1)
+        # GET only looks; POST claims.
+        peek = self.j("GET", "/api/next", role=None, token=tok)[1]["ticket"]
+        self.assertEqual((peek["id"], peek["status"]), (first["id"], "ready"))
+        got = self.j("POST", "/api/next", {}, role=None, token=tok)[1]
+        self.assertEqual((got["ticket"]["id"], got["ticket"]["status"]), (first["id"], "in_progress"))
+        self.assertNotIn("in_progress", got)  # nothing else under way
+        # Taking more while one is under way: it says so.
+        more = self.j("POST", "/api/next", {}, role=None, token=tok)[1]
+        self.assertEqual(more["ticket"]["id"], second["id"])
+        self.assertEqual([t["id"] for t in more["in_progress"]], [first["id"]])
+        self.assertIn("finish those first", more["note"])
+        # Silent so far: the nudge is in what_now, and a hand-back is refused until it comments.
+        self.assertIn("you haven't commented since you started it", self.j("GET", f"/api/tickets/{first['id']}", role=None, token=tok)[1]["what_now"])
+        self.assertEqual(self.j("PATCH", f"/api/tickets/{first['id']}", {"status": "review"}, role=None, token=tok)[0], 409)
+        # A checklist upload without a comment comes back with a reminder; after a comment, it doesn't.
+        put = lambda text: self.j("PUT", f"/api/tickets/{first['id']}/checklist", role=None, token=tok, raw=text.encode(),
+                                  headers={"Content-Type": "text/markdown"})[1]
+        self.assertIn("reminder", put("- [x] one\n- [ ] two"))
+        self.j("POST", f"/api/tickets/{first['id']}/comments", {"body": "Step one done."}, role=None, token=tok)
+        self.assertNotIn("reminder", put("- [x] one\n- [x] two"))
+        self.assertNotIn("Note:", self.j("GET", f"/api/tickets/{first['id']}", role=None, token=tok)[1]["what_now"])
+        # 20 quiet minutes later, it's nudged again.
+        with self.srv.store.db() as db:
+            db.execute("UPDATE comments SET created_at = created_at - 1500 WHERE ticket_id = ?", (first["id"],))
+            db.execute("UPDATE events SET at = at - 1500 WHERE ticket_id = ?", (first["id"],))
+        self.assertIn("your last comment here was 25 minutes ago", self.j("GET", f"/api/tickets/{first['id']}", role=None, token=tok)[1]["what_now"])
+        self.assertEqual(self.j("PATCH", f"/api/tickets/{first['id']}", {"status": "review"}, role=None, token=tok)[0], 200)
+        # Everyone gets "blocked", humans too.
+        self.assertIs(self.j("GET", f"/api/tickets/{first['id']}", role="human")[1]["blocked"], False)
 
     def test_skill(self):
         code, body, h = self.call("GET", "/api/skill", role="agent", headers={"Host": "tickets.example:43917"})

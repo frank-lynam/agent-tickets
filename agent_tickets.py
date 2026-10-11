@@ -62,6 +62,8 @@ def epic_status_for(statuses):
     return "in_progress" if any(x != "backlog" for x in statuses) else "backlog"
 
 
+COMMENT_QUIET_MINUTES = 20  # an agent's in-progress ticket with no comment for this long gets a nudge
+
 AGENT_TARGETS = {"ready", "in_progress", "review"}  # statuses an agent may set
 AGENT_LOCKED = {"backlog", "done"}                  # tickets an agent may only comment on
 PRIORITIES = {1: "High", 2: "Normal", 3: "Low"}
@@ -504,6 +506,7 @@ class Store:
         if "checklist_md" in t:
             t["checklist"] = checklist_summary(t)
         t["blocked_by"] = self.blockers(t["id"])
+        t["blocked"] = bool(t["blocked_by"])
         if t.get("epic_id"):
             row = self.db().execute("SELECT title FROM tickets WHERE id = ?", (t["epic_id"],)).fetchone()
             t["epic_title"] = row["title"] if row else None
@@ -695,6 +698,13 @@ class Store:
             if t["kind"] == "epic" and "status" in fields and fields["status"] != t["status"]:
                 raise ApiError(400, "an epic's status follows its tickets (backlog, active, complete); it can't be set")
             if role == "agent":
+                if (fields.get("status") in ("review", "ready") and t["status"] == "in_progress"
+                        and self.comment_gap(t["id"], actor)[1] is None):
+                    what = ("a hand-off comment: start it with \"Done\" or \"Needs a decision\", then say what you did, "
+                            "where, and how to check it (or the question and your recommendation)"
+                            if fields["status"] == "review" else "a comment saying where you got to and what's left")
+                    raise ApiError(409, f"comment on {t['id']} first: you haven't since you started it. Post {what}; "
+                                        "then change the status.")
                 if "status" in fields and fields["status"] not in AGENT_TARGETS:
                     raise ApiError(403, "agents can set ready, in_progress or review; only humans move "
                                         "tickets to backlog or done")
@@ -732,6 +742,25 @@ class Store:
                     self._sync_epics(db, [t["epic_id"], fields.get("epic_id")], actor, role, now)
         return self._links(self.ticket(t["id"]))
 
+    def comment_gap(self, tid, user):
+        """(when the ticket last went into progress, when `user` last commented on it since then or None)."""
+        db = self.db()
+        started = db.execute("SELECT MAX(at) FROM events WHERE ticket_id = ? AND field = 'status' AND new = 'in_progress'",
+                             (tid,)).fetchone()[0] or 0
+        last = db.execute("SELECT MAX(created_at) FROM comments WHERE ticket_id = ? AND author = ? COLLATE NOCASE "
+                          "AND created_at >= ?", (tid, user, started)).fetchone()[0]
+        return started, last
+
+    def comment_nudge(self, tid, user):
+        """A reminder for an agent that's gone quiet on its in-progress ticket, or None."""
+        started, last = self.comment_gap(tid, user)
+        if last is None:
+            return "you haven't commented since you started it: post a comment (what you're doing, your plan)"
+        quiet = (time.time() - last) / 60
+        if quiet >= COMMENT_QUIET_MINUTES:
+            return f"your last comment here was {int(quiet)} minutes ago: comment what you've done since"
+        return None
+
     def put_checklist(self, tid, text, actor, role):
         """The agent working a ticket reports its checklist: the whole file, replacing the last upload."""
         t = self.ticket(tid)
@@ -748,6 +777,12 @@ class Store:
             raise ApiError(400, "send the checklist's text as the body")
         old = checklist_summary(dict(t))
         new = parse_checklist(text)
+        # Ticking steps off isn't a report on its own: if there's been no comment since the last upload, say so.
+        started, last = self.comment_gap(t["id"], actor)
+        since = max(started, t["checklist_at"] or 0)
+        reminder = (None if last is not None and last >= since else
+                    "Now comment on the ticket: what you did in this step and what happened. The checklist shows "
+                    "progress; comments are how the humans know what's going on.")
         if text != (t["checklist_md"] or ""):
             now = time.time()
             with self.write_lock:
@@ -757,7 +792,10 @@ class Store:
                                "WHERE id = ?", (text, actor, now, now, t["id"]))
                     self._event(db, t["id"], actor, role, "checklist", f"{old['done']}/{old['total']}" if old else None,
                                 f"{new['done']}/{new['total']}", now)
-        return {"checklist": self.detail(t["id"])["checklist"]}
+        out = {"checklist": self.detail(t["id"])["checklist"]}
+        if reminder:
+            out["reminder"] = reminder
+        return out
 
     def cancel(self, tid, actor, role):
         """Close a ticket out of the normal cycle (overtaken by events, a duplicate...): it goes to done,
@@ -1187,6 +1225,10 @@ class Store:
                           r["created_at"])
             r["why"] = ("yours and in progress: keep working on it" if r["status"] == "in_progress"
                         else "assigned to you and ready: start it")
+            if r["status"] == "in_progress":
+                nudge = self.comment_nudge(r["id"], user)
+                if nudge:
+                    r["why"] += f" ({nudge})"
             out.append(r)
         out.sort(key=lambda r: r["_rank"])
         for r in out:
@@ -1209,7 +1251,7 @@ class Store:
         anyone's ready tickets. Only when there's none of that does it wait (up to `timeout` seconds)."""
         marks, end = self._marks(), time.time() + timeout
         steps = [("queue", lambda: self.outstanding(user, "ready", assigned=False) if queue else [],
-                  "ready for anyone: take it with GET /api/next?claim=1")]
+                  "ready for anyone: take it with POST /api/next")]
         while True:
             notice = self.chat_notice(user)
             if notice:
@@ -3188,7 +3230,8 @@ enough, or a request fails in a way you don't understand. Errors come back as `{
    `POST /api/chat/ID/messages` `{{"body": "..."}}`. A human's message keeps notifying you until you reply
    (reading isn't enough; if nothing needs saying, reply briefly). Other agents' messages only need reading
    (`POST /api/chat/ID/read`). Any response with a `"chat"` field means the same: stop, answer chat, carry on.
-3. `GET /api/next?claim=1` takes the next ready ticket (yours first). `{{"ticket": null}}`: nothing to do.
+3. `POST /api/next` takes the next ready ticket (yours first). `{{"ticket": null}}`: nothing to do. Only take new
+   work when you've none in progress (its reply lists any under `in_progress`).
    The ticket you get is now in progress and assigned to you: that means you work on it, now.
 4. Read the whole ticket (`GET /api/tickets/ID`): description, every comment, checklist, and every page
    in its `wiki_links` (`GET /api/wiki/PATH`).
@@ -3282,7 +3325,7 @@ put it in comments or files.
 - **ready**: cleared for work. Pick these up when you have time.
 - **in_progress**: its assignee is working on it right now. **If it's
   assigned to you, that's you: do the work, and comment on the ticket as
-  you go.** Claiming a ticket (`/api/next?claim=1`) or starting it puts it
+  you go.** Claiming a ticket (`POST /api/next`) or starting it puts it
   here, assigned to you; that's the signal to begin, not a sign that it's
   taken. Only someone *else's* in-progress ticket is hands-off (comment
   only). Check `assignee` against your username (`GET /api/me`).
@@ -3343,7 +3386,7 @@ proposed tickets, in one step.
 
 ## How to work a ticket
 
-1. `GET /api/next?claim=1`: takes your next ready ticket (ones assigned
+1. `POST /api/next`: takes your next ready ticket (ones assigned
    to you first, then unassigned ones; high priority first, then oldest),
    moves it to in_progress and assigns it to you in the same step, so two
    agents never get the same one. **The ticket you get back is yours, in
@@ -3354,8 +3397,17 @@ proposed tickets, in one step.
 2. Read the whole ticket: `GET /api/tickets/ID` has the description, every
    comment (humans' replies included: they're instructions), the status
    history and the checklist.
-3. Work. Comment at milestones and attach evidence (screenshots, short
-   recordings, logs).
+3. Work, and **comment on the ticket as you go**. Comments are the only way
+   the humans know what happened; a ticket without them looks abandoned.
+   The minimum: a comment when you start (what you're about to do), one
+   after each step (what you did, what happened, including errors and
+   surprises), and a hand-off. Attach evidence (screenshots, short
+   recordings, logs). The server holds you to it: you can't hand a ticket
+   back (review) or release it (ready) without having commented since you
+   started it, your own in-progress tickets carry a note in `what_now` (and
+   in `/api/wait`) once you've gone 20 minutes without a comment, and a
+   checklist upload with no comment since the last one comes back with a
+   `"reminder"`.
 4. Keep a markdown checklist on your machine ("- [ ] step" / "- [x] step")
    and upload the whole file after each step: `PUT /api/tickets/ID/checklist`
    with its text as the body. Each upload replaces the last one; it's a
@@ -3425,7 +3477,7 @@ offers, and write down how in your skill.**
      start it if it's ready. Finish what you've started before taking new
      work.
   4. `{"reason": "queue", "tickets": [...]}`: only with `&queue=1`:
-     unassigned ready tickets. Take one with `GET /api/next?claim=1`.
+     unassigned ready tickets. Take one with `POST /api/next`.
   Only when none of these applies does it wait, and it returns the moment
   one does, or `{"reason": "timeout"}` when time is up (then call it
   again). Blocked tickets never count. The longest timeout is 300 seconds;
@@ -3508,44 +3560,60 @@ All JSON in and out, except file uploads (raw bytes) and this page.
 Ticket ids are two words, like `amber-otter` (older tickets have four or five
 letters, like `KAMI`). Any case works, and a space for the hyphen in JSON.
 
-    GET   /api                       this briefing (no token needed)
-    GET   /api/me                    {"username", "kind", "guidance"}
-    GET   /api/guidance              {"guidance": the house rules and any notes for you}
-    GET   /api/next                  your next ready ticket, or {"ticket": null}; plus "guidance"
-    GET   /api/next?claim=1          ...and move it to in_progress, assigned to you
-    GET   /api/wait?timeout=50       what to do next: unread chat, replies on your tickets, your in-progress
-                                     tickets, your ready tickets (&queue=1: anyone's ready tickets), at once if
-                                     any; otherwise waits up to 300 s for one
-    GET   /api/tickets               {"tickets": [...]}; filters: ?status=ready,in_progress  ?q=text
-                                     ?assignee=me (or a name, or "none")  ?epic=ID  ?kind=epic  ?proposed=1
-    GET   /api/tickets/ID            one ticket, with comments, attachments, events, checklist
-    POST  /api/tickets               {"title", "description", "priority": 1|2|3,
-                                      "kind": "task"|"epic", "epic_id", "depends_on": ["amber-otter", ...]}
-                                     -> the new ticket (a proposal, in the backlog)
-    POST  /api/tickets/ID/deps       {"depends_on": "amber-otter"}: amber-otter must be done before ID
-    DELETE /api/tickets/ID/deps/amber-otter   remove that dependency
-    PATCH /api/tickets/ID            any of {"status", "title", "description", "priority", "assignee", "epic_id"}
-    PUT   /api/tickets/ID/checklist  your checklist's markdown as the body (or JSON {"text": "..."});
-                                     replaces the last upload
-    POST  /api/tickets/ID/comments   {"body": "..."} -> the comment, with its "id"
-    GET   /api/chat/unread           {"unread": N, "conversations": [{..., "messages": [unread ones]}]}
-    GET   /api/chat                  {"conversations": [{"id", "name", "members", "unread", "last_message"}]}
-    POST  /api/chat                  {"members": ["frank"], "title" (optional), "body" (optional first message)}
-                                     -> the conversation (with one person and no title: your existing one)
-    GET   /api/chat/ID               the conversation, its messages (?after=MESSAGE_ID for newer ones) and
-                                     "read_up_to": each member's last read message id;
-                                     marks it read (?peek=1 doesn't)
-    POST  /api/chat/ID/messages      {"body": "..."} -> the message, with its "id"
-    POST  /api/chat/ID/files?filename=notes.md&message_id=N   a file for that message (raw bytes, like tickets)
-    POST  /api/chat/ID/read          mark it read without replying
-    POST  /api/chat/ID/members       {"username": "agent-2"}: tell someone else about it
-    GET   /api/wiki                  {"tree": [{"title", "path", "children": [...]}]};
-                                     ?q=some words: {"results": [{"title", "path", "snippet"}]}
-    GET   /api/wiki/SECTION/PAGE     {"title", "body", "path", "breadcrumbs", "children", "updated_at", ...}
-    GET   /api/skill                 a SKILL.md for this server, to save as a skill
-    POST  /api/tickets/ID/attachments?filename=demo.mp4&comment_id=N
-                                     the file's raw bytes as the body, with its Content-Type;
-                                     comment_id (optional) attaches it to that comment
+Start here
+
+    GET    /api                        this briefing (no token needed); GET /api/skill: a SKILL.md for it
+    GET    /api/me                     {"username", "kind", "guidance", "chat_unread", "prefs"}
+    GET    /api/wait?timeout=50        what to do now: chat, replies, your work in order (see above)
+    POST   /api/next                   take a new ticket: {"ticket": ... or null, "guidance", "in_progress"
+                                       (any you've already started: finish those first), "note"}
+                                       (GET /api/next only looks; GET ?claim=1 still claims, for old skills)
+
+Tickets
+
+    GET    /api/tickets                {"tickets": [...]}; filters ?status=ready,in_progress ?q=text
+                                       ?assignee=me|NAME|none ?epic=ID ?kind=epic ?proposed=1
+    GET    /api/tickets/ID             one ticket: comments, attachments, events, checklist, wiki_links,
+                                       blocked, what_now
+    POST   /api/tickets                {"title", "description", "priority": 1|2|3, "kind": "task"|"epic",
+                                        "epic_id", "depends_on": ["amber-otter", ...]} -> a proposal
+    PATCH  /api/tickets/ID             any of {"status", "title", "description", "priority", "assignee", "epic_id"}
+    POST   /api/tickets/ID/comments    {"body": "..."} -> the comment, with its "id"
+    POST   /api/tickets/ID/attachments a file (see Files below); comment_id attaches it to a comment
+    PUT    /api/tickets/ID/checklist   your checklist's markdown as the body; replaces the last upload
+    POST   /api/tickets/ID/deps        {"depends_on": "amber-otter"}: that one must be done first
+    DELETE /api/tickets/ID/deps/OTHER  drop that dependency
+
+Chat
+
+    GET    /api/chat/unread            what you owe: {"unread": N, "conversations": [{..., "needs_reply",
+                                       "messages": [...]}]}
+    GET    /api/chat                   {"conversations": [{"id", "name", "members", "unread", "last_message"}]}
+    POST   /api/chat                   {"members": ["frank"], "title" (optional), "body" (optional first message)}
+                                       -> the conversation (one person and no title: your existing one)
+    GET    /api/chat/ID                its messages (?after=MESSAGE_ID for newer) and "read_up_to"; marks it
+                                       read (?peek=1 doesn't)
+    POST   /api/chat/ID/messages       {"body": "..."} -> the message, with its "id"
+    POST   /api/chat/ID/files          a file for a message (as for tickets, with message_id)
+    POST   /api/chat/ID/read           mark it read (enough for agents' messages; humans' need a reply)
+    POST   /api/chat/ID/members        {"username": "agent-2"}: bring someone in
+
+Wiki (read-only for agents)
+
+    GET    /api/wiki                   {"tree": [{"title", "path", "children": [...]}]};
+                                       ?q=some words: {"results": [{"title", "path", "snippet"}]}
+    GET    /api/wiki/SECTION/PAGE      {"title", "body", "path", "breadcrumbs", "children", "updated_at", ...}
+
+You personally
+
+    GET    /api/guidance               the house rules plus any notes for you
+    GET    /api/me/prefs, PUT ...      your own settings, e.g. {"tts": true}
+
+Humans only (for completeness): `POST /api/tickets/ID/accept` (`{"ready",
+"assignee", "priority"}`) and `/decline` for proposals, `POST
+/api/tickets/ID/cancel`, writing the wiki (`POST /api/wiki`, `PUT`/`DELETE
+/api/wiki/PATH`), users (`/api/users`), `PUT /api/guidance` and
+`GET /api/export`.
 
 Priorities: 1 high, 2 normal, 3 low.
 
@@ -3591,7 +3659,7 @@ for you, 404 no such ticket, 409 conflict, 413 too large.
 ## Examples
 
     URL=http://host:43917  TOKEN=at_...
-    curl -s -H "Authorization: Bearer $TOKEN" "$URL/api/next?claim=1"
+    curl -s -X POST -H "Authorization: Bearer $TOKEN" "$URL/api/next"
     curl -s -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \\
          -d '{"body": "Done. Login form validates; screenshot attached."}' "$URL/api/tickets/amber-otter/comments"
     curl -s -H "Authorization: Bearer $TOKEN" -H "Content-Type: image/png" \\
@@ -3640,7 +3708,7 @@ def docs_for(store, actor, role):
         lines.append("Assigned to you and ready:")
         lines += [f"- {t['id']}: {t['title']}" for t in queue]
     if not mine and not queue and role == "agent":
-        lines.append("Nothing is assigned to you. `GET /api/next?claim=1` takes the next unassigned ready ticket.")
+        lines.append("Nothing is assigned to you. `POST /api/next` takes the next unassigned ready ticket.")
     sections = store.wiki_tree()
     if sections:
         lines.append("Wiki sections: " + ", ".join(f"{n['title']} (`{n['path']}`)" for n in sections) + ".")
@@ -3680,7 +3748,7 @@ def what_now(t, me):
         return f"Blocked until {', '.join(blocked)} {'is' if len(blocked) == 1 else 'are'} done: it can't start yet. Comment if you have ideas."
     if st == "ready":
         if mine:
-            return "Assigned to you and ready: start it (PATCH status in_progress, or GET /api/next?claim=1), then work on it."
+            return "Assigned to you and ready: start it (PATCH status in_progress, or POST /api/next), then work on it."
         if who:
             return f"Ready, but assigned to {who}: leave it for them; you can comment."
         return "Ready for anyone: start it (PATCH status in_progress) to take it, then work on it."
@@ -3734,9 +3802,14 @@ class Handler(BaseHTTPRequestHandler):
         role, actor = getattr(self, "who_is", (None, None))
         if role == "agent" and code < 400 and isinstance(obj, dict):
             # Every ticket an agent gets says, in one line, what it means for that agent.
-            for t in [obj, obj.get("ticket")] + list(obj.get("tickets") or []):
+            for t in [obj, obj.get("ticket")] + list(obj.get("tickets") or []) + list(obj.get("in_progress") or []):
                 if isinstance(t, dict) and "status" in t and "id" in t and "kind" in t:
                     t["what_now"] = what_now(t, actor)
+                    mine = (t.get("assignee") or "").lower() == actor.lower()
+                    if mine and t["status"] == "in_progress" and t["kind"] == "task":
+                        nudge = self.server.store.comment_nudge(t["id"], actor)
+                        if nudge:
+                            t["what_now"] += " Note: " + nudge + "."
                     # Finished predecessors don't block: keep them out of depends_on so nobody thinks they do.
                     if isinstance(t.get("depends_on"), list):
                         t["done_dependencies"] = [d for d in t["depends_on"] if d.get("status") == "done"]
@@ -4005,9 +4078,19 @@ class Handler(BaseHTTPRequestHandler):
                 if role != "human":
                     raise ApiError(403, "only humans can export")
                 return self.serve_export()
-            if method == "GET" and path == "/api/next":
-                t = store.claim_next(actor, role, bool((query.get("claim") or [""])[0]))
-                return self.json(200, {"ticket": t, "guidance": store.guidance_for(actor)})
+            if path == "/api/next" and method in ("GET", "POST"):
+                # POST claims (GET ?claim=1 too, for older skills); GET alone only looks.
+                if method == "POST":
+                    self.body_json()
+                claim = method == "POST" or bool((query.get("claim") or [""])[0])
+                t = store.claim_next(actor, role, claim)
+                out = {"ticket": t, "guidance": store.guidance_for(actor)}
+                started = [w for w in store.work_for(actor) if w["status"] == "in_progress" and (not t or w["id"] != t["id"])]
+                if started:
+                    out["in_progress"] = started
+                    out["note"] = (f"You also have {len(started)} ticket{'s' if len(started) != 1 else ''} in progress "
+                                   "(in \"in_progress\"): finish those first. GET /api/wait lists your work in order.")
+                return self.json(200, out)
             if path == "/api/tickets":
                 if method == "GET":
                     st = [s for s in (query.get("status") or [""])[0].split(",") if s]

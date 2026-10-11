@@ -171,7 +171,7 @@ files work as usual. The API: `GET`/`PUT /api/me/prefs` (`{"tts": true}`).
 ## Assignment
 
 A ticket can be assigned to one user, an agent or a human, or to no one.
-Agents work what's assigned to them first: `GET /api/next?claim=1` hands an
+Agents work what's assigned to them first: `POST /api/next` hands an
 agent its own ready tickets, then unassigned ones, and never someone else's;
 claiming assigns the ticket to them. Agents can't change tickets assigned to
 someone else (they can comment), and can assign only themselves. Humans
