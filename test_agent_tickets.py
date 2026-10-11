@@ -121,7 +121,7 @@ class TicketsTest(unittest.TestCase):
         a = self.new("backlog", title="new one")
         spaced = a["id"].replace("-", " ").title()
         b = self.new("backlog", title="after both", depends_on=f"kamo, {spaced}")
-        self.assertEqual(sorted(d["id"] for d in self.j("GET", f"/api/tickets/{b['id']}")[1]["depends_on"]),
+        self.assertEqual(sorted(d["id"] for d in self.j("GET", f"/api/tickets/{b['id']}", role="human")[1]["depends_on"]),
                          sorted(["KAMO", a["id"]]))
         self.assertEqual(self.j("DELETE", f"/api/tickets/{b['id']}/deps/{a['id']}", role="human")[0], 200)
         # Both kinds link from chat; look-alike hyphenated words don't.
@@ -923,14 +923,23 @@ class TicketsTest(unittest.TestCase):
         started = time.time()
         self.assertEqual(W("/api/wait?timeout=1")["reason"], "timeout")
         self.assertLess(time.time() - started, 4)
-        # Work it already has comes back at once, in order: in progress (by priority), then ready.
+        # Work it already has comes back at once, as one list in the order to do it: priority first; within a
+        # priority, started before not started, then nearest done (checklist), then oldest.
         low = self.new("in_progress", assignee="agent-z", title="low", priority=3)
         high = self.new("in_progress", assignee="agent-z", title="high", priority=1)
-        queued = self.new("ready", assignee="agent-z", title="next up")
+        queued = self.new("ready", assignee="agent-z", title="next up")  # normal priority
+        near = self.new("in_progress", assignee="agent-z", title="low but nearly done", priority=3)
+        self.j("PUT", f"/api/tickets/{near['id']}/checklist", role=None, token=tok, raw=b"- [x] a\n- [x] b\n- [ ] c",
+               headers={"Content-Type": "text/markdown"})
+        self.j("PUT", f"/api/tickets/{low['id']}/checklist", role=None, token=tok, raw=b"- [x] a\n- [ ] b\n- [ ] c",
+               headers={"Content-Type": "text/markdown"})
         got, took = waited()
-        self.assertEqual((got["reason"], [t["id"] for t in got["tickets"]]), ("in_progress", [high["id"], low["id"]]))
+        self.assertEqual((got["reason"], [t["id"] for t in got["tickets"]]),
+                         ("in_progress", [high["id"], queued["id"], near["id"], low["id"]]))
         self.assertEqual(got["tickets"][0]["why"], "yours and in progress: keep working on it")
+        self.assertEqual([t["progress"] for t in got["tickets"]], [None, None, "2/3", "1/3"])
         self.assertLess(took, 2)
+        self.j("PATCH", f"/api/tickets/{near['id']}", {"status": "review"}, role=None, token=tok)
         for t in (high, low):  # handed back
             self.j("PATCH", f"/api/tickets/{t['id']}", {"status": "review"}, role=None, token=tok)
         got = W()
@@ -1146,6 +1155,26 @@ class TicketsTest(unittest.TestCase):
         brief = self.call("GET", "/api", role=None)[1].decode()
         self.assertIn('**Never stop because a ticket is "already in progress".**', brief)
         self.assertIn("If it's\n  assigned to you, that's you", brief)
+
+    def test_done_dependencies_dont_block(self):
+        tok = self.j("POST", "/api/users", {"username": "agent-dd", "kind": "agent"}, role="human")[1]["token"]
+        first = self.new("ready", title="first step")
+        second = self.new("ready", title="second step")
+        then = self.new("ready", title="after both", depends_on=f"{first['id']}, {second['id']}")
+        got = self.j("GET", f"/api/tickets/{then['id']}", role=None, token=tok)[1]
+        self.assertEqual((got["blocked"], sorted(d["id"] for d in got["depends_on"]), got["done_dependencies"]),
+                         (True, sorted([first["id"], second["id"]]), []))
+        self.j("PATCH", f"/api/tickets/{first['id']}", {"status": "done"}, role="human")
+        got = self.j("GET", f"/api/tickets/{then['id']}", role=None, token=tok)[1]
+        self.assertEqual((got["blocked"], [d["id"] for d in got["depends_on"]], [d["id"] for d in got["done_dependencies"]]),
+                         (True, [second["id"]], [first["id"]]))
+        self.j("PATCH", f"/api/tickets/{second['id']}", {"status": "done"}, role="human")
+        got = self.j("GET", f"/api/tickets/{then['id']}", role=None, token=tok)[1]
+        self.assertEqual((got["blocked"], got["depends_on"], len(got["done_dependencies"])), (False, [], 2))
+        self.assertFalse(got["what_now"].startswith("Blocked"))
+        # Humans' view keeps the full list.
+        self.assertEqual(len(self.j("GET", f"/api/tickets/{then['id']}", role="human")[1]["depends_on"]), 2)
+        self.assertIn("**A\npredecessor that's done no longer blocks anything.**", self.call("GET", "/api", role=None)[1].decode())
 
     def test_skill(self):
         code, body, h = self.call("GET", "/api/skill", role="agent", headers={"Host": "tickets.example:43917"})

@@ -270,7 +270,7 @@ DEFAULT_GUIDANCE = """## How we work
 3. After each step, tick it off in your file, upload it again, and comment what you did and what happened, including errors and surprises.
 4. When something is visible (a page, a chart, a game), attach a screenshot or a short recording.
 5. Hand back with a comment that starts "Done" or "Needs a decision", then set the status to review.
-6. After every action (a step, a hand-back, a chat reply), call GET /api/wait and do what it returns (chat, replies, your in-progress tickets, then ready ones). Never end a turn with nothing in hand: keep wait running in the background so it wakes you, and have a recurring check (cron, scheduled task) as a safety net. Don't leave tickets in progress that you aren't working on: if you're waiting on a decision, move it to review and say what you need.
+6. After every action (a step, a hand-back, a chat reply), call GET /api/wait and do what it returns: chat, replies, then your tickets in the order it lists them (highest priority first, started and nearest-done first). Finish what you've started before taking new work. Never end a turn with nothing in hand: keep wait running in the background so it wakes you, and have a recurring check (cron, scheduled task) as a safety net. Don't leave tickets in progress that you aren't working on: if you're waiting on a decision, move it to review and say what you need.
 
 ## How much to write
 
@@ -1166,6 +1166,30 @@ class Store:
             out[r["id"]] = {"id": r["id"], "title": r["title"], "status": r["status"], "why": why}
         return list(out.values())
 
+    def work_for(self, user):
+        """The user's own unblocked in-progress and ready tickets, in the order to do them: highest
+        priority first; at the same priority, started before not started, then nearest completion
+        (checklist progress), then oldest."""
+        rows = [dict(r) for r in self.db().execute(
+            "SELECT t.id, t.title, t.status, t.priority, t.created_at, t.checklist_md FROM tickets t "
+            "WHERE t.status IN ('in_progress', 'ready') AND t.kind = 'task' AND t.proposed = 0 "
+            "AND t.assignee = ? COLLATE NOCASE AND NOT EXISTS (SELECT 1 FROM deps d JOIN tickets p "
+            "ON p.id = d.depends_on WHERE d.ticket_id = t.id AND p.status != 'done')", (user,))]
+        out = []
+        for r in rows:
+            ck = parse_checklist(r.pop("checklist_md")) if r.get("checklist_md") else None
+            done, total = (ck["done"], ck["total"]) if ck else (0, 0)
+            r["progress"] = f"{done}/{total}" if total else None
+            r["_rank"] = (r["priority"], 0 if r["status"] == "in_progress" else 1, -(done / total if total else 0),
+                          r["created_at"])
+            r["why"] = ("yours and in progress: keep working on it" if r["status"] == "in_progress"
+                        else "assigned to you and ready: start it")
+            out.append(r)
+        out.sort(key=lambda r: r["_rank"])
+        for r in out:
+            del r["_rank"], r["created_at"]
+        return out
+
     def outstanding(self, user, status, assigned=True):
         """Unblocked tickets (not epics or proposals) in `status`: the user's own, or with assigned=False,
         nobody's. Highest priority first, then oldest."""
@@ -1181,10 +1205,7 @@ class Store:
         their tickets since the call began; their in-progress tickets; their ready tickets; with `queue`,
         anyone's ready tickets. Only when there's none of that does it wait (up to `timeout` seconds)."""
         marks, end = self._marks(), time.time() + timeout
-        steps = [("in_progress", lambda: self.outstanding(user, "in_progress"),
-                  "yours and in progress: keep working on it"),
-                 ("ready", lambda: self.outstanding(user, "ready"), "assigned to you and ready: start it"),
-                 ("queue", lambda: self.outstanding(user, "ready", assigned=False) if queue else [],
+        steps = [("queue", lambda: self.outstanding(user, "ready", assigned=False) if queue else [],
                   "ready for anyone: take it with GET /api/next?claim=1")]
         while True:
             notice = self.chat_notice(user)
@@ -1193,6 +1214,9 @@ class Store:
             news = self.news_for(user, marks, queue)
             if news:
                 return {"reason": "tickets", "chat": None, "tickets": news}
+            work = self.work_for(user)
+            if work:  # "in_progress" or "ready", after the first thing to do
+                return {"reason": work[0]["status"], "chat": None, "tickets": work}
             for reason, find, why in steps:
                 found = find()
                 if found:
@@ -3057,7 +3081,9 @@ enough, or a request fails in a way you don't understand. Errors come back as `{
 - Files: `POST /api/tickets/ID/attachments?filename=NAME&comment_id=N`, raw bytes as the body.
 - Hand back: a comment starting "Done" or "Needs a decision", then `PATCH /api/tickets/ID` `{{"status": "review"}}`.
 - You may set ready, in_progress and review; never backlog or done. Backlog, done and other people's
-  tickets: comment only. Blocked tickets (predecessors not done) can't start; comment instead.
+  tickets: comment only. Blocked tickets (predecessors not done) can't start; comment instead. A ticket's
+  `"blocked"` says whether it is; `depends_on` lists only predecessors that still block (done ones are in
+  `done_dependencies` and don't block).
 - New ideas: `POST /api/tickets` `{{"title", "description"}}` makes a proposal a human accepts or declines.
 
 ## When you're idle
@@ -3067,7 +3093,8 @@ returns. Never end a turn with nothing in hand: keep it running in the backgroun
 background command your harness reports when it finishes, a hook before you end a turn), plus a recurring
 check as a safety net (cron, a scheduled task, your harness's scheduler) that calls
 `GET /api/wait?timeout=1` every few minutes and wakes you if the reason isn't `timeout`. It tells you what to do next, at once if there's anything: unread chat, replies on your tickets,
-your in-progress tickets, your ready tickets (in that order). Do it, then call it again. Don't park work in
+then your tickets in the order to do them (highest priority first; started and nearest-done first within a
+priority). Work that list top down, finishing what you've started before new work. Do it, then call it again. Don't park work in
 in progress: if you're stuck on a decision, move it to review with what you need. Write down here how you set
 up the listener for your harness.
 
@@ -3153,10 +3180,14 @@ epic's state follows its tickets and is set automatically (`"epic_state"`):
 backlog (none made ready yet), active (some ready or under way), complete
 (all done; declined tickets don't count).
 
-**Dependencies**: a ticket can list tickets that must be done first
-(`depends_on`). Until they're done (approved, declined or cancelled), it's
-**blocked**: it can't move to in_progress, review or done (you get a 409
-naming the blockers), and /api/next skips it. You can still comment on it.
+**Dependencies**: a ticket can list tickets that must be done first.
+Until they're done (approved, declined or cancelled), it's **blocked**: it
+can't move to in_progress, review or done (you get a 409 naming the
+blockers), and /api/next skips it. You can still comment on it. **A
+predecessor that's done no longer blocks anything.** In what the API gives
+you: `"blocked"` is true or false; `depends_on` and `blocked_by` list only
+the predecessors that still block; finished ones are moved to
+`done_dependencies`. If `blocked` is false, nothing is in the way.
 
 **Proposals**: tickets you create are proposals. They wait in the backlog,
 marked proposed, until a human accepts (to the backlog or straight to
@@ -3250,18 +3281,22 @@ offers, and write down how in your skill.**
   2. `{"reason": "tickets", "tickets": [{"id", "title", "status", "why"}]}`:
      while you were waiting, someone else commented on or changed a ticket
      assigned to you, or assigned you one. Read it and act on it.
-  3. `{"reason": "in_progress", "tickets": [...]}`: your in-progress
-     tickets, highest priority first. Keep working on them.
-  4. `{"reason": "ready", "tickets": [...]}`: ready tickets assigned to
-     you. Start the first (`GET /api/next?claim=1`).
-  5. `{"reason": "queue", "tickets": [...]}`: only with `&queue=1`:
+  3. `{"reason": "in_progress" or "ready", "tickets": [...]}`: your work,
+     in the order to do it: your in-progress and ready tickets, **highest
+     priority first; at the same priority, ones you've started before ones
+     you haven't, then the nearest to done** (by checklist, `"progress":
+     "3/5"`), then the oldest. The reason is the status of the first.
+     Work the list top down: continue the first if it's in progress, or
+     start it if it's ready. Finish what you've started before taking new
+     work.
+  4. `{"reason": "queue", "tickets": [...]}`: only with `&queue=1`:
      unassigned ready tickets. Take one with `GET /api/next?claim=1`.
   Only when none of these applies does it wait, and it returns the moment
   one does, or `{"reason": "timeout"}` when time is up (then call it
   again). Blocked tickets never count. The longest timeout is 300 seconds;
   keep it under 100 if a proxy sits in front of this server (many cut long
   requests), and loop.
-- Because of 1, 3 and 4, it returns straight away until you've dealt with
+- Because of 1 and 3, it returns straight away until you've dealt with
   them: answer chat, and finish your in-progress tickets or hand them
   back. **Don't park work in in_progress:** if you're stuck waiting on a
   decision or on someone else, move the ticket to review with a comment
@@ -3394,7 +3429,8 @@ A ticket looks like:
     {"id": "amber-otter", "title": "...", "description": "...", "status": "in_progress", "assignee": "agent-1",
      "what_now": "This ticket is yours and in progress: you are working on it now. ...",
      "kind": "task", "epic_id": "quiet-falcon", "epic_title": "...", "proposed": 0, "declined": 0, "cancelled": 0,
-     "blocked_by": [], "depends_on": [{"id": "stony-brook", "title": "...", "status": "done"}], "unblocks": [...],
+     "blocked": false, "blocked_by": [], "depends_on": [],
+     "done_dependencies": [{"id": "stony-brook", "title": "...", "status": "done"}], "unblocks": [...],
      "priority": 2, "created_by": "frank",
      "created_at": 1760000000.0, "updated_at": 1760000300.0,
      "comments": [{"id": 12, "author": "frank", "role": "human", "body": "...", "created_at": ...}],
@@ -3556,6 +3592,12 @@ class Handler(BaseHTTPRequestHandler):
             for t in [obj, obj.get("ticket")] + list(obj.get("tickets") or []):
                 if isinstance(t, dict) and "status" in t and "id" in t and "kind" in t:
                     t["what_now"] = what_now(t, actor)
+                    # Finished predecessors don't block: keep them out of depends_on so nobody thinks they do.
+                    if isinstance(t.get("depends_on"), list):
+                        t["done_dependencies"] = [d for d in t["depends_on"] if d.get("status") == "done"]
+                        t["depends_on"] = [d for d in t["depends_on"] if d.get("status") != "done"]
+                    if "blocked_by" in t:
+                        t["blocked"] = bool(t["blocked_by"])
         if role == "agent" and code < 400:
             # Agents are told about unread chat on every response, and asked to answer it first.
             notice = self.server.store.chat_notice(actor)
