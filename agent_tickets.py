@@ -64,6 +64,8 @@ def epic_status_for(statuses):
 
 COMMENT_QUIET_MINUTES = 20  # an agent's in-progress ticket with no comment for this long gets a nudge
 
+PAGE = 20  # comments or messages shown (and returned) at a time; older ones on request
+
 AGENT_TARGETS = {"ready", "in_progress", "review"}  # statuses an agent may set
 AGENT_LOCKED = {"backlog", "done"}                  # tickets an agent may only comment on
 PRIORITIES = {1: "High", 2: "Normal", 3: "Low"}
@@ -521,17 +523,24 @@ class Store:
             (eid,))}
         return {"total": sum(counts.values()), "done": counts.get("done", 0), "by_status": counts}
 
-    def detail(self, tid):
+    def detail(self, tid, limit=None):
+        """A ticket with its comments, files, history and the rest. With `limit`, only the latest `limit`
+        comments (comments_more says there are older ones), and the files and history from the same span."""
         t = self.ticket(tid)
         db = self.db()
-        t["comments"] = [dict(r) for r in db.execute(
+        every = [dict(r) for r in db.execute(
             "SELECT * FROM comments WHERE ticket_id = ? ORDER BY created_at, id", (t["id"],))]
+        shown = every[-limit:] if limit else every
+        start = shown[0]["created_at"] if len(shown) < len(every) else None
+        t["comments"], t["comments_total"], t["comments_more"] = shown, len(every), start is not None
+        ids = {c["id"] for c in shown}
         t["attachments"] = [self.attachment_json(dict(r)) for r in db.execute(
-            "SELECT * FROM attachments WHERE ticket_id = ? ORDER BY created_at, id", (t["id"],))]
+            "SELECT * FROM attachments WHERE ticket_id = ? ORDER BY created_at, id", (t["id"],))
+            if start is None or r["comment_id"] in ids or (r["comment_id"] is None and r["created_at"] >= start)]
         t["events"] = [dict(r) for r in db.execute(
-            "SELECT * FROM events WHERE ticket_id = ? ORDER BY at, id", (t["id"],))]
+            "SELECT * FROM events WHERE ticket_id = ? ORDER BY at, id", (t["id"],)) if start is None or r["at"] >= start]
         t["checklist"] = checklist_summary(t, items=True)
-        refs = wiki_refs(t["description"]) + [p for c in t["comments"] for p in wiki_refs(c["body"])]
+        refs = wiki_refs(t["description"]) + [p for c in every for p in wiki_refs(c["body"])]
         t["wiki_links"] = [self.wiki_link_info(p) for p in dict.fromkeys(refs)]
         # Predecessors: the ones still in the way, and the finished ones (which no longer block anything).
         deps = [dict(r) for r in db.execute(
@@ -550,6 +559,19 @@ class Store:
                                   key=lambda x: (5 if x["declined"] or x["cancelled"] else rank[x["status"]], x["created_at"]))
         self._links(t)
         return t
+
+    def comment_page(self, tid, before, limit=PAGE):
+        """The `limit` comments before comment `before` (oldest first), their files, and whether there are
+        older ones still."""
+        t = self.ticket(tid)
+        db = self.db()
+        rows = [dict(r) for r in db.execute(
+            "SELECT * FROM comments WHERE ticket_id = ? AND id < ? ORDER BY id DESC LIMIT ?", (t["id"], before, limit + 1))]
+        more, page_ = len(rows) > limit, rows[:limit][::-1]
+        ids = [c["id"] for c in page_]
+        files = [self.attachment_json(dict(r)) for r in db.execute(
+            f"SELECT * FROM attachments WHERE comment_id IN ({','.join('?' * len(ids))}) ORDER BY id", ids)] if ids else []
+        return {"comments": page_, "attachments": files, "more": more}
 
     def attachment_json(self, a):
         a = {k: v for k, v in a.items() if k != "path"}
@@ -919,7 +941,7 @@ class Store:
                         self._event(db, row["id"], actor, role, "assignee", None, actor, now)
                     self._sync_epics(db, [db.execute("SELECT epic_id FROM tickets WHERE id = ?", (row["id"],)).fetchone()[0]],
                                      actor, role, now)
-        return self.detail(row["id"])
+        return self.detail(row["id"], limit=PAGE)
 
     def comment(self, tid, body, actor, role):
         body = str(body or "").strip()
@@ -1355,11 +1377,12 @@ class Store:
             raise ApiError(404, "no such file")
         return dict(row)
 
-    def messages(self, cid, after=0, limit=200, internal=False):
-        """A conversation's messages after id `after` (the latest `limit`), oldest first, with their files."""
+    def messages(self, cid, after=0, limit=200, internal=False, before=None):
+        """A conversation's messages after id `after` (and before id `before`): the latest `limit` of them,
+        oldest first, with their files."""
         msgs = [dict(r) for r in self.db().execute(
-            "SELECT * FROM (SELECT * FROM messages WHERE conversation_id = ? AND id > ? ORDER BY id DESC LIMIT ?) "
-            "ORDER BY id", (cid, after, limit))]
+            "SELECT * FROM (SELECT * FROM messages WHERE conversation_id = ? AND id > ? AND id < ? ORDER BY id DESC "
+            "LIMIT ?) ORDER BY id", (cid, after, before or 1 << 62, limit))]
         by_id = {m["id"]: m for m in msgs}
         for m in msgs:
             m["attachments"] = []
@@ -1378,9 +1401,15 @@ class Store:
             "SELECT * FROM chat_files WHERE message_id = ? ORDER BY id", (mid,))]
         return m
 
-    def conversation_detail(self, cid, viewer, after=0, mark=True):
+    def older_messages(self, cid, before):
+        return bool(self.db().execute("SELECT 1 FROM messages WHERE conversation_id = ? AND id < ? LIMIT 1",
+                                      (cid, before)).fetchone())
+
+    def conversation_detail(self, cid, viewer, mark=True):
+        """A conversation with its latest PAGE messages; messages_more says there are older ones."""
         c = self.conversation(cid, viewer)
-        c["messages"] = self.messages(c["id"], after)
+        c["messages"] = self.messages(c["id"], limit=PAGE)
+        c["messages_more"] = bool(c["messages"]) and self.older_messages(c["id"], c["messages"][0]["id"])
         if mark:
             self.mark_read(c["id"], viewer)
             c["unread"] = 0
@@ -1415,7 +1444,7 @@ class Store:
                     if m["author"].lower() != user.lower() and (owed(m) or m["id"] > last_read)]
             if msgs:
                 c = self.conversation(cid, user)
-                c["messages"], c["needs_reply"] = msgs, any(owed(m) for m in msgs)
+                c["messages"], c["count"], c["needs_reply"] = msgs[-PAGE:], len(msgs), any(owed(m) for m in msgs)
                 out.append(c)
         return out
 
@@ -1424,10 +1453,10 @@ class Store:
         convs = self.chat_attention(user)
         if not convs:
             return None
-        total = sum(len(c["messages"]) for c in convs)
-        summary = [{"id": c["id"], "name": c["name"], "messages": len(c["messages"]), "needs_reply": c["needs_reply"]}
+        total = sum(c["count"] for c in convs)
+        summary = [{"id": c["id"], "name": c["name"], "messages": c["count"], "needs_reply": c["needs_reply"]}
                    for c in convs]
-        where = "; ".join(f'{c["name"]} ({len(c["messages"])}{", needs your reply" if c["needs_reply"] else ""})'
+        where = "; ".join(f'{c["name"]} ({c["count"]}{", needs your reply" if c["needs_reply"] else ""})'
                           for c in convs)
         return {"count": total, "conversations": summary,
                 "notice": f"You have {total} chat message{'s' if total != 1 else ''} to answer ({where}). Answer chat "
@@ -1885,6 +1914,7 @@ html[data-tts="1"] .c,html[data-tts="1"] .msg,html[data-tts="1"] .desc{cursor:po
 .speaking{outline:3px solid var(--accent);outline-offset:2px}
 button.latest{position:fixed;z-index:35;right:max(16px,env(safe-area-inset-right));padding:8px 14px;border-radius:999px;
 background:var(--accent);color:var(--accent-ink);border-color:var(--accent);box-shadow:0 4px 14px rgba(0,0,0,.25);font-size:14px}
+.earlier{text-align:center;margin:0 0 10px}.earlier .more{font-size:13px;padding:6px 14px}
 .receipt{margin:6px 2px 0;text-align:right}.receipt .unseen{color:var(--review)}
 .composer{position:sticky;bottom:0;margin-top:14px;padding:10px 0 4px;background:var(--bg)}
 .composer textarea{min-height:64px}
@@ -1996,6 +2026,22 @@ document.addEventListener('click', (e) => {
       && !e.shiftKey && a.getAttribute('href')[0] !== '#') document.documentElement.classList.add('working');
 });
 window.addEventListener('pageshow', () => { leaving = false; document.documentElement.classList.remove('working'); });
+// "Show earlier": load the page before the oldest shown, above it, without moving what you're reading.
+document.addEventListener('click', async (e) => {
+  const b = e.target.closest && e.target.closest('button.more'); if (!b) return;
+  const list = document.getElementById(b.dataset.list), label = b.textContent;
+  b.disabled = true; b.textContent = 'Loading…';
+  try {
+    const r = await fetch(b.dataset.url + b.dataset.before, {credentials: 'same-origin'});
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json(), h0 = document.documentElement.scrollHeight;
+    list.querySelector(':scope > .empty')?.remove();
+    list.insertAdjacentHTML('afterbegin', d.html);
+    window.scrollBy(0, document.documentElement.scrollHeight - h0);
+    if (d.before) { b.dataset.before = d.before; b.textContent = d.label; b.disabled = false; }
+    else b.parentNode.remove();
+  } catch (err) { b.disabled = false; b.textContent = label; }
+});
 // Long tickets and chats: a "Latest" button while the newest comment or message is off screen,
 // counting what arrives while you're scrolled away.
 document.addEventListener('DOMContentLoaded', () => {
@@ -2022,7 +2068,9 @@ document.addEventListener('DOMContentLoaded', () => {
     fresh = 0;
   });
   new MutationObserver((changes) => {
-    if (!btn.hidden) fresh += changes.reduce((n, c) => n + [...c.addedNodes].filter(x => x.nodeType === 1).length, 0);
+    // Only what arrives at the end is new (older pages load at the top).
+    if (!btn.hidden) fresh += changes.filter(c => !c.nextSibling)
+      .reduce((n, c) => n + [...c.addedNodes].filter(x => x.nodeType === 1).length, 0);
     update();
   }).observe(list, {childList: true});
   addEventListener('scroll', update, {passive: true});
@@ -2633,7 +2681,7 @@ def ticket_sig(t):
     return hashlib.sha256(json.dumps(key, default=str).encode()).hexdigest()[:16]
 
 
-def ticket_timeline(store, t):
+def ticket_timeline(store, t, empty='<p class="empty">No activity yet.</p>'):
     """The activity list: comments (with their files), loose files and events, oldest first. Every
     entry has an id, and a comment a data-v (its file count), so the live page can add and update them."""
     by_comment = {}
@@ -2688,7 +2736,7 @@ def ticket_timeline(store, t):
             text = f'{esc(e["actor"])} changed {esc(e["field"]).replace("_", " ")} to {esc(e["new"] or "nothing")}'
         items.append((e["at"], f'<div class="ev" id="e{e["id"]}">{text} · <span title="{when(e["at"])}">{ago(e["at"])}</span></div>'))
     items.sort(key=lambda x: x[0])
-    return "".join(h for _, h in items) or '<p class="empty">No activity yet.</p>'
+    return "".join(h for _, h in items) or empty
 
 
 def ticket_wiki_box(t):
@@ -2712,9 +2760,34 @@ def ticket_checklist(t):
                if ck["total"] else "") + f'<ul class="ck">{lis}</ul>')
 
 
-def ticket_live(store, tid):
-    """What the open ticket page polls for."""
+def ticket_span(t, start, end=None):
+    """A copy of a (full) ticket with only the comments, files and history from `start` to before `end`."""
+    inside = lambda at: at >= start and (end is None or at < end)
+    out = dict(t)
+    out["comments"] = [c for c in t["comments"] if inside(c["created_at"])]
+    ids = {c["id"] for c in out["comments"]}
+    out["attachments"] = [a for a in t["attachments"] if a["comment_id"] in ids or (a["comment_id"] is None and inside(a["created_at"]))]
+    out["events"] = [e for e in t["events"] if inside(e["at"])]
+    return out
+
+
+def ticket_earlier(store, tid, before):
+    """The page of activity before comment `before`, for the ticket page's "Show earlier" button."""
     t = store.detail(tid)
+    page_ = store.comment_page(t["id"], before)
+    if not page_["comments"]:
+        return {"html": "", "before": None, "label": ""}
+    end = next(c["created_at"] for c in t["comments"] if c["id"] == before)
+    start = page_["comments"][0]["created_at"] if page_["more"] else 0
+    html = ticket_timeline(store, ticket_span(t, start, end), empty="")
+    left = sum(1 for c in t["comments"] if c["created_at"] < start)
+    return {"html": html, "before": page_["comments"][0]["id"] if page_["more"] else None,
+            "label": f"Show earlier activity ({left} more comment{'s' if left != 1 else ''})"}
+
+
+def ticket_live(store, tid, start=0):
+    """What the open ticket page polls for: the activity from `start` (where the page's view begins) on."""
+    t = ticket_span(store.detail(tid), start)
     ck = t["checklist"]
     return {"sig": ticket_sig(t), "timeline": ticket_timeline(store, t),
             "checklist": ticket_checklist(t), "checklist_v": str(ck["updated_at"]) if ck else "",
@@ -2731,7 +2804,8 @@ LIVE_JS = """
     if (busy || document.hidden) return;
     busy = true;
     try {
-      const r = await fetch('/t/' + TID + '/live', {credentials: 'same-origin', cache: 'no-store'});
+      const r = await fetch('/t/' + TID + '/live?from=' + document.getElementById('tl').dataset.from,
+                            {credentials: 'same-origin', cache: 'no-store'});
       if (!r.ok) return;
       const d = await r.json(), tl = document.getElementById('tl'), tmp = document.createElement('div');
       tmp.innerHTML = d.timeline;
@@ -2762,8 +2836,13 @@ function clearDraft(){ try { localStorage.removeItem('at-draft:' + TID); } catch
 
 
 def render_ticket(store, tid):
-    t = store.detail(tid)
+    t = store.detail(tid, limit=PAGE)
     timeline = ticket_timeline(store, t)
+    view_from = t["comments"][0]["created_at"] if t["comments_more"] else 0
+    earlier = (f'<div class="earlier"><button type="button" class="more" data-list="tl" '
+               f'data-url="/t/{t["id"]}/earlier?before=" data-before="{t["comments"][0]["id"]}">Show earlier activity '
+               f'({t["comments_total"] - len(t["comments"])} more comment{"s" if t["comments_total"] - len(t["comments"]) != 1 else ""})'
+               f'</button></div>' if t["comments_more"] else "")
     wiki_box = ticket_wiki_box(t)
     ckhtml = ticket_checklist(t)
     ck_v = str(t["checklist"]["updated_at"]) if t["checklist"] else ""
@@ -2880,7 +2959,7 @@ def render_ticket(store, tid):
  <div class="row" style="margin-top:8px"><label class="meta" for="prio">Priority</label>
   <select id="prio" class="as" onchange="setPrio(this.value)">{''.join(f'<option value="{k}"{" selected" if k == t["priority"] else ""}>{v}</option>' for k, v in PRIORITIES.items())}</select></div>
  {epic_box}
- <h2>Activity</h2><div class="tl" id="tl">{timeline}</div>
+ <h2>Activity</h2>{earlier}<div class="tl" id="tl" data-from="{view_from}">{timeline}</div>
  {unanswered}<h2>Comment</h2><form class="stack box" id="cf">
   <textarea id="cbody" placeholder="Feedback, a decision, or a question for the agent (Enter posts it as a comment only; Shift+Enter for a new line)" aria-label="Comment"></textarea>
   <div class="row"><input type="file" id="cfiles" multiple aria-label="Attach files"></div>
@@ -3107,8 +3186,11 @@ if (am) am.onsubmit = async (e) => { e.preventDefault();
 
 def render_chat(store, cid, viewer):
     c = store.conversation(cid, viewer)
-    msgs = store.messages(c["id"], internal=True)
+    msgs = store.messages(c["id"], limit=PAGE, internal=True)
     store.mark_read(c["id"], viewer)
+    earlier = (f'<div class="earlier"><button type="button" class="more" data-list="msgs" data-url="/chat/{c["id"]}/before/" '
+               f'data-before="{msgs[0]["id"]}">Show earlier messages</button></div>'
+               if msgs and store.older_messages(c["id"], msgs[0]["id"]) else "")
     last = msgs[-1]["id"] if msgs else 0
     others = [u for u in store.users() if not u["disabled"] and u["kind"] != "guest"
               and u["username"].lower() not in {m.lower() for m in c["members"]}]
@@ -3122,7 +3204,7 @@ def render_chat(store, cid, viewer):
 <div class="row" style="justify-content:space-between;align-items:baseline"><h1 style="margin-bottom:4px">{esc(c["name"])}</h1>
 <button type="button" class="cancel" onclick="deleteChat()">Delete chat</button></div>
 <div class="meta">With {esc(", ".join(c["members"]) or "no one yet")}. Anyone can read and post here.</div>{add}
-<div id="chatroom" data-cid="{c["id"]}" data-last="{last}" style="margin-top:14px">
+<div id="chatroom" data-cid="{c["id"]}" data-last="{last}" style="margin-top:14px">{earlier}
 <div class="chat" id="msgs">{shown or '<p class="empty" id="none">No messages yet. Say hello.</p>'}</div>
 <p class="meta receipt" id="receipt">{receipt_html(store, c["id"])}</p>
 <form class="stack composer" id="mf"><textarea id="mbody" placeholder="Message (Enter sends, Shift+Enter for a new line)" aria-label="Message"></textarea>
@@ -3669,6 +3751,17 @@ sections above them; or scan the tree (`GET /api/wiki`).
 You can't change the wiki: if something is missing, wrong or out of date,
 tell a human in chat. Don't copy wiki text into tickets; link the page.
 
+## Long threads
+
+To keep your context small, a ticket comes with its **latest 20
+comments** (and the files and history from that span), and a conversation
+with its latest 20 messages; `comments_total` / `comments_more` and
+`messages_more` say whether there's more. That's usually all you need: the
+description, the latest comments, the checklist and `what_now`. Page back
+(`GET /api/tickets/ID/comments?before=ID`, `GET /api/chat/ID/messages?before=ID`)
+only when you need something older, a page at a time, and stop when you
+have it.
+
 ## Formatting what you write
 
 Ticket descriptions, comments, chat messages and wiki pages are shown
@@ -3711,8 +3804,11 @@ Tickets
 
     GET    /api/tickets                {"tickets": [...]}; filters ?status=ready,in_progress ?q=text
                                        ?assignee=me|NAME|none ?epic=ID ?kind=ticket|epic ?proposed=1
-    GET    /api/tickets/ID             one ticket: comments, attachments, events, checklist, wiki_links,
-                                       blocked, depends_on, done_dependencies, what_now
+    GET    /api/tickets/ID             one ticket: the latest 20 comments (comments_total, comments_more),
+                                       the attachments and events from the same span, checklist, wiki_links,
+                                       blocked, depends_on, done_dependencies, new_comments, what_now
+    GET    /api/tickets/ID/comments    ?before=COMMENT_ID[&limit=N]: the comments before that one (20 by
+                                       default), with their attachments: {"comments", "attachments", "more"}
     POST   /api/tickets                {"title", "description", "priority": 1|2|3, "kind": "ticket"|"epic",
                                         "epic_id", "depends_on": ["amber-otter", ...]} -> a proposal
     PATCH  /api/tickets/ID             any of {"status", "title", "description", "priority", "assignee", "epic_id"}
@@ -3729,7 +3825,9 @@ Chat
     GET    /api/chat                   {"conversations": [{"id", "name", "members", "unread", "last_message"}]}
     POST   /api/chat                   {"members": ["frank"], "title" (optional), "body" (optional first message)}
                                        -> the conversation (one person and no title: your existing one)
-    GET    /api/chat/ID                its messages (?after=MESSAGE_ID for newer ones) and "read_up_to"
+    GET    /api/chat/ID                the conversation, its latest 20 messages (messages_more) and "read_up_to"
+    GET    /api/chat/ID/messages       ?before=MESSAGE_ID[&limit=N]: the page before that one; ?after=ID: all newer
+                                       ones: {"messages", "more"}
     POST   /api/chat/ID/messages       {"body": "..."} -> the message, with its "id"
     POST   /api/chat/ID/attachments    a file for a message (as for tickets, with message_id)
     POST   /api/chat/ID/read           mark it read (enough for agents' messages; humans' need a reply)
@@ -3830,7 +3928,7 @@ def docs_for(store, actor, role):
     queue = [dict(r) for r in store.db().execute(
         "SELECT id, title FROM tickets WHERE status = 'ready' AND assignee = ? COLLATE NOCASE "
         "ORDER BY priority, created_at", (actor,))]
-    unread = (sum(len(c["messages"]) for c in store.chat_attention(actor)) if role == "agent"
+    unread = (sum(c["count"] for c in store.chat_attention(actor)) if role == "agent"
               else store.unread_total(actor))
     lines = [f"\n## Right now\n", f"You're signed in as **{actor}** ({role})."]
     if unread:
@@ -4119,7 +4217,17 @@ class Handler(BaseHTTPRequestHandler):
                 return self.html(render_new(store, (query.get("epic") or [None])[0],
                                             ticket_from_message(store, int(mid)) if mid.isdigit() else ("", "")))
             if method == "GET" and (tm := re.fullmatch(rf"/t/({ID_PATH})/live", path)):
-                return self.json(200, ticket_live(store, tm.group(1)))
+                start = (query.get("from") or ["0"])[0]
+                return self.json(200, ticket_live(store, tm.group(1), float(start) if re.fullmatch(r"[0-9.]+", start) else 0))
+            if method == "GET" and (tm := re.fullmatch(rf"/t/({ID_PATH})/earlier", path)):
+                before = (query.get("before") or [""])[0]
+                return self.json(200, ticket_earlier(store, tm.group(1), int(before) if before.isdigit() else 0))
+            if method == "GET" and (cm := re.fullmatch(r"/chat/(\d+)/before/(\d+)", path)):
+                cid = store.conversation(int(cm.group(1)))["id"]
+                msgs = store.messages(cid, limit=PAGE, before=int(cm.group(2)), internal=True)
+                more = bool(msgs) and store.older_messages(cid, msgs[0]["id"])
+                return self.json(200, {"html": "".join(render_message(store, m, actor) for m in msgs),
+                                       "before": msgs[0]["id"] if more else None, "label": "Show earlier messages"})
             if method == "GET" and (tm := re.fullmatch(rf"/t/({ID_PATH})", path)):
                 return self.html(render_ticket(store, tm.group(1)))
             if method == "GET" and (fm := re.fullmatch(r"/files/(\d+)/[^/]*", path)):
@@ -4179,7 +4287,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.html(render_users(store, actor))
             if method == "GET" and path == "/api/me":
                 return self.json(200, {"username": actor, "kind": role, "guidance": store.guidance_for(actor),
-                                       "chat_inbox": (sum(len(c["messages"]) for c in store.chat_attention(actor))
+                                       "chat_inbox": (sum(c["count"] for c in store.chat_attention(actor))
                                                        if role == "agent" else store.unread_total(actor)),
                                        "comments_to_answer": sum(o["new_comments"] for o in store.comments_owed(actor)),
                                        "prefs": store.prefs(actor)})
@@ -4283,7 +4391,7 @@ class Handler(BaseHTTPRequestHandler):
                 if other:
                     raise ApiError(404, "not found")
                 if not sub and method == "GET":
-                    return self.json(200, store.detail(tid))
+                    return self.json(200, store.detail(tid, limit=PAGE))
                 if not sub and method == "PATCH":
                     return self.json(200, store.update(tid, self.body_json(TICKET_EDIT), actor, role))
                 if sub == "/checklist" and method == "PUT":
@@ -4297,6 +4405,13 @@ class Handler(BaseHTTPRequestHandler):
                         except (ValueError, AttributeError):
                             raise ApiError(400, 'send the checklist as text, or JSON {"text": "..."}')
                     return self.json(200, store.put_checklist(tid, raw, actor, role))
+                if sub == "/comments" and method == "GET":
+                    before = (query.get("before") or [""])[0]
+                    limit = (query.get("limit") or [""])[0]
+                    if not before.isdigit():
+                        raise ApiError(400, "say where to page back from: ?before=COMMENT_ID (the oldest you have)")
+                    return self.json(200, store.comment_page(tid, int(before),
+                                                             max(1, min(200, int(limit) if limit.isdigit() else PAGE))))
                 if sub == "/comments" and method == "POST":
                     return self.json(201, store.comment(tid, self.body_json(("body",)).get("body"), actor, role))
                 if sub == "/attachments" and method == "POST":
@@ -4329,16 +4444,26 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/chat/inbox" and method == "GET":
             # Agents: everything they still owe (human messages until they reply). Humans: unread.
             convs = store.chat_attention(actor) if role == "agent" else store.unread(actor)
-            return self.json(200, {"count": sum(len(c["messages"]) for c in convs), "conversations": convs})
+            for c in convs:  # humans' unread list: same shape
+                c.setdefault("count", len(c["messages"]))
+                c["messages"] = c["messages"][-PAGE:]
+            return self.json(200, {"count": sum(c["count"] for c in convs), "conversations": convs})
         m = re.fullmatch(r"/api/chat/(\d+)(/messages|/attachments|/members|/read)?", path)
         if m:
             cid, sub = int(m.group(1)), m.group(2)
             if not sub and method == "DELETE":
                 return self.json(200, store.delete_conversation(cid, role))
             if not sub and method == "GET":
-                after = (query.get("after") or ["0"])[0]
-                return self.json(200, store.conversation_detail(cid, actor, int(after) if after.isdigit() else 0,
-                                                                mark=False))
+                return self.json(200, store.conversation_detail(cid, actor, mark=False))
+            if sub == "/messages" and method == "GET":
+                # ?before=ID: the page of older messages; ?after=ID: everything newer.
+                num = lambda k: int(v) if (v := (query.get(k) or [""])[0]).isdigit() else None
+                limit = max(1, min(200, num("limit") or PAGE))
+                c = store.conversation(cid)
+                if num("after") is not None:
+                    return self.json(200, {"messages": store.messages(c["id"], after=num("after")), "more": False})
+                msgs = store.messages(c["id"], limit=limit, before=num("before"))
+                return self.json(200, {"messages": msgs, "more": bool(msgs) and store.older_messages(c["id"], msgs[0]["id"])})
             if sub == "/messages" and method == "POST":
                 return self.json(201, store.post_message(cid, self.body_json(("body",)).get("body"), actor, role))
             if sub == "/members" and method == "POST":

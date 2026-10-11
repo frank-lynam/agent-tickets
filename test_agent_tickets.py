@@ -1418,6 +1418,47 @@ class TicketsTest(unittest.TestCase):
         self.j("PATCH", f"/api/tickets/{t['id']}", {"status": "done"}, role="human")
         self.assertEqual(W()["reason"], "timeout")
 
+    def test_long_threads_are_paged(self):
+        tok = self.j("POST", "/api/users", {"username": "agent-pg", "kind": "agent"}, role="human")[1]["token"]
+        t = self.new("ready", title="long thread", assignee="agent-pg")
+        ids = [self.j("POST", f"/api/tickets/{t['id']}/comments", {"body": f"note {i}"}, role="human")[1]["id"] for i in range(30)]
+        # Agents get the latest 20 (also when claiming), and page back on request.
+        got = self.j("GET", f"/api/tickets/{t['id']}", role=None, token=tok)[1]
+        self.assertEqual(([c["body"] for c in got["comments"]][:2], len(got["comments"]), got["comments_total"], got["comments_more"]),
+                         (["note 10", "note 11"], 20, 30, True))
+        claimed = self.j("POST", "/api/next", {}, role=None, token=tok)[1]["ticket"]
+        self.assertEqual((claimed["id"], len(claimed["comments"])), (t["id"], 20))
+        older = self.j("GET", f"/api/tickets/{t['id']}/comments?before={got['comments'][0]['id']}", role=None, token=tok)[1]
+        self.assertEqual(([c["body"] for c in older["comments"]][0], len(older["comments"]), older["more"]), ("note 0", 10, False))
+        self.assertEqual(self.j("GET", f"/api/tickets/{t['id']}/comments?before={ids[5]}&limit=3", role="human")[1]["more"], True)
+        self.assertEqual(self.j("GET", f"/api/tickets/{t['id']}/comments", role="human")[0], 400)
+        # The page: the latest 20, and a button for the rest, which loads the earlier page.
+        html = self.call("GET", f"/t/{t['id']}", role="human")[1].decode()
+        self.assertEqual(html.count('class="c " id="c'), 20)
+        self.assertIn("Show earlier activity (10 more comments)", html)
+        earlier = self.j("GET", f"/t/{t['id']}/earlier?before={got['comments'][0]['id']}", role="human")[1]
+        self.assertEqual((earlier["html"].count('class="c " id="c'), earlier["before"]), (10, None))
+        self.assertIn("created it in", earlier["html"])  # the history from that span comes along
+        # Chat: the same.
+        c = self.j("POST", "/api/chat", {"members": ["agent-pg"], "body": "m 0"}, role="human")[1]
+        for i in range(1, 45):
+            self.j("POST", f"/api/chat/{c['id']}/messages", {"body": f"m {i}"}, role="human")
+        conv = self.j("GET", f"/api/chat/{c['id']}", role=None, token=tok)[1]
+        self.assertEqual((len(conv["messages"]), conv["messages"][0]["body"], conv["messages_more"]), (20, "m 25", True))
+        page1 = self.j("GET", f"/api/chat/{c['id']}/messages?before={conv['messages'][0]['id']}", role=None, token=tok)[1]
+        page2 = self.j("GET", f"/api/chat/{c['id']}/messages?before={page1['messages'][0]['id']}", role=None, token=tok)[1]
+        self.assertEqual((len(page1["messages"]), page1["more"], len(page2["messages"]), page2["more"]), (20, True, 5, False))
+        newer = self.j("GET", f"/api/chat/{c['id']}/messages?after={conv['messages'][-3]['id']}", role=None, token=tok)[1]
+        self.assertEqual([m["body"] for m in newer["messages"]], ["m 43", "m 44"])
+        inbox = self.j("GET", "/api/chat/inbox", role=None, token=tok)[1]["conversations"]
+        mine = [x for x in inbox if x["id"] == c["id"]][0]
+        self.assertEqual((mine["count"], len(mine["messages"])), (45, 20))  # all counted, the latest 20 shown
+        page = self.call("GET", f"/chat/{c['id']}", role="human")[1].decode()
+        self.assertEqual(page.count('class="msg'), 20)
+        self.assertIn("Show earlier messages", page)
+        more = self.j("GET", f"/chat/{c['id']}/before/{conv['messages'][0]['id']}", role="human")[1]
+        self.assertEqual((more["html"].count('class="msg'), bool(more["before"])), (20, True))
+
     def test_skill(self):
         code, body, h = self.call("GET", "/api/skill", role="agent", headers={"Host": "tickets.example:43917"})
         text = body.decode()

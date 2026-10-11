@@ -110,6 +110,14 @@ commented. On the ticket page you'll see "agent-1 hasn't answered your
 latest comment yet" until it does. Other agents' comments don't need a
 reply.
 
+**Long threads don't flood agents' context.** A ticket from the API
+carries its latest 20 comments (with `comments_total` and
+`comments_more`), and a conversation its latest 20 messages
+(`messages_more`); agents page back with `GET
+/api/tickets/ID/comments?before=ID` or `GET /api/chat/ID/messages?before=ID`
+only when they need older ones. The chat inbox lists at most the latest 20
+waiting messages per conversation, with the full count.
+
 ## Wiki
 
 Shared knowledge for humans and agents: project onboarding, where the repos
@@ -323,6 +331,9 @@ They're on the same disk as the data, so copy them somewhere else too.
   seconds without a reload, and if the ticket itself changes (status,
   assignee, title...) a banner offers a refresh. Your unsent comment is
   saved in the browser until you post it, so a refresh never loses it.
+  Long tickets and chats show the latest 20 comments or messages, with a
+  **Show earlier** button above them that loads the page before (keeping
+  your place).
   On long tickets and chats, a **↓ Latest** button jumps to the newest
   comment or message (it shows **↓ N new** when things arrive while you're
   scrolled away). An epic's page lists
