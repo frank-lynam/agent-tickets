@@ -1478,6 +1478,22 @@ class Store:
                 db.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (now, c["id"]))
         return self.message(mid)
 
+    def delete_conversation(self, cid, role):
+        """A whole conversation, its messages and its files, for good. Humans only."""
+        if role != "human":
+            raise ApiError(403, "only humans delete chats")
+        c = self.conversation(cid)
+        with self.write_lock:
+            db = self.db()
+            paths = [r[0] for r in db.execute("SELECT path FROM chat_files WHERE conversation_id = ?", (c["id"],))]
+            with db:
+                for table in ("chat_files", "messages", "chat_members"):
+                    db.execute(f"DELETE FROM {table} WHERE conversation_id = ?", (c["id"],))
+                db.execute("DELETE FROM conversations WHERE id = ?", (c["id"],))
+        for p in paths:
+            (self.files / p).unlink(missing_ok=True)
+        return {"deleted": c["id"], "name": c["name"]}
+
     def add_member(self, cid, username, actor, role):
         c = self.conversation(cid)
         u = self.user(username)
@@ -1842,6 +1858,7 @@ font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;margin:0 0 8px}
 dl.kv{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;margin:0;font-size:14px}
 dl.kv dt{color:var(--dim)}dl.kv dd{margin:0;overflow-wrap:anywhere}
 .err{color:var(--review)}
+.cbtns{gap:6px}
 button.cancel{margin-left:auto;color:var(--review);border-color:transparent;background:transparent}
 a.wl.missing{color:var(--review);text-decoration-style:dashed}
 .wlink{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:4px 0 0}
@@ -2234,7 +2251,7 @@ def render_list(store, status, q):
     search = (f'<form class="row" method="get" style="margin-bottom:12px"><input type="search" name="q" value="{esc(q)}" '
               f'placeholder="Search {title.lower()}" aria-label="Search"><button>Search</button></form>')
     hint = ('<p class="meta">Ideas waiting to be cleared. "Make ready" lets agents pick one up.</p>' if status == "backlog"
-            else '<p class="meta">Work you approved. <a href="/api/export">Download a backup</a> of everything '
+            else '<p class="meta">Tickets closed as done (and any cancelled or declined). <a href="/api/export">Download a backup</a> of everything '
                  '(tickets, comments, history and files).</p>')
     body = (f'<h1>{title}</h1>{hint}{search}{props}<div class="list">{"".join(rows) or "<p class=empty>Nothing here.</p>"}</div>'
             + (f'<script>{PROPOSAL_JS}</script>' if status == "backlog" and not props else ""))
@@ -2549,6 +2566,25 @@ def render_attachment(a, store=None):
     return f'<div class="att">{media}<div class="meta">{link}</div></div>'
 
 
+def status_phrase(old, new, role):
+    """A status change as what someone did ("sent it back for more work"), not a move between columns."""
+    if new == "done":
+        return "<b>closed it as done</b>"
+    if old == "done":
+        return f"<b>reopened it</b>{' into the backlog' if new == 'backlog' else ''}"
+    if old == "review" and new == "in_progress":
+        return "<b>sent it back for more work</b>"
+    if new == "review":
+        return "<b>handed it back for review</b>" if role == "agent" else "<b>moved it to review</b>"
+    if new == "in_progress":
+        return "<b>started it</b>"
+    if new == "ready":
+        return "<b>released it</b> back to Ready" if old == "in_progress" else "<b>made it ready</b>"
+    if new == "backlog":
+        return "<b>moved it back to the backlog</b>"
+    return f"moved it from {LABELS.get(old, old)} to <b>{LABELS.get(new, new)}</b>"
+
+
 def ticket_sig(t):
     """Changes to these mean the page's header and buttons are stale: "refresh to see it"."""
     key = [t["status"], t["assignee"], t["title"], t["priority"], t["epic_id"], t["proposed"], t["declined"], t["cancelled"],
@@ -2601,7 +2637,7 @@ def ticket_timeline(store, t):
             text = (f'{esc(e["actor"])} moved it into epic <a href="/t/{esc(e["new"])}">{esc(e["new"])}</a>' if e["new"]
                     else f'{esc(e["actor"])} took it out of its epic')
         elif e["field"] == "status":
-            text = f'{esc(e["actor"])} moved it from {LABELS.get(e["old"], e["old"])} to <b>{LABELS.get(e["new"], e["new"])}</b>'
+            text = f'{esc(e["actor"])} {status_phrase(e["old"], e["new"], e["role"])}'
         elif e["field"] == "assignee":
             text = (f'{esc(e["actor"])} assigned it to <b>{esc(e["new"])}</b>' if e["new"]
                     else f'{esc(e["actor"])} unassigned it')
@@ -2734,11 +2770,13 @@ def render_ticket(store, tid):
                       f'<h2>Unblocks</h2><div class="box">{link_list(t["unblocks"])}</div>')
 
     s = t["status"]
+    # Each button says what happens to the ticket, not what you think of the work: agreeing with an
+    # agent's idea that still needs building is a "Send back for more work", not a "Close as done".
     actions = {
         "backlog": [("ready", "Make ready", True)],
-        "ready": [("backlog", "Back to backlog", False)],
-        "in_progress": [("review", "Needs review", False), ("ready", "Release to ready", False)],
-        "review": [("done", "Approve", True), ("in_progress", "Send back", False)],
+        "ready": [("backlog", "Move back to backlog", False)],
+        "in_progress": [("review", "Move to review", False), ("ready", "Release to ready", False)],
+        "review": [("done", "Close as done", True), ("in_progress", "Send back for more work", False)],
         "done": [("in_progress", "Reopen", False)],
     }[s]
     if t["kind"] == "epic":  # an epic's state follows its tickets; nothing to set by hand
@@ -2754,7 +2792,35 @@ def render_ticket(store, tid):
     if s == "backlog" and t["kind"] == "task" and not t["proposed"]:  # Make ready, for someone
         btns = (assign_select(store, t["id"], t["assignee"])
                 + btns.replace(f"setStatus('{t['id']}','ready')", f"readyFor('{t['id']}')", 1))
-    move_opts = "".join(f'<option value="{x}">{LABELS[x]}</option>' for x in STATUSES if x != s)
+    # What posting can do, besides commenting. Enter in the box only ever comments.
+    if t["kind"] == "epic" or t["proposed"]:
+        comment_buttons = '<button class="primary" id="csend">Comment</button>'
+    elif s == "review":
+        comment_buttons = ('<button class="primary" id="csend" data-move="in_progress">Send back with this comment</button>'
+                           '<button data-move="done">Close as done</button><button data-move="">Just comment</button>')
+    elif s == "done":
+        comment_buttons = ('<button class="primary" id="csend">Comment</button>'
+                           f'<button data-move="{"backlog" if t["cancelled"] or t["declined"] else "in_progress"}">Comment &amp; reopen</button>')
+    else:
+        comment_buttons = '<button class="primary" id="csend">Comment</button>'
+    if s == "review" and t["kind"] == "task" and not t["proposed"]:
+        handoff = next((c["body"] for c in reversed(t["comments"]) if c["role"] == "agent"), "")
+        first = handoff.strip().lower()
+        if first.startswith("needs a decision"):
+            # The likely next step is answering and sending it back, so that's the main button.
+            tid_ = t["id"]
+            btns = (btns.replace(f'class="primary" onclick="setStatus(\'{tid_}\',\'done\')"', f'class="" onclick="setStatus(\'{tid_}\',\'done\')"')
+                        .replace(f'class="" onclick="setStatus(\'{tid_}\',\'in_progress\')"',
+                                 f'class="primary" onclick="setStatus(\'{tid_}\',\'in_progress\')"'))
+            say = ("<b>The agent needs a decision from you.</b> Answer in a comment, then <b>Send back with this "
+                   "comment</b> so it carries on (or <b>Close as done</b> if nothing's left to do).")
+        elif first.startswith("done"):
+            say = ("<b>The agent says it's done.</b> Check it, then <b>Close as done</b>, or <b>Send back for more "
+                   "work</b> with what to change.")
+        else:
+            say = "<b>Waiting on you.</b> <b>Close as done</b> if it's finished, or <b>Send back for more work</b> with what's next."
+        banners += (f'<div class="banner prop">{say} <span class="meta">Agreeing with an idea that still needs '
+                    f'building is a send-back: the button is about the ticket, not your verdict.</span></div>')
     body = f"""<div class="row" style="margin-bottom:6px"><span class="id">{t['id']}</span>
 <span class="chip s-{s}">{"Cancelled" if t["cancelled"] else "Declined" if t["declined"] else (EPIC_STATES if t['kind'] == 'epic' else LABELS)[s]}</span>{'<span class="p1">High priority</span>' if t['priority'] == 1 else ''}
 <span class="meta">{'assigned to <b>' + esc(t['assignee']) + '</b>' if t['assignee'] else 'unassigned'}</span>
@@ -2771,10 +2837,9 @@ def render_ticket(store, tid):
  {epic_box}
  <h2>Activity</h2><div class="tl" id="tl">{timeline}</div>
  <h2>Comment</h2><form class="stack box" id="cf">
-  <textarea id="cbody" placeholder="Feedback, a decision, or a question for the agent (Enter sends, Shift+Enter for a new line)" aria-label="Comment"></textarea>
-  <div class="row"><input type="file" id="cfiles" multiple aria-label="Attach files">
-  <label class="meta"{' hidden' if t['kind'] == 'epic' else ''}>then <select id="cmove" style="width:auto"><option value="">keep status</option>{move_opts}</select></label>
-  <button class="primary" id="csend">Post</button></div></form>
+  <textarea id="cbody" placeholder="Feedback, a decision, or a question for the agent (Enter posts it as a comment only; Shift+Enter for a new line)" aria-label="Comment"></textarea>
+  <div class="row"><input type="file" id="cfiles" multiple aria-label="Attach files"></div>
+  <div class="row cbtns">{comment_buttons}</div></form>
 </div><aside>
  <h2 style="margin-top:0">Checklist</h2><div class="box" id="ckbox" data-v="{ck_v}">{ckhtml}</div>
  <div id="wikibox" data-v="{esc(json.dumps(t['wiki_links']))}">{wiki_box}</div>
@@ -2790,18 +2855,20 @@ def render_ticket(store, tid):
 <script>
 const TID = {json.dumps(t['id'])}, SIG = {json.dumps(ticket_sig(t))}, $ = (id) => document.getElementById(id);
 document.getElementById('cf').onsubmit = async (e) => {{
-  e.preventDefault(); const btn = document.getElementById('csend');
-  if (btn.disabled || (!$('cbody').value.trim() && !$('cfiles').files.length && !$('cmove').value)) return;
-  btn.disabled = true; btn.textContent = 'Posting…';
+  e.preventDefault();
+  // Which button: its data-move is the status change, if any. Enter (no button) only comments.
+  const btn = e.submitter || document.getElementById('csend'), move = (e.submitter && e.submitter.dataset.move) || '';
+  if (btn.disabled || (!$('cbody').value.trim() && !$('cfiles').files.length && !move)) return;
+  const label = btn.textContent; btn.disabled = true; btn.textContent = 'Posting…';
   try {{
     const files = [...$('cfiles').files], text = $('cbody').value.trim();
     let cid = null;
     if (text || files.length) cid = (await api('POST', '/api/tickets/' + TID + '/comments', {{body: text || '(attached files)'}})).id;
     for (const f of files) {{ btn.textContent = 'Uploading ' + f.name + '…'; await upload(TID, f, cid); }}
-    if ($('cmove').value) await api('PATCH', '/api/tickets/' + TID, {{status: $('cmove').value}});
+    if (move) await api('PATCH', '/api/tickets/' + TID, {{status: move}});
     clearDraft();
     location.reload();
-  }} catch (err) {{ fail(err); btn.disabled = false; btn.textContent = 'Post'; }}
+  }} catch (err) {{ fail(err); btn.disabled = false; btn.textContent = label; }}
 }};
 async function assign(name) {{ try {{ await api('PATCH', '/api/tickets/' + TID, {{assignee: name || null}}); location.reload(); }}
   catch (err) {{ fail(err); }} }}
@@ -2982,6 +3049,10 @@ $('mf').onsubmit = async (e) => {
   await poll(true);
 };
 enterSends('mbody', 'mf');
+async function deleteChat(){
+  if (!confirm("Delete this whole chat, with all its messages and files? This can't be undone.")) return;
+  try { await api('DELETE', '/api/chat/' + CID); location.href = '/chat'; } catch (err) { fail(err); }
+}
 const am = $('am');
 if (am) am.onsubmit = async (e) => { e.preventDefault();
   try { await api('POST', '/api/chat/' + CID + '/members', {username: $('amwho').value}); location.reload(); }
@@ -3003,7 +3074,8 @@ def render_chat(store, cid, viewer):
                f'style="width:auto">{opts}</select><button>Add to conversation</button></form>')
     shown = "".join(render_message(store, m, viewer) for m in msgs)
     body = f"""<p class="meta" style="margin:0 0 4px"><a href="/chat">← Chat</a></p>
-<h1 style="margin-bottom:4px">{esc(c["name"])}</h1>
+<div class="row" style="justify-content:space-between;align-items:baseline"><h1 style="margin-bottom:4px">{esc(c["name"])}</h1>
+<button type="button" class="cancel" onclick="deleteChat()">Delete chat</button></div>
 <div class="meta">With {esc(", ".join(c["members"]) or "no one yet")}. Anyone can read and post here.</div>{add}
 <div id="chatroom" data-cid="{c["id"]}" data-last="{last}" style="margin-top:14px">
 <div class="chat" id="msgs">{shown or '<p class="empty" id="none">No messages yet. Say hello.</p>'}</div>
@@ -3331,7 +3403,9 @@ put it in comments or files.
   only). Check `assignee` against your username (`GET /api/me`).
 - **review**: the humans' turn. Move a ticket here when it's finished, or
   when you need a decision before you can go on.
-- **done**: a human approved it. Only humans set this.
+- **done**: a human closed it as done (the work is finished). Only humans
+  set this. A human agreeing with your idea or answering your question
+  sends it back to in_progress instead: read their comment and carry on.
 
 Tickets can be assigned to one user (an agent or a human). Work on tickets
 assigned to you; you may also take unassigned ready ones.
@@ -3597,6 +3671,7 @@ Chat
     POST   /api/chat/ID/files          a file for a message (as for tickets, with message_id)
     POST   /api/chat/ID/read           mark it read (enough for agents' messages; humans' need a reply)
     POST   /api/chat/ID/members        {"username": "agent-2"}: bring someone in
+                                       (humans can also DELETE /api/chat/ID: the whole chat, for good)
 
 Wiki (read-only for agents)
 
@@ -3732,7 +3807,7 @@ def what_now(t, me):
     if st == "done":
         if t.get("cancelled"):
             return "Cancelled by a human: stop any work on it. You can still comment."
-        return "Done (approved or declined): nothing to do. You can still comment."
+        return "Closed as done (or declined) by a human: nothing to do. You can still comment."
     if st == "review":
         return ("You handed this back; it's waiting for a human. Don't keep working on it unless they move it back "
                 "to in progress." if mine else "Waiting for a human's review: comment only.")
@@ -4177,6 +4252,8 @@ class Handler(BaseHTTPRequestHandler):
         m = re.fullmatch(r"/api/chat/(\d+)(/messages|/files|/members|/read)?", path)
         if m:
             cid, sub = int(m.group(1)), m.group(2)
+            if not sub and method == "DELETE":
+                return self.json(200, store.delete_conversation(cid, role))
             if not sub and method == "GET":
                 after = (query.get("after") or ["0"])[0]
                 return self.json(200, store.conversation_detail(cid, actor, int(after) if after.isdigit() else 0,

@@ -1299,6 +1299,64 @@ class TicketsTest(unittest.TestCase):
         # Everyone gets "blocked", humans too.
         self.assertIs(self.j("GET", f"/api/tickets/{first['id']}", role="human")[1]["blocked"], False)
 
+    def test_review_wording(self):
+        tok = self.j("POST", "/api/users", {"username": "agent-wd", "kind": "agent"}, role="human")[1]["token"]
+        t = self.new("in_progress", assignee="agent-wd", title="word test")
+        self.j("POST", f"/api/tickets/{t['id']}/comments", {"body": "Needs a decision: A or B? I'd pick A."}, role=None, token=tok)
+        self.j("PATCH", f"/api/tickets/{t['id']}", {"status": "review"}, role=None, token=tok)
+        html = self.call("GET", f"/t/{t['id']}", role="human")[1].decode()
+        for words in ("Close as done", "Send back for more work", "Send back with this comment", "Just comment",
+                      "The agent needs a decision from you.", "handed it back for review"):
+            self.assertIn(words, html)
+        self.assertNotIn('id="cmove"', html)
+        self.assertIn(f"class=\"primary\" onclick=\"setStatus('{t['id']}','in_progress')\">Send back for more work", html)
+        # The comment box's buttons carry the status change; sending back reads as such.
+        self.assertIn('data-move="in_progress">Send back with this comment', html)
+        self.j("POST", f"/api/tickets/{t['id']}/comments", {"body": "A, go."}, role="human")
+        self.j("PATCH", f"/api/tickets/{t['id']}", {"status": "in_progress"}, role="human")
+        self.assertIn("<b>sent it back for more work</b>", self.call("GET", f"/t/{t['id']}", role="human")[1].decode())
+        self.j("POST", f"/api/tickets/{t['id']}/comments", {"body": "Done. Built A."}, role=None, token=tok)
+        self.j("PATCH", f"/api/tickets/{t['id']}", {"status": "review"}, role=None, token=tok)
+        self.assertIn("The agent says it's done.", self.call("GET", f"/t/{t['id']}", role="human")[1].decode())
+        self.j("PATCH", f"/api/tickets/{t['id']}", {"status": "done"}, role="human")
+        html = self.call("GET", f"/t/{t['id']}", role="human")[1].decode()
+        self.assertIn("<b>closed it as done</b>", html)
+        self.assertIn("Comment &amp; reopen", html)
+
+    def test_delete_chat(self):
+        tok = self.j("POST", "/api/users", {"username": "agent-dc", "kind": "agent"}, role="human")[1]["token"]
+        c = self.j("POST", "/api/chat", {"members": ["agent-dc"], "body": "temporary"}, role="human")[1]
+        f = self.j("POST", f"/api/chat/{c['id']}/files?filename=x.txt", raw=b"bye", role="human")[1]
+        path = self.srv.store.files / self.srv.store.chat_file(f["id"])["path"]
+        self.assertTrue(path.is_file())
+        self.assertIn("deleteChat()", self.call("GET", f"/chat/{c['id']}", role="human")[1].decode())
+        self.assertEqual(self.j("DELETE", f"/api/chat/{c['id']}", role=None, token=tok)[0], 403)  # agents can't
+        self.assertEqual(self.j("DELETE", f"/api/chat/{c['id']}", role="human")[1]["deleted"], c["id"])
+        self.assertEqual(self.j("GET", f"/api/chat/{c['id']}", role="human")[0], 404)
+        self.assertFalse(path.exists())
+        self.assertEqual(self.j("GET", "/api/me", role=None, token=tok)[1]["chat_unread"], 0)  # nothing owed any more
+
+    def test_page_scripts_parse(self):
+        """Every script the pages carry is valid JavaScript (a stray quote breaks a whole page). Needs node."""
+        import shutil
+        import subprocess
+        if not shutil.which("node"):
+            self.skipTest("node isn't installed")
+        for name in ("JS", "CHAT_JS", "CHAT_LIST_JS", "LIVE_JS", "SETTINGS_JS", "NEW_JS", "DEP_PICKER_JS",
+                     "WIKI_EDIT_JS", "COPY_JS", "DASH_JS", "PROPOSAL_JS"):
+            r = subprocess.run(["node", "--check", "-"], input=getattr(at, name), text=True, capture_output=True)
+            self.assertEqual(r.returncode, 0, f"{name}: {r.stderr}")
+        # And the scripts written into pages (ticket, chat, new, wiki, settings).
+        t = self.new("review", title="script check")
+        c = self.j("POST", "/api/chat", {"title": "script check", "body": "x"}, role="human")[1]
+        self.j("POST", "/api/wiki", {"title": "Script check"}, role="human")
+        for path in (f"/t/{t['id']}", f"/chat/{c['id']}", "/chat", "/new", "/wiki/script-check?edit=1", "/settings", "/",
+                     "/backlog", "/users", "/guidance"):
+            html = self.call("GET", path, role="human")[1].decode()
+            for i, js in enumerate(re.findall(r"<script>(.*?)</script>", html, re.S)):
+                r = subprocess.run(["node", "--check", "-"], input=js, text=True, capture_output=True)
+                self.assertEqual(r.returncode, 0, f"{path} script {i}: {r.stderr}")
+
     def test_skill(self):
         code, body, h = self.call("GET", "/api/skill", role="agent", headers={"Host": "tickets.example:43917"})
         text = body.decode()
@@ -1335,7 +1393,8 @@ class TicketsTest(unittest.TestCase):
             self.assertNotIn(b"<b>escaping</b>", body)
         html = self.call("GET", f"/t/{t['id']}", role="human")[1].decode()
         self.assertIn('href="https://example.com"', html)
-        self.assertIn("Approve", html)
+        self.assertIn("Close as done", html)
+        self.assertNotIn("Approve", html)
         self.assertIn("Needs your review", self.call("GET", "/", role="human")[1].decode())
         self.assertEqual(self.call("GET", "/t/ZZZZ", role="human")[0], 404)
 

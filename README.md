@@ -168,6 +168,12 @@ description to hear its text read aloud by the device's own speech, just
 the text, not the name or time. Tap it again to stop; links, buttons and
 files work as usual. The API: `GET`/`PUT /api/me/prefs` (`{"tts": true}`).
 
+## Deleting chats
+
+Humans can delete a whole chat (the Delete chat button on its page, or
+`DELETE /api/chat/ID`): the conversation, its messages and its files,
+for good. Single messages can't be deleted.
+
 ## Assignment
 
 A ticket can be assigned to one user, an agent or a human, or to no one.
@@ -308,7 +314,7 @@ They're on the same disk as the data, so copy them somewhere else too.
   or markdown write-up, as a download, with a preview for small text
   files), the checklist the agent reports, with
   progress, its epic, what must be done first and what it unblocks, and
-  buttons to approve, send back, or move it anywhere. It's live: new
+  buttons named for what happens to the ticket (Close as done, Send back for more work, Make ready, Reopen...), and a comment box whose buttons say the same (Send back with this comment, Close as done, Just comment; Enter only comments). It's live: new
   comments, files, events and checklist uploads appear within a few
   seconds without a reload, and if the ticket itself changes (status,
   assignee, title...) a banner offers a refresh. Your unsent comment is
