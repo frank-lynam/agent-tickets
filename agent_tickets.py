@@ -264,7 +264,7 @@ GONE = ("checklist_path is gone: keep your checklist on your machine and upload 
 
 DEFAULT_GUIDANCE = """## How we work
 
-0. Chat comes first. When a response carries a "chat" notice, read your unread messages and answer them before your next step on the ticket. Chat is for questions and planning that aren't about one ticket; anything about a ticket goes in a comment on that ticket.
+0. Chat comes first. When a response carries a "chat" notice, reply to the messages before your next step on the ticket. A human's message stays until you reply, even a short "Got it". Chat is for questions and planning that aren't about one ticket; anything about a ticket goes in a comment on that ticket.
 1. When you take a ticket, it's in progress and assigned to you: that means you are working on it now. First post a one-line comment: you're starting, and you'll write a checklist.
 2. Write a markdown checklist of the steps ("- [ ] step") in a file on your machine, upload it (PUT /api/tickets/ID/checklist), and post a short plan: what you'll do, and how you'll know it's done.
 3. After each step, tick it off in your file, upload it again, and comment what you did and what happened, including errors and surprises.
@@ -1331,17 +1331,42 @@ class Store:
                 out.append(c)
         return out
 
+    def chat_attention(self, user):
+        """The conversations an agent still owes something in: messages from humans posted since the agent
+        last wrote there (they stay until it replies, read or not), and other messages it hasn't read
+        (from agents, or notes like "(added ...)": reading them is enough, so two agents can't owe each
+        other replies forever). Each has "messages" and "needs_reply"."""
+        db, out = self.db(), []
+        for cid, last_read in db.execute(
+                "SELECT m.conversation_id, m.last_read FROM chat_members m JOIN conversations c ON c.id = m.conversation_id "
+                "WHERE m.username = ? ORDER BY c.updated_at DESC", (user,)).fetchall():
+            mine = db.execute("SELECT COALESCE(MAX(id), 0) FROM messages WHERE conversation_id = ? AND author = ? "
+                              "COLLATE NOCASE", (cid, user)).fetchone()[0]
+            owed = lambda m: m["role"] == "human" and m["id"] > mine
+            msgs = [m for m in self.messages(cid, after=min(mine, last_read), limit=500)
+                    if m["author"].lower() != user.lower() and (owed(m) or m["id"] > last_read)]
+            if msgs:
+                c = self.conversation(cid, user)
+                c["messages"], c["needs_reply"] = msgs, any(owed(m) for m in msgs)
+                out.append(c)
+        return out
+
     def chat_notice(self, user):
-        """What goes with every ticket response to an agent that has unread chat."""
-        total = self.unread_total(user)
-        if not total:
+        """What goes with every response to an agent that owes chat a reply (or has unread chat)."""
+        convs = self.chat_attention(user)
+        if not convs:
             return None
-        convs = [{"id": c["id"], "name": c["name"], "unread": c["unread"]} for c in self.unread(user)]
-        where = "; ".join(f'{c["name"]} ({c["unread"]})' for c in convs)
-        return {"unread": total, "conversations": convs,
-                "notice": f"You have {total} unread chat message{'s' if total != 1 else ''} ({where}). Answer chat "
-                          "before your next step on this ticket: GET /api/chat/unread, then reply with "
-                          "POST /api/chat/ID/messages (or POST /api/chat/ID/read when no reply is needed). Then carry on."}
+        total = sum(len(c["messages"]) for c in convs)
+        summary = [{"id": c["id"], "name": c["name"], "messages": len(c["messages"]), "needs_reply": c["needs_reply"]}
+                   for c in convs]
+        where = "; ".join(f'{c["name"]} ({len(c["messages"])}{", needs your reply" if c["needs_reply"] else ""})'
+                          for c in convs)
+        return {"unread": total, "conversations": summary,
+                "notice": f"You have {total} chat message{'s' if total != 1 else ''} to answer ({where}). Answer chat "
+                          "before your next step: GET /api/chat/unread, then reply in each conversation with "
+                          "POST /api/chat/ID/messages. Messages from humans keep this notice up until you reply there, "
+                          "even after you've read them; if nothing needs saying, reply briefly (\"Got it\"). "
+                          "Messages from other agents only need reading (POST /api/chat/ID/read). Then carry on."}
 
     def mark_read(self, cid, user, upto=None):
         db = self.db()
@@ -1423,7 +1448,7 @@ class Store:
                            "WHERE conversation_id = ?) WHERE conversation_id = ? AND username = ? AND ?",
                            (c["id"], c["id"], u["username"], added))
         if added:
-            self.post_message(c["id"], f"(added {u['username']})", actor, role)
+            self.post_message(c["id"], f"(added {u['username']})", actor, "system")  # a note, not a question
         return self.conversation(c["id"], actor)
 
     def add_chat_file(self, cid, mid, filename, mime, size, stream, actor, role, max_bytes):
@@ -3060,9 +3085,10 @@ enough, or a request fails in a way you don't understand. Errors come back as `{
 ## Each session
 
 1. `GET /api/me`: who you are, your humans' current guidance (follow it; it changes), unread chat count.
-2. Unread chat? Answer it before anything else: `GET /api/chat/unread`, then `POST /api/chat/ID/messages`
-   `{{"body": "..."}}` (or `POST /api/chat/ID/read` if no reply is needed). Any response with a `"chat"`
-   field means the same: stop, answer chat, then carry on.
+2. Chat to answer? Do it before anything else: `GET /api/chat/unread`, then reply in each conversation:
+   `POST /api/chat/ID/messages` `{{"body": "..."}}`. A human's message keeps notifying you until you reply
+   (reading isn't enough; if nothing needs saying, reply briefly). Other agents' messages only need reading
+   (`POST /api/chat/ID/read`). Any response with a `"chat"` field means the same: stop, answer chat, carry on.
 3. `GET /api/next?claim=1` takes the next ready ticket (yours first). `{{"ticket": null}}`: nothing to do.
    The ticket you get is now in progress and assigned to you: that means you work on it, now.
 4. Read the whole ticket (`GET /api/tickets/ID`): description, every comment, checklist, and every page
@@ -3256,13 +3282,21 @@ Conversations between any users, humans and agents; anyone can read and
 post in any of them. The members of a conversation are the people who are
 told about its new messages.
 
-**Answer chat before you carry on.** When you have unread messages, every
+**Answer chat before you carry on.** While you owe chat an answer, every
 ticket response (`/api/next`, `GET`/`PATCH` a ticket, comments, uploads)
 includes a `"chat"` field (`{"unread": 2, "conversations": [...], "notice":
-"..."}`), and every API response has an `X-Chat-Unread` header. When you see
-it: `GET /api/chat/unread`, reply to each conversation, then go back to your
-ticket. If a message needs no reply, mark it read (`POST /api/chat/ID/read`).
-Reading a conversation (`GET /api/chat/ID`) or posting in it also marks it read.
+"..."}`), every API response has an `X-Chat-Unread` header, and
+`/api/wait` returns `"reason": "chat"`. When you see it:
+`GET /api/chat/unread`, reply in each conversation, then go back to your
+ticket.
+
+**A message from a human stays on that list until you reply in its
+conversation.** Reading it isn't enough, and marking it read doesn't
+clear it. If nothing needs saying, reply briefly anyway ("Got it",
+"Will do after this ticket"), so they know you saw it. Messages from other
+agents, and notes like "(added agent-2)", only need reading: mark them
+read (`POST /api/chat/ID/read`) or reply if you have something to say.
+That way two agents never owe each other replies forever.
 
 Keep chat for things that aren't about one ticket. Work on a ticket is
 discussed in comments on the ticket, where the humans review it.
@@ -3481,10 +3515,11 @@ def docs_for(store, actor, role):
     queue = [dict(r) for r in store.db().execute(
         "SELECT id, title FROM tickets WHERE status = 'ready' AND assignee = ? COLLATE NOCASE "
         "ORDER BY priority, created_at", (actor,))]
-    unread = store.unread_total(actor)
+    unread = (sum(len(c["messages"]) for c in store.chat_attention(actor)) if role == "agent"
+              else store.unread_total(actor))
     lines = [f"\n## Right now\n", f"You're signed in as **{actor}** ({role})."]
     if unread:
-        lines.append(f"**You have {unread} unread chat message{'s' if unread != 1 else ''}. Answer them first:** "
+        lines.append(f"**You have {unread} chat message{'s' if unread != 1 else ''} to answer. Reply first:** "
                      "`GET /api/chat/unread`.")
     lines.append(f"Tickets: {counts.get('ready', 0)} ready, {counts.get('in_progress', 0)} in progress, "
                  f"{counts.get('review', 0)} waiting for review, {counts.get('backlog', 0)} in the backlog.")
@@ -3763,7 +3798,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self.html(render_users(store, actor))
             if method == "GET" and path == "/api/me":
                 return self.json(200, {"username": actor, "kind": role, "guidance": store.guidance_for(actor),
-                                       "chat_unread": store.unread_total(actor), "prefs": store.prefs(actor)})
+                                       "chat_unread": (sum(len(c["messages"]) for c in store.chat_attention(actor))
+                                                       if role == "agent" else store.unread_total(actor)),
+                                       "prefs": store.prefs(actor)})
             if path == "/api/me/prefs":
                 if method == "GET":
                     return self.json(200, store.prefs(actor))
@@ -3899,7 +3936,8 @@ class Handler(BaseHTTPRequestHandler):
                 cid = store.start_conversation(self.body_json(), actor, role)
                 return self.json(201, store.conversation_detail(cid, actor, mark=False))
         if path == "/api/chat/unread" and method == "GET":
-            convs = store.unread(actor)
+            # Agents: everything they still owe (human messages until they reply). Humans: unread.
+            convs = store.chat_attention(actor) if role == "agent" else store.unread(actor)
             return self.json(200, {"unread": sum(len(c["messages"]) for c in convs), "conversations": convs})
         m = re.fullmatch(r"/api/chat/(\d+)(/messages|/files|/members|/read)?", path)
         if m:

@@ -634,7 +634,7 @@ class TicketsTest(unittest.TestCase):
         self.assertEqual((got["status"], got["chat"]["unread"], h["X-Chat-Unread"]), ("in_progress", 1, "1"))
         self.assertIn("Answer chat", got["chat"]["notice"])
         self.assertEqual(self.j("GET", "/api/next", role=None, token=tok)[1]["chat"]["conversations"][0]["id"], c["id"])
-        self.assertIn("unread chat message", self.call("GET", "/api", role=None, token=tok)[1].decode())
+        self.assertIn("chat message to answer", self.call("GET", "/api", role=None, token=tok)[1].decode())
         self.assertEqual(self.j("GET", "/api/me", role=None, token=tok)[1]["chat_unread"], 1)
         unread = self.j("GET", "/api/chat/unread", role=None, token=tok)[1]
         self.assertEqual((unread["unread"], unread["conversations"][0]["messages"][0]["author"]), (1, "Frank"))
@@ -978,6 +978,9 @@ class TicketsTest(unittest.TestCase):
         self.assertEqual(W()["reason"], "chat")
         for c in self.j("GET", "/api/chat/unread", role=None, token=tok)[1]["conversations"]:
             self.j("POST", f"/api/chat/{c['id']}/read", {}, role=None, token=tok)
+        self.assertEqual(W("/api/wait?timeout=1")["reason"], "chat")  # read isn't enough: a human asked
+        for c in self.j("GET", "/api/chat/unread", role=None, token=tok)[1]["conversations"]:
+            self.j("POST", f"/api/chat/{c['id']}/messages", {"body": "Got it"}, role=None, token=tok)
         self.assertEqual(W("/api/wait?timeout=1")["reason"], "timeout")
         # The briefing and skill teach it.
         brief = self.call("GET", "/api", role=None)[1].decode()
@@ -1175,6 +1178,38 @@ class TicketsTest(unittest.TestCase):
         # Humans' view keeps the full list.
         self.assertEqual(len(self.j("GET", f"/api/tickets/{then['id']}", role="human")[1]["depends_on"]), 2)
         self.assertIn("**A\npredecessor that's done no longer blocks anything.**", self.call("GET", "/api", role=None)[1].decode())
+
+    def test_chat_until_replied(self):
+        tok = self.j("POST", "/api/users", {"username": "agent-rp", "kind": "agent"}, role="human")[1]["token"]
+        other = self.j("POST", "/api/users", {"username": "agent-rq", "kind": "agent"}, role="human")[1]["token"]
+        me = lambda: self.j("GET", "/api/me", role=None, token=tok)[1]["chat_unread"]
+        c = self.j("POST", "/api/chat", {"members": ["agent-rp"], "body": "Can you check the deploy?"}, role="human")[1]
+        self.assertEqual(me(), 1)
+        # Reading it (opening the conversation, or marking it read) doesn't clear it.
+        self.j("GET", f"/api/chat/{c['id']}", role=None, token=tok)
+        self.j("POST", f"/api/chat/{c['id']}/read", {}, role=None, token=tok)
+        notice = self.j("GET", "/api/next", role=None, token=tok)[1]["chat"]
+        self.assertEqual((notice["unread"], notice["conversations"][0]["needs_reply"]), (1, True))
+        self.assertIn("until you reply there", notice["notice"])
+        self.assertEqual(self.j("GET", "/api/chat/unread", role=None, token=tok)[1]["conversations"][0]["needs_reply"], True)
+        # Humans still see it as read (the receipt), whatever the agent owes.
+        self.assertIn("Read by agent-rp", self.call("GET", f"/chat/{c['id']}", role="human")[1].decode())
+        # Replying clears it; a new human message brings it back.
+        self.j("POST", f"/api/chat/{c['id']}/messages", {"body": "On it"}, role=None, token=tok)
+        self.assertEqual(me(), 0)
+        self.j("POST", f"/api/chat/{c['id']}/messages", {"body": "Thanks!"}, role="human")
+        self.assertEqual(me(), 1)
+        self.j("POST", f"/api/chat/{c['id']}/messages", {"body": "Got it"}, role=None, token=tok)
+        # Another agent's message, and an "(added ...)" note, only need reading: no reply loops between agents.
+        d = self.j("POST", "/api/chat", {"members": ["agent-rp"], "body": "fyi: tests are green"}, role=None, token=other)[1]
+        self.assertEqual(me(), 1)
+        self.j("POST", f"/api/chat/{d['id']}/read", {}, role=None, token=tok)
+        self.assertEqual(me(), 0)
+        g = self.j("POST", "/api/chat", {"title": "team"}, role="human")[1]
+        self.j("POST", f"/api/chat/{g['id']}/members", {"username": "agent-rp"}, role="human")
+        self.assertEqual(me(), 1)
+        self.j("POST", f"/api/chat/{g['id']}/read", {}, role=None, token=tok)
+        self.assertEqual(me(), 0)
 
     def test_skill(self):
         code, body, h = self.call("GET", "/api/skill", role="agent", headers={"Host": "tickets.example:43917"})

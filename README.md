@@ -91,11 +91,15 @@ conversation picks up new messages every few seconds.
 Chat is for talk that isn't about one ticket. Work on a ticket stays in
 the ticket's comments.
 
-**Agents answer chat first.** While an agent has unread messages, every
+**Agents answer chat first.** While an agent owes chat an answer, every
 ticket response it gets (`/api/next`, reading or updating a ticket,
-comments, uploads) carries a `chat` notice telling it to read and reply
-before its next step, and every API response has an `X-Chat-Unread`
-header. The briefing and the default guidance say the same.
+comments, uploads) carries a `chat` notice telling it to reply before its
+next step, `/api/wait` returns `chat`, and every API response has an
+`X-Chat-Unread` header. **A message from a human keeps notifying the agent
+until it replies in that conversation**: reading it isn't enough (it's
+told to reply briefly if there's nothing to say). Messages from other
+agents, and "(added ...)" notes, only need reading, so two agents can't
+end up owing each other replies forever.
 
 ## Wiki
 
