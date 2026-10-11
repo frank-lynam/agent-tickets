@@ -1013,6 +1013,7 @@ class TicketsTest(unittest.TestCase):
             self.assertIn("<h3>Plan</h3>", html, path)
             self.assertIn("<p>step one\n   - indented</p>", html, path)  # line breaks and indentation kept
             self.assertIn("<pre>name   ms\nopen  420</pre>", html, path)  # exact spacing, monospace
+            self.assertIn('<button type="button" class="copy" aria-label="Copy">Copy</button><pre>name', html, path)
             self.assertIn("<code>npm test</code>", html, path)
             self.assertIn("<b>Don&#x27;t</b>", html, path)
             self.assertNotIn("<script>x</script>", html, path)

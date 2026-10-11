@@ -1770,9 +1770,12 @@ form.stack{display:grid;gap:8px}
 .md p{white-space:pre-wrap;overflow-wrap:anywhere;margin:0 0 8px}.md>:last-child{margin-bottom:0}
 .md h2,.md h3,.md h4{text-transform:none;letter-spacing:0;color:inherit;margin:12px 0 4px;font-weight:700}
 .md h2{font-size:17px}.md h3{font-size:15.5px}.md h4{font-size:15px}.md>:first-child{margin-top:0}
-.md pre{white-space:pre;overflow:auto;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:8px 10px;
+.md pre{white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:8px 10px;
 font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;margin:0 0 8px}
-.md code{font:13px ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--bg);padding:1px 4px;border-radius:4px}
+.md code{font:13px ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--bg);padding:1px 4px;border-radius:4px;overflow-wrap:anywhere}
+.code{position:relative;margin:0 0 8px}.code pre{margin:0;padding-right:62px}.md>.code:last-child{margin-bottom:0}
+.code .copy{position:absolute;top:5px;right:5px;padding:2px 9px;font-size:12px;font-weight:600;opacity:.85}
+.code .copy:hover{opacity:1}
 .tl{display:grid;gap:10px}
 .c{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 14px}
 .c.agent{border-left:3px solid var(--agent)}
@@ -1803,8 +1806,8 @@ a.wl.missing{color:var(--review);text-decoration-style:dashed}
 .tag.epic{background:var(--prog-bg);color:var(--agent)}
 .banner{border-radius:10px;padding:10px 14px;margin-bottom:14px;background:var(--review-bg);color:var(--review)}
 .banner.prop{background:var(--prog-bg);color:var(--prog)}
-.chat{display:grid;gap:8px}
-.msg{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:8px 12px;max-width:min(680px,94%);justify-self:start}
+.chat{display:grid;gap:8px;grid-template-columns:minmax(0,1fr)}
+.msg{min-width:0;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:8px 12px;max-width:min(680px,94%);justify-self:start}
 .msg.mine{justify-self:end;background:var(--prog-bg)}
 .msg.agent{border-left:3px solid var(--agent)}
 .msg .who{font-weight:600}.msg .who.agent{color:var(--agent)}
@@ -1824,7 +1827,7 @@ html[data-tts="1"] .c,html[data-tts="1"] .msg,html[data-tts="1"] .desc{cursor:po
 .wk h2,.wk h3,.wk h4{text-transform:none;letter-spacing:0;color:var(--ink);margin:18px 0 6px}
 .wk>:first-child{margin-top:0}.wk h2{font-size:19px}.wk h3{font-size:16px}.wk h4{font-size:15px}
 .wk p{white-space:pre-wrap;overflow-wrap:anywhere;margin:0 0 10px}
-.wk pre{white-space:pre;overflow:auto;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:8px 10px;font-size:13px}
+.wk pre{white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:8px 10px;font-size:13px}
 .wk code{font:13px ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--bg);padding:1px 4px;border-radius:4px}
 .crumbs{font-size:13px;color:var(--dim);margin-bottom:4px}.crumbs a{text-decoration:none}
 .tree,.tree ul{list-style:none;margin:0;padding:0}.tree ul{margin-left:16px;border-left:1px solid var(--line);padding-left:10px}
@@ -1942,6 +1945,18 @@ async function upload(tid, file, commentId){
   if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.error || ('HTTP ' + r.status)); }
 }
 function fail(e){ alert(e.message); }
+// Copy buttons on code blocks: the original text, unwrapped.
+async function copyText(text){
+  try { await navigator.clipboard.writeText(text); return true; } catch (e) {
+    const a = document.createElement('textarea'); a.value = text; document.body.appendChild(a); a.select();
+    let ok = false; try { ok = document.execCommand('copy'); } catch (e2) {} a.remove(); return ok;
+  }
+}
+document.addEventListener('click', async (e) => {
+  const b = e.target.closest && e.target.closest('button.copy'); if (!b) return;
+  const ok = await copyText(b.parentNode.querySelector('pre').textContent);
+  b.textContent = ok ? 'Copied' : 'Copy failed'; setTimeout(() => { b.textContent = 'Copy'; }, 1500);
+});
 // Text boxes grow with what's typed, up to 80% of the screen, then scroll.
 function fit(el){
   if (!el || el.tagName !== 'TEXTAREA') return;
@@ -2969,6 +2984,11 @@ def wiki_inline(store, text):
     return "".join(out)
 
 
+def code_block(lines):
+    """A code block: monospace, wrapped, with a Copy button that copies the original text."""
+    return f'<div class="code"><button type="button" class="copy" aria-label="Copy">Copy</button><pre>{esc(chr(10).join(lines))}</pre></div>'
+
+
 def wiki_html(store, text):
     """Text as people and agents write it: line breaks and indentation kept, plus a little markdown:
     # headings, ``` code blocks (monospace, spacing exact), `code`, **bold**, links. Used for the wiki,
@@ -2985,7 +3005,7 @@ def wiki_html(store, text):
                 flush()
                 code = []
             else:
-                out.append(f"<pre>{esc(chr(10).join(code))}</pre>")
+                out.append(code_block(code))
                 code = None
             continue
         if code is not None:
@@ -2999,7 +3019,7 @@ def wiki_html(store, text):
         else:
             para.append(line)
     if code is not None:
-        out.append(f"<pre>{esc(chr(10).join(code))}</pre>")
+        out.append(code_block(code))
     flush()
     return "".join(out)
 
