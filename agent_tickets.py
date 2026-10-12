@@ -269,12 +269,16 @@ USERNAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,31}")
 DEFAULT_GUIDANCE = """## How we work
 
 0. Chat comes first. When a response carries a "chat" notice, reply to the messages before your next step on the ticket. A human's message stays until you reply, even a short "Got it". Chat is for questions and planning that aren't about one ticket; anything about a ticket goes in a comment on that ticket.
-1. When you take a ticket, it's in progress and assigned to you: that means you are working on it now. First post a one-line comment: you're starting, and you'll write a checklist.
-2. Write a markdown checklist of the steps ("- [ ] step") in a file on your machine, upload it (PUT /api/tickets/ID/checklist), and post a short plan: what you'll do, and how you'll know it's done.
+1. When you take a ticket, it's in progress and assigned to you: that means you are working on it now. Make its folder (~/work/tickets/TICKET-ID/, e.g. ~/work/tickets/amber-otter/) and, if it changes a repo, a branch in that repo named ticket/TICKET-ID. Then post a one-line comment: you're starting, where the folder and branch are, and that you'll write a checklist.
+2. Write a markdown checklist of the steps ("- [ ] step") in that folder (checklist.md), upload it (PUT /api/tickets/ID/checklist), and post a short plan: what you'll do, and how you'll know it's done.
 3. After each step, tick it off in your file, upload it again, and comment what you did and what happened, including errors and surprises.
 4. When something is visible (a page, a chart, a game), attach a screenshot or a short recording.
 5. Hand back with a comment that starts "Done" or "Needs a decision", then set the status to review.
 6. After every action (a step, a hand-back, a chat reply), call GET /api/wait and do what it returns: chat, replies, then your tickets in the order it lists them (highest priority first, started and nearest-done first). Finish what you've started before taking new work. Never end a turn with nothing in hand: keep wait running in the background so it wakes you, and have a recurring check (cron, scheduled task) as a safety net. Don't leave tickets in progress that you aren't working on: if you're waiting on a decision, move it to review and say what you need.
+
+## Keeping your files tidy
+
+Keep each ticket's working files (checklist, notes, scratch files, downloads, logs, screenshots) in its own folder, ~/work/tickets/TICKET-ID/, not loose in your home folder, so you and anyone after you can find them. Changes to a project happen in that project's own repo, on the ticket's branch, not as copies in the ticket folder. Don't touch other tickets' folders. When a ticket is closed as done, clear out what isn't worth keeping.
 
 ## How much to write
 
@@ -3444,7 +3448,10 @@ enough, or a request fails in a way you don't understand. Errors come back as `{
 - Comment as you go: `POST /api/tickets/ID/comments` `{{"body": "..."}}`.
 - A human's comment on your ticket waits for your reply: `/api/wait` returns it (reason `comments`) and the
   ticket shows `new_comments`, until you comment on that ticket. Read it, act on it, reply (even briefly).
-- Checklist: keep it in a markdown file on your machine ("- [ ] step"); after each step upload the whole
+- Files: one folder per ticket, `~/work/tickets/TICKET-ID/` (checklist, notes, scratch, logs, screenshots), never
+  loose in your home folder; code changes in the project's repo on a `ticket/TICKET-ID` branch. Name both in your
+  start comment; leave other tickets' folders alone; tidy up once a ticket is closed as done.
+- Checklist: keep it as `checklist.md` in the ticket's folder ("- [ ] step"); after each step upload the whole
   file: `PUT /api/tickets/ID/checklist` (body: the file's text, `Content-Type: text/markdown`). Each upload
   replaces the last; your file is the source. Only while the ticket is yours and in progress.
 - Files: `curl -F file=@notes.md -F comment_id=N "$URL/api/tickets/ID/attachments"`, or the raw bytes with the
@@ -3598,9 +3605,10 @@ proposed tickets, in one step.
    look for another ticket or wait for permission. `{"ticket": null}`
    means there's nothing to do. The response also has `"guidance"`: the current house rules for
    you. Read it every time; humans change it.
-2. Read the whole ticket: `GET /api/tickets/ID` has the description, every
-   comment (humans' replies included: they're instructions), the status
-   history and the checklist.
+2. Read the ticket: `GET /api/tickets/ID` has the description, the latest
+   comments (humans' replies included: they're instructions; page back if
+   you need older ones, see "Long threads"), the recent history and the
+   checklist.
 3. Work, and **comment on the ticket as you go**. Comments are the only way
    the humans know what happened; a ticket without them looks abandoned.
    The minimum: a comment when you start (what you're about to do), one
@@ -3612,27 +3620,36 @@ proposed tickets, in one step.
    in `/api/wait`) once you've gone 20 minutes without a comment, and a
    checklist upload with no comment since the last one comes back with a
    `"reminder"`.
-4. Keep a markdown checklist on your machine ("- [ ] step" / "- [x] step")
+4. **Keep your files tidy: one folder per ticket.** Put everything you make
+   for a ticket (checklist, notes, scratch files, downloads, logs,
+   screenshots) in `~/work/tickets/TICKET-ID/` (e.g.
+   `~/work/tickets/amber-otter/`), never loose in your home folder. Code
+   changes go in the project's own repo, on a branch named
+   `ticket/TICKET-ID`, not as copies in the ticket folder. Name the folder
+   and branch in your start comment, so you (or whoever comes next) can
+   find them. Leave other tickets' folders alone; once a ticket is closed
+   as done, clear out what isn't worth keeping.
+5. Keep a markdown checklist in that folder (`checklist.md`; "- [ ] step" / "- [x] step")
    and upload the whole file after each step: `PUT /api/tickets/ID/checklist`
    with its text as the body. Each upload replaces the last one; it's a
    report for the humans (they see it with a progress bar), and your file
    stays the source. Only you can upload it, while the ticket is assigned
    to you and in progress.
-5. Hand back: post a comment, then `PATCH` the status to review. A good
+6. Hand back: post a comment, then `PATCH` the status to review. A good
    hand-off comment says:
    - **Done** or **Needs a decision** (first line, so it's clear which).
    - What you did, and where (files, branches, commits).
    - How to check it (what to open, run or look at; attach a screenshot
      or recording).
    - For a decision: the question, the options, and what you'd recommend.
-6. Stopping before you're finished: comment where you got to and what's
+7. Stopping before you're finished: comment where you got to and what's
    next. If you're blocked on a decision or on someone else, move it to
    review saying what you need; if someone else should take it, release
    it (`ready`). Leave it in_progress only if you're coming back to it:
    `/api/wait` keeps handing your in-progress tickets back to you.
-7. After review a human may move it back to in_progress or ready with a
+8. After review a human may move it back to in_progress or ready with a
    comment saying what to change. Read their comment first.
-8. **A human's comment on your ticket waits for your reply.** Whenever a
+9. **A human's comment on your ticket waits for your reply.** Whenever a
    human comments on a ticket assigned to you (not done), it stays on your
    list until you comment on that ticket: `/api/wait` returns it (reason
    `comments`) right after chat, the ticket shows `"new_comments": N`, and

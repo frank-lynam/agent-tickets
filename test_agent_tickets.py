@@ -1459,6 +1459,14 @@ class TicketsTest(unittest.TestCase):
         more = self.j("GET", f"/chat/{c['id']}/before/{conv['messages'][0]['id']}", role="human")[1]
         self.assertEqual((more["html"].count('class="msg'), bool(more["before"])), (20, True))
 
+    def test_files_guidance(self):
+        brief = self.call("GET", "/api", role=None)[1].decode()
+        self.assertIn("**Keep your files tidy: one folder per ticket.**", brief)
+        self.assertIn("`~/work/tickets/TICKET-ID/`", brief)
+        self.assertIn("ticket/TICKET-ID", at.DEFAULT_GUIDANCE)
+        self.assertIn("## Keeping your files tidy", at.DEFAULT_GUIDANCE)
+        self.assertIn("~/work/tickets/TICKET-ID/", self.call("GET", "/api/skill", role="agent")[1].decode())
+
     def test_skill(self):
         code, body, h = self.call("GET", "/api/skill", role="agent", headers={"Host": "tickets.example:43917"})
         text = body.decode()
