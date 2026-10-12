@@ -269,7 +269,7 @@ USERNAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,31}")
 DEFAULT_GUIDANCE = """## How we work
 
 0. Chat comes first. When a response carries a "chat" notice, reply to the messages before your next step on the ticket. A human's message stays until you reply, even a short "Got it". Chat is for questions and planning that aren't about one ticket; anything about a ticket goes in a comment on that ticket.
-1. When you take a ticket, it's in progress and assigned to you: that means you are working on it now. Make its folder (~/work/tickets/TICKET-ID/, e.g. ~/work/tickets/amber-otter/) and, if it changes a repo, a branch in that repo named ticket/TICKET-ID. Then post a one-line comment: you're starting, where the folder and branch are, and that you'll write a checklist.
+1. When you take a ticket, it's in progress and assigned to you: that means you are working on it now. Make its folder (~/work/tickets/TICKET-ID/, e.g. ~/work/tickets/amber-otter/) and, if it changes a repo, a branch in that repo named ticket/TICKET-ID. Then post a one-line comment: you're starting (and on which branch), and you'll write a checklist.
 2. Write a markdown checklist of the steps ("- [ ] step") in that folder (checklist.md), upload it (PUT /api/tickets/ID/checklist), and post a short plan: what you'll do, and how you'll know it's done.
 3. After each step, tick it off in your file, upload it again, and comment what you did and what happened, including errors and surprises.
 4. When something is visible (a page, a chart, a game), attach a screenshot or a short recording.
@@ -278,7 +278,9 @@ DEFAULT_GUIDANCE = """## How we work
 
 ## Keeping your files tidy
 
-Keep each ticket's working files (checklist, notes, scratch files, downloads, logs, screenshots) in its own folder, ~/work/tickets/TICKET-ID/, not loose in your home folder, so you and anyone after you can find them. Changes to a project happen in that project's own repo, on the ticket's branch, not as copies in the ticket folder. Don't touch other tickets' folders. When a ticket is closed as done, clear out what isn't worth keeping.
+Keep each ticket's working files (checklist, notes, scratch files, downloads, logs, screenshots) in its own folder, ~/work/tickets/TICKET-ID/, not loose in your home folder, so you can find them when you come back to it. Changes to a project happen in that project's own repo, on the ticket's branch, not as copies in the ticket folder.
+
+Your machine is yours alone: no human or other agent can see your files. Anything they need leaves it: attach files to the ticket (logs, screenshots, write-ups), push your branch and name it and the commit in your comments. If a ticket is released or reassigned, the next one starts with only what's on the ticket and in the repo. When a ticket is closed as done, clear out what isn't worth keeping.
 
 ## How much to write
 
@@ -3449,8 +3451,9 @@ enough, or a request fails in a way you don't understand. Errors come back as `{
 - A human's comment on your ticket waits for your reply: `/api/wait` returns it (reason `comments`) and the
   ticket shows `new_comments`, until you comment on that ticket. Read it, act on it, reply (even briefly).
 - Files: one folder per ticket, `~/work/tickets/TICKET-ID/` (checklist, notes, scratch, logs, screenshots), never
-  loose in your home folder; code changes in the project's repo on a `ticket/TICKET-ID` branch. Name both in your
-  start comment; leave other tickets' folders alone; tidy up once a ticket is closed as done.
+  loose in your home folder; code changes in the project's repo on a `ticket/TICKET-ID` branch. Tidy up once a ticket
+  is closed as done. Nobody else can see your machine: attach what humans or the next agent need to the ticket,
+  and push your branch (name it and the commit in your comments).
 - Checklist: keep it as `checklist.md` in the ticket's folder ("- [ ] step"); after each step upload the whole
   file: `PUT /api/tickets/ID/checklist` (body: the file's text, `Content-Type: text/markdown`). Each upload
   replaces the last; your file is the source. Only while the ticket is yours and in progress.
@@ -3625,10 +3628,15 @@ proposed tickets, in one step.
    screenshots) in `~/work/tickets/TICKET-ID/` (e.g.
    `~/work/tickets/amber-otter/`), never loose in your home folder. Code
    changes go in the project's own repo, on a branch named
-   `ticket/TICKET-ID`, not as copies in the ticket folder. Name the folder
-   and branch in your start comment, so you (or whoever comes next) can
-   find them. Leave other tickets' folders alone; once a ticket is closed
-   as done, clear out what isn't worth keeping.
+   `ticket/TICKET-ID`, not as copies in the ticket folder. Once a ticket is
+   closed as done, clear out what isn't worth keeping.
+
+   **Your machine is yours alone:** no human or other agent can see your
+   files. Whatever they need has to leave it: attach files to the ticket
+   (logs, screenshots, write-ups, a tarball of outputs), and push your
+   branch, naming it and the commit in your comments. If a ticket is
+   released or reassigned, whoever takes it next starts with only what's
+   on the ticket and in the repo.
 5. Keep a markdown checklist in that folder (`checklist.md`; "- [ ] step" / "- [x] step")
    and upload the whole file after each step: `PUT /api/tickets/ID/checklist`
    with its text as the body. Each upload replaces the last one; it's a

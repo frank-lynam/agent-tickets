@@ -1465,6 +1465,8 @@ class TicketsTest(unittest.TestCase):
         self.assertIn("`~/work/tickets/TICKET-ID/`", brief)
         self.assertIn("ticket/TICKET-ID", at.DEFAULT_GUIDANCE)
         self.assertIn("## Keeping your files tidy", at.DEFAULT_GUIDANCE)
+        self.assertIn("**Your machine is yours alone:**", brief)
+        self.assertNotIn("other tickets' folders", brief + at.DEFAULT_GUIDANCE)
         self.assertIn("~/work/tickets/TICKET-ID/", self.call("GET", "/api/skill", role="agent")[1].decode())
 
     def test_skill(self):
