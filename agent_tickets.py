@@ -2525,9 +2525,14 @@ function clearEpic(){ $('nt-epic').value = ''; $('nt-epic-pick').value = ''; $('
 """
 
 
-def render_new(store, epic=None, prefill=("", "")):
+def render_new(store, epic=None, prefill=("", ""), after=None):
+    """The new-ticket page. `after`: a ticket this one follows on from (it must be done first, and the new
+    one goes in its epic)."""
     opts = "".join(f'<option value="{s}"{" selected" if s == "backlog" else ""}>{LABELS[s]}</option>' for s in STATUSES)
-    body = f"""<h1 id="nt-h">New ticket</h1><form class="stack box" id="nf" data-kind="ticket">
+    follows = (f'<p class="meta" style="margin:-8px 0 12px">Follows on from <a href="/t/{after["id"]}">'
+               f'<span class="id">{after["id"]}</span> {esc(after["title"])}</a>: it\'s filled in under '
+               f'"Must be done first"{" and the epic" if epic else ""}.</p>' if after else "")
+    body = f"""<h1 id="nt-h">New ticket</h1>{follows}<form class="stack box" id="nf" data-kind="ticket">
 <div class="kinds" role="group" aria-label="What are you creating?">
  <button type="button" data-kind="ticket" aria-pressed="true" onclick="setKind('ticket')"><b>Ticket</b>
   <span class="meta">A piece of work for an agent or a human</span></button>
@@ -2544,7 +2549,7 @@ def render_new(store, epic=None, prefill=("", "")):
 <button type="button" onclick="clearEpic()">None</button></span></label>
 <input type="hidden" id="nt-epic" value="{esc(norm_id(epic)) if epic else ""}"></div>
 <label class="task-only acw">Must be done first (optional: pick from the list, or type ids or words)
-<input type="text" id="nt-deps" placeholder="amber-otter, quiet-falcon"></label>
+<input type="text" id="nt-deps" placeholder="amber-otter, quiet-falcon" value="{esc(after["id"] + ", ") if after else ""}"></label>
 <div><button class="primary" id="nt-go">Create ticket</button></div></form>
 <script>{dep_candidates(store)}{epic_candidates(store)}{DEP_PICKER_JS}{EPIC_PICKER_JS}{NEW_JS}</script>"""
     return page("New ticket", body, "/new", len(store.tickets(["review"])))
@@ -2971,6 +2976,8 @@ def render_ticket(store, tid):
                    for to, lbl, p in actions)
     if s == "done" and (t["cancelled"] or t["declined"]):  # reopening goes back to the backlog
         btns = btns.replace(f"setStatus('{t['id']}','in_progress')", f"setStatus('{t['id']}','backlog')")
+    if t["kind"] == "ticket" and not t["proposed"]:  # next step: a new ticket that waits on this one
+        btns += f'<a class="btn" href="/new?after={t["id"]}" style="text-decoration:none">Create follow-on ticket</a>'
     if s != "done" and not t["proposed"]:  # out of the normal cycle: overtaken by events, a duplicate...
         btns += (f'<button class="cancel" onclick="cancelTicket()">Cancel {"epic" if t["kind"] == "epic" else "ticket"}</button>')
     if s == "backlog" and t["kind"] == "ticket" and not t["proposed"]:  # Make ready, for someone
@@ -4307,8 +4314,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.html(render_list(store, path[1:], (query.get("q") or [""])[0].strip()))
             if method == "GET" and path == "/new":
                 mid = (query.get("from_message") or [""])[0]
-                return self.html(render_new(store, (query.get("epic") or [None])[0],
-                                            ticket_from_message(store, int(mid)) if mid.isdigit() else ("", "")))
+                after = store.ticket((query.get("after") or [""])[0]) if query.get("after") else None
+                epic = (query.get("epic") or [None])[0] or (after["epic_id"] if after else None)
+                return self.html(render_new(store, epic, ticket_from_message(store, int(mid)) if mid.isdigit()
+                                            else ("", ""), after))
             if method == "GET" and (tm := re.fullmatch(rf"/t/({ID_PATH})/live", path)):
                 start = (query.get("from") or ["0"])[0]
                 return self.json(200, ticket_live(store, tm.group(1), float(start) if re.fullmatch(r"[0-9.]+", start) else 0))

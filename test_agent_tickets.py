@@ -1507,6 +1507,21 @@ class TicketsTest(unittest.TestCase):
         self.assertIn(f'value="{e["id"]} · Finished plan"', html)
         self.assertIn(">Remove</button>", html)
 
+    def test_follow_on_ticket(self):
+        e = self.new("backlog", title="Follow plan", kind="epic")
+        t = self.new("ready", title="step one", epic_id=e["id"])
+        page = self.call("GET", f"/t/{t['id']}", role="human")[1].decode()
+        self.assertIn(f'href="/new?after={t["id"]}"', page)
+        new = self.call("GET", f"/new?after={t['id']}", role="human")[1].decode()
+        self.assertIn(f'id="nt-deps" placeholder="amber-otter, quiet-falcon" value="{t["id"]}, "', new)
+        self.assertIn(f'<input type="hidden" id="nt-epic" value="{e["id"]}">', new)
+        self.assertIn("Follows on from", new)
+        loose = self.new("ready", title="no epic")
+        new = self.call("GET", f"/new?after={loose['id']}", role="human")[1].decode()
+        self.assertIn('<input type="hidden" id="nt-epic" value="">', new)
+        self.assertEqual(self.call("GET", "/new?after=no-such-ticket", role="human")[0], 404)
+        self.assertNotIn("/new?after=", self.call("GET", f"/t/{e['id']}", role="human")[1].decode())  # epics: no
+
     def test_skill(self):
         code, body, h = self.call("GET", "/api/skill", role="agent", headers={"Host": "tickets.example:43917"})
         text = body.decode()

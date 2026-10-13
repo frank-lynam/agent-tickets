@@ -72,6 +72,9 @@ Agents can't set Backlog or Done, and can only comment on tickets in them.
   (say, send it back after adding a dependency in review); the agent is
   then told it's blocked and waits. Comments are always allowed. A
   declined or cancelled predecessor counts as done. Loops are refused.
+- **Follow-on tickets:** "Create follow-on ticket" on any ticket opens the
+  new-ticket page with that ticket under "Must be done first" and the same
+  epic already filled in.
 - **Picking an epic** (on a ticket, or on the + New page) is a search:
   clicking in lists the open epics; typing finds any epic, completed ones
   included. Adding a ticket to a completed epic makes it active again.
