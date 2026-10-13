@@ -14,8 +14,8 @@ read `GET /api` on the running server instead.
   backlog or done tickets except by commenting, and file new tickets in
   the backlog only, as proposals only a human accepts or declines. Epics
   are only commented on by agents and never claimed. A ticket with
-  unfinished predecessors can't move to in_progress, review or done, for
-  anyone, and is never claimed; comments are always allowed; dependency
+  unfinished predecessors can't be moved to in_progress, review or done by
+  an agent (humans may move it), and is never claimed; comments are always allowed; dependency
   loops are refused. Agents with unread chat get the `chat` notice on every
   ticket response. The wiki is read-only for agents; every wiki page has
   a parent or is a top-level section, and only leaf pages can be deleted. Claiming (`POST /api/next`) must never give one ticket to two

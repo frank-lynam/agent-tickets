@@ -66,11 +66,16 @@ Agents can't set Backlog or Done, and can only comment on tickets in them.
   done (declined ones don't count; adding a ticket reopens it). Nobody sets
   it by hand. Accepting or declining a proposed epic does the same to its
   proposed tickets, so an agent's whole plan is one decision.
-- **Dependencies** ("must be done first") are enforced, for everyone: a
-  ticket whose predecessors aren't done can't move to In progress, Needs
-  review or Done, and `/api/next` skips it. Comments are always allowed. A
-  declined predecessor counts as done. Loops are refused. To override,
-  remove the dependency on the ticket page.
+- **Dependencies** ("must be done first") bind agents: an agent can't
+  start a ticket whose predecessors aren't done, or hand it back, and
+  `/api/next` and `/api/wait` skip it. You can still move it anywhere
+  (say, send it back after adding a dependency in review); the agent is
+  then told it's blocked and waits. Comments are always allowed. A
+  declined or cancelled predecessor counts as done. Loops are refused.
+- **Picking an epic** (on a ticket, or on the + New page) is a search:
+  clicking in lists the open epics; typing finds any epic, completed ones
+  included. Adding a ticket to a completed epic makes it active again.
+  Cancelled and declined epics aren't offered.
 
 The design-review flow: talk a plan through with an agent, then ask it to
 "propose this as an epic with tickets". It creates the epic, then each

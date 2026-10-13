@@ -605,12 +605,15 @@ class Store:
         return u["username"]
 
     def _check_epic(self, eid):
-        """An epic's id, or None."""
+        """An epic's id, or None. A complete epic is fine (a new ticket makes it active again); a cancelled
+        or declined one isn't."""
         if eid in (None, ""):
             return None
         e = self.ticket(str(eid))
         if e["kind"] != "epic":
             raise ApiError(400, f"{e['id']} isn't an epic")
+        if e["cancelled"] or e["declined"]:
+            raise ApiError(400, f"{e['id']} was {'cancelled' if e['cancelled'] else 'declined'}: pick another epic")
         return e["id"]
 
     def _would_cycle(self, db, tid, dep):
@@ -713,8 +716,9 @@ class Store:
             t = self.ticket(tid)
             if t["kind"] == "epic" and fields.get("epic_id"):
                 raise ApiError(400, "epics can't belong to another epic")
-            # Waiting on unfinished predecessors: it can't start, be reviewed or be approved.
-            if fields.get("status") in ("in_progress", "review", "done") and t["kind"] == "ticket":
+            # Waiting on unfinished predecessors: an agent can't start it or hand it back. (Humans run the
+            # board: they can move it anywhere, e.g. send it back after adding a dependency in review.)
+            if role != "human" and fields.get("status") in ("in_progress", "review", "done") and t["kind"] == "ticket":
                 waiting = self.blockers(t["id"])
                 if waiting:
                     raise ApiError(409, f"{t['id']} is blocked: {', '.join(waiting)} must be done first "
@@ -2376,12 +2380,60 @@ def assignee_options(store, current=None):
     return "".join(opts)
 
 
-def epic_options(store, current=None):
-    opts = ['<option value="">None</option>']
-    for e in store.tickets(["backlog", "ready", "in_progress", "review"], kind="epic"):
-        sel = " selected" if current and e["id"] == norm_id(current) else ""
-        opts.append(f'<option value="{e["id"]}"{sel}>{e["id"]} · {esc(e["title"])}</option>')
-    return "".join(opts)
+def epic_candidates(store):
+    """Every live epic, for the epic pickers (as a <script> line): open ones are offered straight away,
+    complete ones when you search."""
+    rows = [{"id": r["id"], "title": r["title"], "state": EPIC_STATE_NAMES.get(r["status"], r["status"])}
+            for r in store.db().execute(
+                "SELECT id, title, status FROM tickets WHERE kind = 'epic' AND proposed = 0 AND cancelled = 0 "
+                "AND declined = 0 ORDER BY status = 'done', updated_at DESC LIMIT 2000")]
+    return "const EPIC_CANDIDATES = " + json.dumps(rows).replace("</", "<\\/") + ";"
+
+
+# The epic picker: open epics as soon as you're in the field; typing searches all of them, complete ones
+# included (choosing one makes it active again).
+EPIC_PICKER_JS = """
+function epicPicker(input, onPick){
+  const menu = document.createElement('div');
+  menu.className = 'ac'; menu.hidden = true; menu.setAttribute('role', 'listbox');
+  input.parentNode.insertBefore(menu, input.nextSibling);
+  input.setAttribute('autocomplete', 'off');
+  let items = [], at = -1;
+  const esc = (t) => t.replace(/[&<>]/g, ch => ({'&': '&amp;', '<': '&lt;', '>': '&gt;'}[ch]));
+  function show(){
+    const q = input.value === input.dataset.shown ? '' : input.value.trim().toLowerCase();
+    items = EPIC_CANDIDATES.filter(e => q ? e.id.toLowerCase().includes(q) || e.title.toLowerCase().includes(q)
+                                          : e.state !== 'complete').slice(0, 12);
+    at = items.length ? 0 : -1;
+    menu.innerHTML = items.length ? items.map((e, i) => '<div class="ac-i" role="option" data-i="' + i + '"><span class="id">'
+      + e.id + '</span> ' + esc(e.title) + ' <span class="meta">' + e.state + '</span></div>').join('')
+      : '<div class="ac-h">' + (q ? 'No epic matches' : 'No open epics: type to search complete ones') + '</div>';
+    menu.hidden = false; mark();
+  }
+  function mark(){ menu.querySelectorAll('.ac-i').forEach(el => el.classList.toggle('on', +el.dataset.i === at)); }
+  function pick(i){ const e = items[i]; if (!e) return; menu.hidden = true; input.value = e.id + ' · ' + e.title;
+    input.dataset.shown = input.value; onPick(e); }
+  input.addEventListener('focus', () => { input.select(); show(); });
+  input.addEventListener('input', show);
+  input.addEventListener('blur', () => setTimeout(() => { menu.hidden = true; if (input.dataset.shown !== undefined) input.value = input.dataset.shown; }, 150));
+  menu.addEventListener('mousedown', (e) => { const el = e.target.closest('.ac-i'); if (el) { e.preventDefault(); pick(+el.dataset.i); } });
+  input.addEventListener('keydown', (e) => {
+    if (menu.hidden) return;
+    if (e.key === 'ArrowDown') { at = Math.min(items.length - 1, at + 1); mark(); e.preventDefault(); }
+    else if (e.key === 'ArrowUp') { at = Math.max(0, at - 1); mark(); e.preventDefault(); }
+    else if (e.key === 'Enter') { e.preventDefault(); if (at >= 0) pick(at); }
+    else if (e.key === 'Escape') { menu.hidden = true; }
+  });
+}
+"""
+
+
+def epic_field(store, input_id, current=None):
+    """The epic picker's input (showing the current epic) and, if there is one, a way to clear it."""
+    e = store.ticket(current) if current else None
+    shown = f'{e["id"]} · {e["title"]}' if e else ""
+    return (f'<span class="acw" style="flex:1;min-width:160px"><input type="text" id="{input_id}" value="{esc(shown)}" '
+            f'data-shown="{esc(shown)}" placeholder="None: pick or search epics" aria-label="Epic"></span>')
 
 
 def dep_candidates(store):
@@ -2468,6 +2520,8 @@ $('nf').onsubmit = async (e) => {
 };
 setKind('ticket');
 depPicker($('nt-deps'), {multi: true, epic: () => $('nt-epic').value, exclude: () => []});
+epicPicker($('nt-epic-pick'), (e) => { $('nt-epic').value = e.id; });
+function clearEpic(){ $('nt-epic').value = ''; $('nt-epic-pick').value = ''; $('nt-epic-pick').dataset.shown = ''; }
 """
 
 
@@ -2486,11 +2540,13 @@ def render_new(store, epic=None, prefill=("", "")):
 <div class="row task-only"><label>Status <select id="nt-status">{opts}</select></label>
 <label>Priority <select id="nt-prio"><option value="1">High</option><option value="2" selected>Normal</option><option value="3">Low</option></select></label>
 <label>Assign to <select id="nt-who">{assignee_options(store)}</select></label></div>
-<div class="row task-only"><label>Epic <select id="nt-epic">{epic_options(store, epic)}</select></label></div>
+<div class="row task-only"><label style="flex:1">Epic <span class="row" style="margin-top:2px">{epic_field(store, "nt-epic-pick", epic)}
+<button type="button" onclick="clearEpic()">None</button></span></label>
+<input type="hidden" id="nt-epic" value="{esc(norm_id(epic)) if epic else ""}"></div>
 <label class="task-only acw">Must be done first (optional: pick from the list, or type ids or words)
 <input type="text" id="nt-deps" placeholder="amber-otter, quiet-falcon"></label>
 <div><button class="primary" id="nt-go">Create ticket</button></div></form>
-<script>{dep_candidates(store)}{DEP_PICKER_JS}{NEW_JS}</script>"""
+<script>{dep_candidates(store)}{epic_candidates(store)}{DEP_PICKER_JS}{EPIC_PICKER_JS}{NEW_JS}</script>"""
     return page("New ticket", body, "/new", len(store.tickets(["review"])))
 
 
@@ -2876,7 +2932,8 @@ def render_ticket(store, tid):
                     + '</div>')
     if t["blocked_by"]:
         banners += (f'<div class="banner">Blocked: {", ".join(f"<a href=/t/{b}>{b}</a>" for b in t["blocked_by"])} '
-                    f'must be done first. It can\'t start until then; comments are fine.</div>')
+                    f'must be done first. Agents can\'t start it or hand it back until then (you can still move it); '
+                    f'comments are fine.</div>')
     epic_box = ""
     if t["kind"] == "epic":
         pr = t["progress"]
@@ -2887,8 +2944,9 @@ def render_ticket(store, tid):
     if t["kind"] == "epic":
         side_links = ""
     else:
-        side_links = (f'<h2>Epic</h2><div class="box"><select id="epic" aria-label="Epic" onchange="setEpic(this.value)">'
-                      f'{epic_options(store, t["epic_id"])}</select></div>'
+        side_links = (f'<h2>Epic</h2><div class="box"><div class="row">{epic_field(store, "epic", t["epic_id"])}'
+                      + (f'<button type="button" onclick="setEpic(\'\')">Remove</button>' if t["epic_id"] else "")
+                      + '</div></div>'
                       f'<h2>Must be done first</h2><div class="box">{link_list(t["depends_on"] + t["done_dependencies"], True)}'
                       f'<form class="row" id="df"><span class="acw" style="flex:1;min-width:120px"><input type="text" id="dep" '
                       f'placeholder="pick or type an id or words" aria-label="Add a predecessor"></span><button>Add</button></form>'
@@ -3011,6 +3069,9 @@ if (df) df.onsubmit = async (e) => {{ e.preventDefault();
   try {{ await api('POST', '/api/tickets/' + TID + '/deps', {{depends_on: $('dep').value.trim()}}); location.reload(); }}
   catch (err) {{ fail(err); }} }};
 {dep_candidates(store) if t["kind"] == "ticket" else ""}
+{epic_candidates(store) if t["kind"] == "ticket" else ""}
+{EPIC_PICKER_JS}
+if ($('epic')) epicPicker($('epic'), (e) => setEpic(e.id));
 if (df) {{ {DEP_PICKER_JS}
   depPicker($('dep'), {{epic: () => {json.dumps(t["epic_id"] or "")},
     exclude: () => {json.dumps([t["id"].lower()] + [d["id"].lower() for d in t["depends_on"] + t["done_dependencies"]])},
@@ -3565,9 +3626,12 @@ backlog (none made ready yet), active (some ready or under way), complete
 (all done; declined tickets don't count).
 
 **Dependencies**: a ticket can list tickets that must be done first.
-Until they're done (approved, declined or cancelled), it's **blocked**: it
-can't move to in_progress, review or done (you get a 409 naming the
-blockers), and /api/next skips it. You can still comment on it. **A
+Until they're done (approved, declined or cancelled), it's **blocked**: you
+can't move it to in_progress, review or done (you get a 409 naming the
+blockers), and /api/next and /api/wait skip it. A human may still move it
+(say, send it back to you in progress after adding a dependency); then
+its `what_now` says it's yours but blocked: don't start until the
+predecessor is done. You can still comment on it. **A
 predecessor that's done no longer blocks anything.** In what the API gives
 you: `"blocked"` is true or false; `depends_on` and `blocked_by` list only
 the predecessors that still block; finished ones are moved to
@@ -4000,6 +4064,10 @@ def what_now(t, me):
     if st == "review":
         return ("You handed this back; it's waiting for a human. Don't keep working on it unless they move it back "
                 "to in progress." if mine else "Waiting for a human's review: comment only.")
+    if st == "in_progress" and mine and blocked:
+        return (f"Yours and in progress, but blocked until {', '.join(blocked)} "
+                f"{'is' if len(blocked) == 1 else 'are'} done: don't start work on it yet. /api/wait will hand it "
+                "to you once it's unblocked. Comment if you have something to say.")
     if st == "in_progress":
         if mine:
             return ("This ticket is yours and in progress: you are working on it now. Do the work, comment on the "

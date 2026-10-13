@@ -595,18 +595,17 @@ class TicketsTest(unittest.TestCase):
         # Pages.
         self.assertIn("Schema", self.call("GET", f"/t/{e['id']}", role="human")[1].decode())
         self.assertIn("New login", self.call("GET", "/", role="human")[1].decode())
-        self.assertIn(f'value="{e["id"]}" selected', self.call("GET", f"/new?epic={e['id']}", role="human")[1].decode())
+        self.assertIn(f'<input type="hidden" id="nt-epic" value="{e["id"]}">', self.call("GET", f"/new?epic={e['id']}", role="human")[1].decode())
 
     def test_dependencies_block(self):
         tok = self.j("POST", "/api/users", {"username": "agent-d", "kind": "agent"}, role="human")[1]["token"]
         first = self.new("ready", title="first", assignee="agent-d", priority=3)
         then = self.new("ready", title="then", assignee="agent-d", priority=1, depends_on=first["id"])
         self.assertEqual(then["blocked_by"], [first["id"]])
-        # Blocked for everyone, humans included; comments still fine.
-        for role, tk in (("human", None), (None, tok)):
-            code, err = self.j("PATCH", f"/api/tickets/{then['id']}", {"status": "in_progress"}, role=role, token=tk)
-            self.assertEqual(code, 409)
-            self.assertIn(first["id"], err["error"])
+        # An agent can't start it; comments are still fine.
+        code, err = self.j("PATCH", f"/api/tickets/{then['id']}", {"status": "in_progress"}, role=None, token=tok)
+        self.assertEqual(code, 409)
+        self.assertIn(first["id"], err["error"])
         self.assertEqual(self.j("POST", f"/api/tickets/{then['id']}/comments", {"body": "idea"}, role=None, token=tok)[0], 201)
         # /api/next skips it despite its higher priority.
         self.assertEqual(self.j("POST", "/api/next", {}, role=None, token=tok)[1]["ticket"]["id"], first["id"])
@@ -1468,6 +1467,45 @@ class TicketsTest(unittest.TestCase):
         self.assertIn("**Your machine is yours alone:**", brief)
         self.assertNotIn("other tickets' folders", brief + at.DEFAULT_GUIDANCE)
         self.assertIn("~/work/tickets/TICKET-ID/", self.call("GET", "/api/skill", role="agent")[1].decode())
+
+    def test_humans_can_move_blocked_tickets(self):
+        tok = self.j("POST", "/api/users", {"username": "agent-bk", "kind": "agent"}, role="human")[1]["token"]
+        t = self.new("in_progress", assignee="agent-bk", title="in review soon")
+        self.j("POST", f"/api/tickets/{t['id']}/comments", {"body": "Done."}, role=None, token=tok)
+        self.j("PATCH", f"/api/tickets/{t['id']}", {"status": "review"}, role=None, token=tok)
+        first = self.new("ready", title="needs to happen first")
+        self.j("POST", f"/api/tickets/{t['id']}/deps", {"depends_on": first["id"]}, role="human")
+        # The human sends it back anyway; the agent is told it's blocked, and isn't handed it.
+        self.assertEqual(self.j("PATCH", f"/api/tickets/{t['id']}", {"status": "in_progress"}, role="human")[1]["status"], "in_progress")
+        got = self.j("GET", f"/api/tickets/{t['id']}", role=None, token=tok)[1]
+        self.assertTrue(got["what_now"].startswith(f"Yours and in progress, but blocked until {first['id']} is done"))
+        self.assertNotIn(t["id"], [w["id"] for w in self.j("GET", "/api/wait?timeout=1", role=None, token=tok)[1]["tickets"]])
+        self.assertEqual(self.j("PATCH", f"/api/tickets/{t['id']}", {"status": "review"}, role=None, token=tok)[0], 409)
+        self.assertIn("you can still move it", self.call("GET", f"/t/{t['id']}", role="human")[1].decode())
+
+    def test_complete_epics_take_new_tickets(self):
+        e = self.new("backlog", title="Finished plan", kind="epic")
+        only = self.new("ready", title="the only part", epic_id=e["id"])
+        self.j("PATCH", f"/api/tickets/{only['id']}", {"status": "done"}, role="human")
+        self.assertEqual(self.j("GET", f"/api/tickets/{e['id']}", role="human")[1]["epic_state"], "complete")
+        # The pickers know about it (as complete), and adding a ticket brings it back to life.
+        page = self.call("GET", "/new", role="human")[1].decode()
+        cands = {x["id"]: x["state"] for x in json.loads(re.search(r"const EPIC_CANDIDATES = (\[.*?\]);", page).group(1))}
+        self.assertEqual(cands[e["id"]], "complete")
+        later = self.new("ready", title="one more for it")
+        self.j("PATCH", f"/api/tickets/{later['id']}", {"epic_id": e["id"]}, role="human")
+        self.assertEqual(self.j("GET", f"/api/tickets/{e['id']}", role="human")[1]["epic_state"], "active")
+        self.assertEqual(self.new("backlog", title="and another", epic_id=e["id"])["epic_id"], e["id"])
+        # Cancelled epics aren't offered and can't take tickets.
+        dead = self.new("backlog", title="Dropped plan", kind="epic")
+        self.j("POST", f"/api/tickets/{dead['id']}/cancel", {}, role="human")
+        self.assertEqual(self.j("PATCH", f"/api/tickets/{later['id']}", {"epic_id": dead["id"]}, role="human")[0], 400)
+        self.assertNotIn(dead["id"], re.search(r"const EPIC_CANDIDATES = (\[.*?\]);",
+                                               self.call("GET", "/new", role="human")[1].decode()).group(1))
+        # The ticket page shows the current epic in the picker, with a way to remove it.
+        html = self.call("GET", f"/t/{later['id']}", role="human")[1].decode()
+        self.assertIn(f'value="{e["id"]} · Finished plan"', html)
+        self.assertIn(">Remove</button>", html)
 
     def test_skill(self):
         code, body, h = self.call("GET", "/api/skill", role="agent", headers={"Host": "tickets.example:43917"})
