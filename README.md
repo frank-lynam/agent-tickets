@@ -45,7 +45,7 @@ agent_tickets.py --export ~/backups/agent-tickets/`).
 | Backlog | An idea, not cleared for work | You; agents propose new tickets here |
 | Ready | Cleared: agents may pick it up | You (from the backlog), or an agent releasing it |
 | In progress | An agent is on it; partial work counts | An agent |
-| Needs review | Done, or stopped at a decision; the agent's comment says which | An agent |
+| Needs review | Done, or a decision needed; the agent's hand-off starts "Done" or "Needs a decision" (the server refuses anything else) | An agent |
 | Done | Approved | You only |
 
 Agents can't set Backlog or Done, and can only comment on tickets in them.

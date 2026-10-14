@@ -923,6 +923,7 @@ class TicketsTest(unittest.TestCase):
         self.assertNotEqual(now["checklist_v"], first["checklist_v"])
         self.assertIn("1 of 1 done", now["checklist"])
         # A status change does change it (the page shows "refresh").
+        self.j("POST", f"/api/tickets/{t['id']}/comments", {"body": "Done."}, role=None, token=tok)
         self.j("PATCH", f"/api/tickets/{t['id']}", {"status": "review"}, role=None, token=tok)
         self.assertNotEqual(self.j("GET", f"/t/{t['id']}/live", role="human")[1]["sig"], first["sig"])
         # The dashboard checks every 10 seconds, swapping in place.
@@ -1012,7 +1013,7 @@ class TicketsTest(unittest.TestCase):
         # The briefing and skill teach it.
         brief = self.call("GET", "/api", role=None)[1].decode()
         self.assertIn("## Staying reachable when you're idle", brief)
-        self.assertIn("**Don't park work in in_progress:**", brief)
+        self.assertIn("never for parking", brief)
         self.assertIn("**The loop: after every action, call it.**", brief)
         self.assertIn("*A recurring check, as a safety net:*", brief)
         self.assertIn("/api/wait", self.call("GET", "/api/skill", role=None, token=tok)[1].decode())
@@ -1290,6 +1291,7 @@ class TicketsTest(unittest.TestCase):
             db.execute("UPDATE comments SET created_at = created_at - 1500 WHERE ticket_id = ?", (first["id"],))
             db.execute("UPDATE events SET at = at - 1500 WHERE ticket_id = ?", (first["id"],))
         self.assertIn("your last comment here was 25 minutes ago", self.j("GET", f"/api/tickets/{first['id']}", role=None, token=tok)[1]["what_now"])
+        self.j("POST", f"/api/tickets/{first['id']}/comments", {"body": "Done. Both steps in."}, role=None, token=tok)
         self.assertEqual(self.j("PATCH", f"/api/tickets/{first['id']}", {"status": "review"}, role=None, token=tok)[0], 200)
         # Everyone gets "blocked", humans too.
         self.assertIs(self.j("GET", f"/api/tickets/{first['id']}", role="human")[1]["blocked"], False)
@@ -1552,6 +1554,36 @@ class TicketsTest(unittest.TestCase):
         self.assertIn("<code>*nor_this*</code>", render("`*nor_this*`"))
         # Still escaped everywhere.
         self.assertNotIn("<script>", render("- <script>x</script>\n> <b>y</b>\n\n| <i>t</i> | a |\n|---|---|"))
+
+    def test_review_is_for_done_or_a_decision(self):
+        tok = self.j("POST", "/api/users", {"username": "agent-rv", "kind": "agent"}, role="human")[1]["token"]
+        t = self.new("in_progress", assignee="agent-rv", title="half done")
+        patch = lambda status: self.j("PATCH", f"/api/tickets/{t['id']}", {"status": status}, role=None, token=tok)
+        say = lambda body: self.j("POST", f"/api/tickets/{t['id']}/comments", {"body": body}, role=None, token=tok)
+        # Paused, not finished: refused, with the right moves spelled out.
+        say("Got halfway, switching to something urgent.")
+        code, err = patch("review")
+        self.assertEqual(code, 409)
+        for hint in ('"Done" or "Needs a decision"', "Keep it in progress", "Add it as a dependency", "Release it"):
+            self.assertIn(hint, err["error"])
+        # Done, or a decision needed (formatting around the first word is fine): accepted.
+        say("**Needs a decision:** A or B? I'd pick A.")
+        self.assertEqual(patch("review")[0], 200)
+        self.j("PATCH", f"/api/tickets/{t['id']}", {"status": "in_progress"}, role="human")
+        say("Done. Built A.")
+        self.assertEqual(patch("review")[0], 200)
+        # Releasing to ready unassigns it, so someone else can take it.
+        u = self.new("in_progress", assignee="agent-rv", title="hand it over")
+        self.j("POST", f"/api/tickets/{u['id']}/comments", {"body": "Releasing: someone with DB access should do this."}, role=None, token=tok)
+        got = self.j("PATCH", f"/api/tickets/{u['id']}", {"status": "ready"}, role=None, token=tok)[1]
+        self.assertEqual((got["status"], got["assignee"]), ("ready", None))
+        # Waiting on another ticket: add it as a dependency; it stays yours, and wait leaves it out.
+        v = self.new("in_progress", assignee="agent-rv", title="needs the other one")
+        other = self.new("ready", title="the other one")
+        self.assertEqual(self.j("POST", f"/api/tickets/{v['id']}/deps", {"depends_on": other["id"]}, role=None, token=tok)[0], 200)
+        got = self.j("GET", f"/api/tickets/{v['id']}", role=None, token=tok)[1]
+        self.assertEqual((got["status"], got["assignee"], got["blocked"]), ("in_progress", "agent-rv", True))
+        self.assertNotIn(v["id"], [w["id"] for w in self.j("GET", "/api/wait?timeout=1", role=None, token=tok)[1]["tickets"]])
 
     def test_skill(self):
         code, body, h = self.call("GET", "/api/skill", role="agent", headers={"Host": "tickets.example:43917"})

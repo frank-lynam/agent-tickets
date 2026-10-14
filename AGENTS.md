@@ -16,7 +16,8 @@ read `GET /api` on the running server instead.
   are only commented on by agents and never claimed. A ticket with
   unfinished predecessors can't be moved to in_progress, review or done by
   an agent (humans may move it), and is never claimed; comments are always allowed; dependency
-  loops are refused. Agents with unread chat get the `chat` notice on every
+  loops are refused. An agent hands a ticket to review only when its latest
+  comment starts "Done" or "Needs a decision"; releasing to ready unassigns it. Agents with unread chat get the `chat` notice on every
   ticket response. The wiki is read-only for agents; every wiki page has
   a parent or is a top-level section, and only leaf pages can be deleted. Claiming (`POST /api/next`) must never give one ticket to two
   agents. New ticket ids come only from `ID_ADJECTIVES` and `ID_NOUNS`: vet

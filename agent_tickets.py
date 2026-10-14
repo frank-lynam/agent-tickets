@@ -62,6 +62,12 @@ def epic_status_for(statuses):
     return "in_progress" if any(x != "backlog" for x in statuses) else "backlog"
 
 
+REVIEW_HELP = (
+    "review is only for finished work or a decision you need from a human: your latest comment must start with "
+    "\"Done\" or \"Needs a decision\". Not finished and no decision needed? Keep it in progress (pausing is fine: "
+    "it stays on your list in priority order). Waiting on another ticket? Add it as a dependency "
+    "(POST /api/tickets/ID/deps): the ticket stays yours, and /api/wait won't hand it to you until that's done. "
+    "Someone else should take it? Release it: status ready (that unassigns it).")
 COMMENT_QUIET_MINUTES = 20  # an agent's in-progress ticket with no comment for this long gets a nudge
 
 PAGE = 20  # comments or messages shown (and returned) at a time; older ones on request
@@ -274,7 +280,7 @@ DEFAULT_GUIDANCE = """## How we work
 3. After each step, tick it off in your file, upload it again, and comment what you did and what happened, including errors and surprises.
 4. When something is visible (a page, a chart, a game), attach a screenshot or a short recording.
 5. Hand back with a comment that starts "Done" or "Needs a decision", then set the status to review.
-6. After every action (a step, a hand-back, a chat reply), call GET /api/wait and do what it returns: chat, replies, then your tickets in the order it lists them (highest priority first, started and nearest-done first). Finish what you've started before taking new work. Never end a turn with nothing in hand: keep wait running in the background so it wakes you, and have a recurring check (cron, scheduled task) as a safety net. Don't leave tickets in progress that you aren't working on: if you're waiting on a decision, move it to review and say what you need.
+6. After every action (a step, a hand-back, a chat reply), call GET /api/wait and do what it returns: chat, replies, then your tickets in the order it lists them (highest priority first, started and nearest-done first). Finish what you've started before taking new work. Never end a turn with nothing in hand: keep wait running in the background so it wakes you, and have a recurring check (cron, scheduled task) as a safety net. Review is only for finished work ("Done") or a decision you need ("Needs a decision"); paused work stays in progress, and work waiting on another ticket gets that ticket as a dependency.
 
 ## Keeping your files tidy
 
@@ -735,6 +741,13 @@ class Store:
                             if fields["status"] == "review" else "a comment saying where you got to and what's left")
                     raise ApiError(409, f"comment on {t['id']} first: you haven't since you started it. Post {what}; "
                                         "then change the status.")
+                if fields.get("status") == "review" and t["status"] == "in_progress":
+                    # Review is the humans' turn: the work is finished, or they must decide something. Not "paused".
+                    first = re.sub(r"^[\s*_#>`~-]+", "", self.last_comment_since_start(t["id"], actor) or "").lower()
+                    if not (first.startswith("done") or first.startswith("needs a decision")):
+                        raise ApiError(409, REVIEW_HELP)
+                if fields.get("status") == "ready" and t["status"] == "in_progress" and "assignee" not in fields:
+                    fields["assignee"] = None  # releasing it: someone else can take it
                 if "status" in fields and fields["status"] not in AGENT_TARGETS:
                     raise ApiError(403, "agents can set ready, in_progress or review; only humans move "
                                         "tickets to backlog or done")
@@ -780,6 +793,12 @@ class Store:
         last = db.execute("SELECT MAX(created_at) FROM comments WHERE ticket_id = ? AND author = ? COLLATE NOCASE "
                           "AND created_at >= ?", (tid, user, started)).fetchone()[0]
         return started, last
+
+    def last_comment_since_start(self, tid, user):
+        started, _ = self.comment_gap(tid, user)
+        row = self.db().execute("SELECT body FROM comments WHERE ticket_id = ? AND author = ? COLLATE NOCASE "
+                                "AND created_at >= ? ORDER BY id DESC LIMIT 1", (tid, user, started)).fetchone()
+        return row[0] if row else None
 
     def comment_nudge(self, tid, user):
         """A reminder for an agent that's gone quiet on its in-progress ticket, or None."""
@@ -3629,6 +3648,8 @@ enough, or a request fails in a way you don't understand. Errors come back as `{
   Always give the real file name (no name: refused). Chat attachments: the same, at `/api/chat/ID/attachments`
   with `message_id`.
 - Hand back: a comment starting "Done" or "Needs a decision", then `PATCH /api/tickets/ID` `{{"status": "review"}}`.
+  Review is only for those two (the server checks); paused work stays in progress, work waiting on another ticket
+  gets it as a dependency, and `ready` releases it (unassigned) for someone else.
 - You may set ready, in_progress and review; never backlog or done. Backlog, done and other people's
   tickets: comment only. Blocked tickets (predecessors not done) can't start; comment instead. A ticket's
   `"blocked"` says whether it is; `depends_on` lists only predecessors that still block (done ones are in
@@ -3643,8 +3664,8 @@ background command your harness reports when it finishes, a hook before you end 
 check as a safety net (cron, a scheduled task, your harness's scheduler) that calls
 `GET /api/wait?timeout=1` every few minutes and wakes you if the reason isn't `timeout`. It tells you what to do next, at once if there's anything: unread chat, replies on your tickets,
 then your tickets in the order to do them (highest priority first; started and nearest-done first within a
-priority). Work that list top down, finishing what you've started before new work. Do it, then call it again. Don't park work in
-in progress: if you're stuck on a decision, move it to review with what you need. Write down here how you set
+priority). Work that list top down, finishing what you've started before new work. Do it, then call it again. Paused work stays in
+progress (it's your queue); waiting on another ticket, add it as a dependency. Write down here how you set
 up the listener for your harness.
 
 ## Writing
@@ -3709,8 +3730,12 @@ put it in comments or files.
   here, assigned to you; that's the signal to begin, not a sign that it's
   taken. Only someone *else's* in-progress ticket is hands-off (comment
   only). Check `assignee` against your username (`GET /api/me`).
-- **review**: the humans' turn. Move a ticket here when it's finished, or
-  when you need a decision before you can go on.
+- **review**: the humans' turn, for exactly two cases: the work is
+  **finished** (hand-off comment starts "Done"), or you **need a decision**
+  from a human before you can go on (it starts "Needs a decision"). Never
+  for "not finished yet" or "I'm working on something else": that stays in
+  progress. The server refuses a hand-back whose latest comment doesn't
+  start with one of those.
 - **done**: a human closed it as done (the work is finished). Only humans
   set this. A human agreeing with your idea or answering your question
   sends it back to in_progress instead: read their comment and carry on.
@@ -3822,10 +3847,18 @@ proposed tickets, in one step.
      or recording).
    - For a decision: the question, the options, and what you'd recommend.
 7. Stopping before you're finished: comment where you got to and what's
-   next. If you're blocked on a decision or on someone else, move it to
-   review saying what you need; if someone else should take it, release
-   it (`ready`). Leave it in_progress only if you're coming back to it:
-   `/api/wait` keeps handing your in-progress tickets back to you.
+   next, then pick the case:
+   - **Pausing** (something more urgent, or you'll continue later): leave
+     it **in progress**. It stays on your list, in priority order.
+   - **Waiting on another ticket**: add that ticket as a dependency
+     (`POST /api/tickets/ID/deps`). It stays yours and in progress, and
+     `/api/wait` skips it until that one's done.
+   - **Need a human's answer**: comment starting "Needs a decision" (the
+     question, the options, your recommendation), then review.
+   - **Someone else should take it**: release it (`ready`; that unassigns
+     it).
+   Never move unfinished work to review just because you've stopped
+   working on it.
 8. After review a human may move it back to in_progress or ready with a
    comment saying what to change. Read their comment first.
 9. **A human's comment on your ticket waits for your reply.** Whenever a
@@ -3895,11 +3928,11 @@ offers, and write down how in your skill.**
   keep it under 100 if a proxy sits in front of this server (many cut long
   requests), and loop.
 - Because of 1, 2 and 4, it returns straight away until you've dealt with
-  them: answer chat, and finish your in-progress tickets or hand them
-  back. **Don't park work in in_progress:** if you're stuck waiting on a
-  decision or on someone else, move the ticket to review with a comment
-  saying what you need, or release it to ready. Otherwise wait will keep
-  handing it back to you (which is the point).
+  them: answer chat, and work your tickets in the order given. A ticket
+  you've paused stays in that list, which is fine: it's your queue. One
+  that's waiting on another ticket should get that ticket as a dependency,
+  so wait leaves it out until it's unblocked. Review is only for "Done" or
+  "Needs a decision" (see step 7 above), never for parking.
 **The loop: after every action, call it.** Whenever you finish something
 (a step of a ticket, a hand-back, a chat reply, a ticket you proposed),
 your next move is `GET /api/wait`, and you do what it returns. Never end
