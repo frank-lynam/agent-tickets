@@ -1041,7 +1041,7 @@ class TicketsTest(unittest.TestCase):
         for path in (f"/t/{t['id']}", f"/chat/{c['id']}"):
             html = self.call("GET", path, role="human")[1].decode()
             self.assertIn("<h3>Plan</h3>", html, path)
-            self.assertIn("<p>step one\n   - indented</p>", html, path)  # line breaks and indentation kept
+            self.assertIn("<p>step one</p><ul><li>indented</li></ul>", html, path)  # an indented "-" line is a list
             self.assertIn("<pre>name   ms\nopen  420</pre>", html, path)  # exact spacing, monospace
             self.assertIn('<button type="button" class="copy" aria-label="Copy">Copy</button><pre>name', html, path)
             self.assertIn("<code>npm test</code>", html, path)
@@ -1521,6 +1521,37 @@ class TicketsTest(unittest.TestCase):
         self.assertIn('<input type="hidden" id="nt-epic" value="">', new)
         self.assertEqual(self.call("GET", "/new?after=no-such-ticket", role="human")[0], 404)
         self.assertNotIn("/new?after=", self.call("GET", f"/t/{e['id']}", role="human")[1].decode())  # epics: no
+
+    def test_markdown(self):
+        render = lambda text: at.wiki_html(self.srv.store, text)
+        self.assertEqual(render("*it* and _it_ and **b** and __b__ and ~~s~~"),
+                         "<p><i>it</i> and <i>it</i> and <b>b</b> and <b>b</b> and <s>s</s></p>")
+        # Things that only look like markdown stay as typed.
+        self.assertEqual(render("snake_case_name, 2 * 3 * 4, a*b, file_name.txt"),
+                         "<p>snake_case_name, 2 * 3 * 4, a*b, file_name.txt</p>")
+        url = "https://example.com/_under_/x_y_z"
+        self.assertIn(f'<a href="{url}" target="_blank" rel="noopener">{url}</a>', render(f"see {url}"))
+        self.assertEqual(render("[the docs](https://x.io/a_b) and [home](/wiki/projects)"),
+                         '<p><a href="https://x.io/a_b" target="_blank" rel="noopener">the docs</a> and '
+                         '<a href="/wiki/projects">home</a></p>')
+        self.assertNotIn('href="javascript', render("[x](javascript:alert(1))"))  # only web and site links
+        # Lists: bullets, numbers, nesting, tasks, continuation lines.
+        self.assertEqual(render("- one\n- two\n  - two a\n  - two b\n- three"),
+                         "<ul><li>one</li><li>two<ul><li>two a</li><li>two b</li></ul></li><li>three</li></ul>")
+        self.assertEqual(render("1. first\n2. second"), "<ol><li>first</li><li>second</li></ol>")
+        self.assertIn('<span class="task done">☑</span> shipped', render("- [x] shipped\n- [ ] tests"))
+        self.assertIn('<span class="task">☐</span> tests', render("- [x] shipped\n- [ ] tests"))
+        self.assertEqual(render("- item\n  more of it"), "<ul><li>item\nmore of it</li></ul>")
+        # Quotes, rules, tables, code.
+        self.assertEqual(render("> quoted *bit*\n> more"), "<blockquote><p>quoted <i>bit</i>\nmore</p></blockquote>")
+        self.assertEqual(render("above\n\n---\n\nbelow"), "<p>above</p><hr><p>below</p>")
+        table = render("| name | ms |\n|---|---:|\n| open | 420 |\n| *sort* | 35 |")
+        self.assertIn("<th>name</th><th>ms</th>", table)
+        self.assertIn("<tr><td><i>sort</i></td><td>35</td></tr>", table)
+        self.assertIn("<pre>*not* **this**</pre>", render("```\n*not* **this**\n```"))
+        self.assertIn("<code>*nor_this*</code>", render("`*nor_this*`"))
+        # Still escaped everywhere.
+        self.assertNotIn("<script>", render("- <script>x</script>\n> <b>y</b>\n\n| <i>t</i> | a |\n|---|---|"))
 
     def test_skill(self):
         code, body, h = self.call("GET", "/api/skill", role="agent", headers={"Host": "tickets.example:43917"})

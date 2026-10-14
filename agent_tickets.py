@@ -1873,6 +1873,15 @@ form.stack{display:grid;gap:8px}
 .box{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}
 .desc{overflow-wrap:anywhere}
 .md p{white-space:pre-wrap;overflow-wrap:anywhere;margin:0 0 8px}.md>:last-child{margin-bottom:0}
+:is(.md,.wk) :is(ul,ol){margin:0 0 8px;padding-left:1.5em}:is(.md,.wk) li{margin:2px 0;white-space:pre-wrap;overflow-wrap:anywhere}
+:is(.md,.wk) li>:is(ul,ol){margin:2px 0 0}
+:is(.md,.wk) blockquote{margin:0 0 8px;padding:2px 0 2px 12px;border-left:3px solid var(--line);color:var(--dim)}
+:is(.md,.wk) hr{border:0;border-top:1px solid var(--line);margin:12px 0}
+:is(.md,.wk) .tablewrap{overflow-x:auto;margin:0 0 8px}
+:is(.md,.wk) table{border-collapse:collapse;font-size:14px}
+:is(.md,.wk) :is(th,td){border:1px solid var(--line);padding:4px 8px;text-align:left;vertical-align:top}
+:is(.md,.wk) th{background:var(--bg)}
+:is(.md,.wk) li:has(> .task){list-style:none;margin-left:-1.2em}:is(.md,.wk) .task{font-size:1.05em}:is(.md,.wk) .task.done{color:var(--ready)}
 .md h2,.md h3,.md h4{text-transform:none;letter-spacing:0;color:inherit;margin:12px 0 4px;font-weight:700}
 .md h2{font-size:17px}.md h3{font-size:15.5px}.md h4{font-size:15px}.md>:first-child{margin-top:0}
 .md pre{white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:8px 10px;
@@ -3108,9 +3117,29 @@ async function setPrio(v) {{ try {{ await api('PATCH', '/api/tickets/' + TID, {{
 TICKET_WORD = re.compile(r"\b(?:[A-Za-z]+-[A-Za-z]+|[A-Z]{4,5})\b")
 
 
-def chat_text(store, body):
-    """A message's text: escaped, with links, and ticket ids that exist linked to their tickets."""
-    parts = LINKABLE.split(esc(body))
+# Inline markdown, applied to escaped plain text only (never inside a link we made), with boundaries so that
+# snake_case_names, 2 * 3 * 4 and the like stay as typed.
+EMPHASIS = [
+    (re.compile(r"\*\*(?!\s)([^*\n]+?)(?<!\s)\*\*"), r"<b>\1</b>"),
+    (re.compile(r"(?<![\w_])__(?!\s)([^_\n]+?)(?<!\s)__(?![\w_])"), r"<b>\1</b>"),
+    (re.compile(r"~~(?!\s)([^~\n]+?)(?<!\s)~~"), r"<s>\1</s>"),
+    (re.compile(r"(?<![\w*])\*(?![\s*])([^*\n]+?)(?<![\s*])\*(?![\w*])"), r"<i>\1</i>"),
+    (re.compile(r"(?<![\w_])_(?![\s_])([^_\n]+?)(?<![\s_])_(?![\w_])"), r"<i>\1</i>"),
+]
+MD_LINK = re.compile(r"\[([^\]\n]+)\]\((https?://[^\s)]+|/[^\s)]*)\)")
+
+
+def emphasize(html_text):
+    for pattern, sub in EMPHASIS:
+        html_text = pattern.sub(sub, html_text)
+    return html_text
+
+
+def plain_html(store, text, links=True):
+    """Escaped text with emphasis; with `links`, also web links, [[wiki/links]] and ticket ids."""
+    if not links:
+        return emphasize(esc(text))
+    parts = LINKABLE.split(esc(text))
     ids = {norm_id(w) for w in TICKET_WORD.findall(" ".join(parts[::2]))}
     known = {r[0] for r in store.db().execute(
         f"SELECT id FROM tickets WHERE id IN ({','.join('?' * len(ids))})", list(ids))} if ids else set()
@@ -3120,7 +3149,24 @@ def chat_text(store, body):
             out.append(link_part(p))
         else:
             out.append(TICKET_WORD.sub(
-                lambda m: f'<a href="/t/{norm_id(m[0])}">{m[0]}</a>' if norm_id(m[0]) in known else m[0], p))
+                lambda m: f'<a href="/t/{norm_id(m[0])}">{m[0]}</a>' if norm_id(m[0]) in known else m[0], emphasize(p)))
+    return "".join(out)
+
+
+def inline_md(store, text):
+    """One run of text as HTML: `code`, [label](url), **bold**, *italics*, ~~strike~~, links, ticket ids."""
+    out = []
+    for i, part in enumerate(re.split(r"(`[^`\n]+`)", text)):
+        if i % 2:
+            out.append(f"<code>{esc(part[1:-1])}</code>")
+            continue
+        pieces = MD_LINK.split(part)  # text, label, url, text, label, url, ...
+        for j in range(0, len(pieces), 3):
+            out.append(plain_html(store, pieces[j]))
+            if j + 2 < len(pieces):
+                url = pieces[j + 2]
+                external = ' target="_blank" rel="noopener"' if url.startswith("http") else ""
+                out.append(f'<a href="{esc(url)}"{external}>{plain_html(store, pieces[j + 1], links=False)}</a>')
     return "".join(out)
 
 
@@ -3288,56 +3334,109 @@ def render_chat(store, cid, viewer):
     return page(c["name"], body, "/chat", len(store.tickets(["review"])))
 
 
-BOLD = re.compile(r"\*\*([^*\n]+?)\*\*")
-
-
-def wiki_inline(store, text):
-    """One run of text: escaped, with `code`, **bold**, links, ticket ids and [[wiki/links]]."""
-    out = []
-    for i, part in enumerate(re.split(r"(`[^`\n]+`)", text)):
-        if i % 2:
-            out.append(f"<code>{esc(part[1:-1])}</code>")
-        else:
-            out.append(BOLD.sub(r"<b>\1</b>", chat_text(store, part)))
-    return "".join(out)
-
-
 def code_block(lines):
     """A code block: monospace, wrapped, with a Copy button that copies the original text."""
     return f'<div class="code"><button type="button" class="copy" aria-label="Copy">Copy</button><pre>{esc(chr(10).join(lines))}</pre></div>'
 
 
+LIST_ITEM = re.compile(r"^(\s*)([-*+]|\d{1,3}[.)])\s+(.*)$")
+RULE = re.compile(r"^\s*([-*_])(?:\s*\1){2,}\s*$")
+TABLE_SEP = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$")
+
+
+def list_html(store, items):
+    """Nested lists from (indent, ordered, text) items; "[ ]" / "[x]" items are tasks."""
+    out, stack = [], []
+    for indent, ordered, text in items:
+        tag = "ol" if ordered else "ul"
+        while stack and indent < stack[-1][0]:
+            out.append(f"</li></{stack.pop()[1]}>")
+        if stack and indent == stack[-1][0] and stack[-1][1] != tag:
+            out.append(f"</li></{stack.pop()[1]}>")
+        if not stack or indent > stack[-1][0]:
+            out.append(f"<{tag}><li>")
+            stack.append((indent, tag))
+        else:
+            out.append("</li><li>")
+        if m := re.match(r"\[([ xX])\]\s+(.*)", text, re.S):
+            done = m[1] != " "
+            out.append(f'<span class="task{" done" if done else ""}">{"☑" if done else "☐"}</span> {inline_md(store, m[2])}')
+        else:
+            out.append(inline_md(store, text))
+    while stack:
+        out.append(f"</li></{stack.pop()[1]}>")
+    return "".join(out)
+
+
+def table_html(store, rows):
+    cells = lambda r: [c.strip() for c in r.strip().strip("|").split("|")]
+    head = "".join(f"<th>{inline_md(store, c)}</th>" for c in cells(rows[0]))
+    body = "".join("<tr>" + "".join(f"<td>{inline_md(store, c)}</td>" for c in cells(r)) + "</tr>" for r in rows[2:])
+    return f'<div class="tablewrap"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>'
+
+
 def wiki_html(store, text):
-    """Text as people and agents write it: line breaks and indentation kept, plus a little markdown:
-    # headings, ``` code blocks (monospace, spacing exact), `code`, **bold**, links. Used for the wiki,
-    ticket descriptions, comments and chat messages."""
-    out, para, code = [], [], None
+    """Text as people and agents write it, as HTML: line breaks and indentation kept, plus markdown:
+    # headings, lists (nested, numbered, - [ ] tasks), > quotes, | tables |, --- rules, ``` code blocks,
+    and inline `code`, **bold**, *italics*, ~~strike~~, [label](url), links, ticket ids, [[wiki/links]].
+    Used for the wiki, ticket descriptions, comments and chat messages."""
+    lines, out, para, i = text.splitlines(), [], [], 0
 
     def flush():
         if para:
-            out.append(f"<p>{wiki_inline(store, chr(10).join(para))}</p>")
+            out.append(f"<p>{inline_md(store, chr(10).join(para))}</p>")
             para.clear()
-    for line in text.splitlines():
+    while i < len(lines):
+        line = lines[i]
         if line.strip().startswith("```"):
-            if code is None:
-                flush()
-                code = []
-            else:
-                out.append(code_block(code))
-                code = None
+            flush()
+            j = i + 1
+            while j < len(lines) and not lines[j].strip().startswith("```"):
+                j += 1
+            out.append(code_block(lines[i + 1:j]))
+            i = j + 1
             continue
-        if code is not None:
-            code.append(line)
+        if not line.strip():
+            flush()
         elif m := re.match(r"(#{1,3})\s+(.*)", line):
             flush()
             n = len(m[1]) + 1
-            out.append(f"<h{n}>{wiki_inline(store, m[2])}</h{n}>")
-        elif not line.strip():
+            out.append(f"<h{n}>{inline_md(store, m[2])}</h{n}>")
+        elif RULE.match(line):
             flush()
+            out.append("<hr>")
+        elif LIST_ITEM.match(line):
+            flush()
+            items = []
+            while i < len(lines) and lines[i].strip():
+                m = LIST_ITEM.match(lines[i])
+                if m:
+                    items.append((len(m[1].expandtabs(4)), m[2][0].isdigit(), m[3]))
+                elif items:  # a continuation line belongs to the item above
+                    items[-1] = (items[-1][0], items[-1][1], items[-1][2] + "\n" + lines[i].strip())
+                i += 1
+            out.append(list_html(store, items))
+            continue
+        elif line.lstrip().startswith(">"):
+            flush()
+            quoted = []
+            while i < len(lines) and lines[i].lstrip().startswith(">"):
+                quoted.append(re.sub(r"^\s*>\s?", "", lines[i]))
+                i += 1
+            out.append(f"<blockquote>{wiki_html(store, chr(10).join(quoted))}</blockquote>")
+            continue
+        elif "|" in line and i + 1 < len(lines) and TABLE_SEP.match(lines[i + 1]):
+            flush()
+            rows = [line, lines[i + 1]]
+            i += 2
+            while i < len(lines) and "|" in lines[i] and lines[i].strip():
+                rows.append(lines[i])
+                i += 1
+            out.append(table_html(store, rows))
+            continue
         else:
             para.append(line)
-    if code is not None:
-        out.append(code_block(code))
+        i += 1
     flush()
     return "".join(out)
 
@@ -3550,8 +3649,9 @@ up the listener for your harness.
 
 ## Writing
 
-Descriptions, comments and chat show your line breaks plus a little markdown: `#` headings, ``` code
-blocks (monospace), `code`, `**bold**`, links, ticket ids and `[[wiki/page]]` links. Write to be scanned on a
+Descriptions, comments and chat show your line breaks plus markdown: `#` headings, lists (`- [ ]` tasks too),
+`> quotes`, tables, ``` code blocks (monospace), `code`, `**bold**`, `*italics*`, `~~strike~~`, `[text](url)`,
+links, ticket ids and `[[wiki/page]]` links. Write to be scanned on a
 phone: short paragraphs with blank lines, headings for long write-ups, lists for steps, code blocks for
 commands and output. No walls of text.
 
@@ -3864,14 +3964,18 @@ Ticket descriptions, comments, chat messages and wiki pages are shown
 with your line breaks and indentation kept, plus a little markdown:
 
 - `# Heading`, `## Heading`, `### Heading` on a line of their own
+- lists: `- item` (or `*`, `+`), `1. item`, nested by indenting, and
+  tasks: `- [ ] to do`, `- [x] done`
+- `> quoted lines`, `---` for a dividing line, and tables
+  (`| a | b |` with a `|---|---|` line under the header)
 - code blocks between lines of three backticks, shown in a monospace
-  font with spacing exact (commands, output, tables, diffs)
-- `` `inline code` `` and `**bold**`
+  font with spacing exact (commands, output, diffs)
+- inline: `` `code` ``, `**bold**`, `*italics*` (or `_italics_`),
+  `~~strike~~`, `[your words](https://...)`
 - links: web addresses, ticket ids (`amber-otter`) and wiki pages
   (`[[section/page]]`, or `[[section/page|your words]]`)
 
-Lists, tables in pipes and other markdown show as you typed them (which
-reads fine). Humans often read on a phone, so write to be scanned: short
+Images and raw HTML aren't rendered (attach images as files). Humans often read on a phone, so write to be scanned: short
 paragraphs separated by blank lines, a heading for each part of a long
 write-up, a list for steps, and code blocks for anything that should line
 up. Don't send a wall of text.

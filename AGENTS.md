@@ -41,6 +41,7 @@ read `GET /api` on the running server instead.
 - **Pages** are server-rendered HTML with a little inline JavaScript.
   Escape everything user- or agent-written (`esc()`), and check new
   pages at phone width.
-- The running instance on the owner's machine is the user service
-  `agent-tickets` (`systemctl --user restart agent-tickets` after a
-  change). Commit and push to GitHub when done.
+- The owner runs the live instance under their own account: don't start,
+  restart or touch it or its data. Test on a throwaway server
+  (`--data` in a temp folder, another `--port`), then commit and push to
+  GitHub; the owner pulls and restarts.

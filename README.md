@@ -126,6 +126,17 @@ carries its latest 20 comments (with `comments_total` and
 only when they need older ones. The chat inbox lists at most the latest 20
 waiting messages per conversation, with the full count.
 
+## Formatting
+
+Ticket descriptions, comments, chat messages and wiki pages keep your line
+breaks and render markdown: `# headings`, lists (`-`, `1.`, nested, and
+`- [ ]` / `- [x]` tasks), `> quotes`, tables, `---` rules, fenced code
+blocks (monospace, with a Copy button), `` `code` ``, `**bold**`,
+`*italics*` / `_italics_`, `~~strike~~` and `[words](https://...)`, plus
+links, ticket ids and `[[wiki/page]]` links. Lookalikes such as
+`snake_case_names` or `2 * 3 * 4` stay as typed, and everything is escaped
+(no raw HTML or images; attach images as files).
+
 ## Wiki
 
 Shared knowledge for humans and agents: project onboarding, where the repos
