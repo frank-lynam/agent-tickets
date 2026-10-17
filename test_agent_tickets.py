@@ -1412,12 +1412,20 @@ class TicketsTest(unittest.TestCase):
         self.assertEqual(W()["reason"], "timeout")
         self.assertEqual(self.j("GET", f"/api/tickets/{t['id']}", role=None, token=tok)[1]["new_comments"], 0)
         self.assertNotIn("hasn't answered", self.call("GET", f"/t/{t['id']}", role="human")[1].decode())
-        # Another agent's comment doesn't need a reply; finished tickets don't count.
+        # Another agent's comment doesn't need a reply.
         self.j("POST", f"/api/tickets/{t['id']}/comments", {"body": "fyi"}, role=None, token=other)
         self.assertEqual(W()["reason"], "timeout")
-        self.j("POST", f"/api/tickets/{t['id']}/comments", {"body": "Shipping it."}, role="human")
+        # A comment on a ticket a human closes is still a comment: owed until the agent replies.
+        self.j("POST", f"/api/tickets/{t['id']}/comments", {"body": "Shipping it. Next time, tests go in tests/."}, role="human")
         self.j("PATCH", f"/api/tickets/{t['id']}", {"status": "done"}, role="human")
+        got = W()
+        self.assertEqual((got["reason"], got["tickets"][0]["id"], got["tickets"][0]["status"]), ("comments", t["id"], "done"))
+        ticket = self.j("GET", f"/api/tickets/{t['id']}", role=None, token=tok)[1]
+        self.assertTrue(ticket["what_now"].startswith("Frank left 1 new comment here: read it and reply"), ticket["what_now"])
+        self.assertIn("agent-cm hasn't answered your latest comment", self.call("GET", f"/t/{t['id']}", role="human")[1].decode())
+        self.j("POST", f"/api/tickets/{t['id']}/comments", {"body": "Will do, thanks!"}, role=None, token=tok)
         self.assertEqual(W()["reason"], "timeout")
+        self.assertEqual(self.j("GET", f"/api/tickets/{t['id']}", role="human")[1]["status"], "done")
 
     def test_long_threads_are_paged(self):
         tok = self.j("POST", "/api/users", {"username": "agent-pg", "kind": "agent"}, role="human")[1]["token"]

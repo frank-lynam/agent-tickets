@@ -1300,7 +1300,7 @@ class Store:
         "new_comments", "from", "why"}], newest activity first."""
         sql = ("SELECT t.id, t.title, t.status, COUNT(c.id) AS n, GROUP_CONCAT(DISTINCT c.author) AS who, "
                "MAX(c.id) AS last FROM tickets t JOIN comments c ON c.ticket_id = t.id "
-               "WHERE t.assignee = ? COLLATE NOCASE AND t.status != 'done' AND t.kind = 'ticket' AND c.role = 'human' "
+               "WHERE t.assignee = ? COLLATE NOCASE AND t.kind = 'ticket' AND c.role = 'human' "
                "AND c.author != ? COLLATE NOCASE AND c.id > COALESCE((SELECT MAX(m.id) FROM comments m "
                "WHERE m.ticket_id = t.id AND m.author = ? COLLATE NOCASE), 0)")
         args = [user, user, user]
@@ -3022,7 +3022,7 @@ def render_ticket(store, tid):
                            f'<button data-move="{"backlog" if t["cancelled"] or t["declined"] else "in_progress"}">Comment &amp; reopen</button>')
     else:
         comment_buttons = '<button class="primary" id="csend">Comment</button>'
-    owed = store.comments_owed(t["assignee"], t["id"]) if t["assignee"] and s != "done" else []
+    owed = store.comments_owed(t["assignee"], t["id"]) if t["assignee"] else []
     unanswered = (f'<p class="meta unanswered">{esc(t["assignee"])} hasn\'t answered '
                   f'{"your latest comment" if owed[0]["new_comments"] == 1 else str(owed[0]["new_comments"]) + " comments"} '
                   f'yet.</p>' if owed and store.user(t["assignee"])["kind"] == "agent" else "")
@@ -3640,7 +3640,8 @@ stuck", "ready for more work"): chat. Reply where you're spoken to; to reach som
   ticket from the API has a `what_now` line saying what it means for you; follow it.
 - Comment as you go: `POST /api/tickets/ID/comments` `{{"body": "..."}}`.
 - A human's comment on your ticket waits for your reply: `/api/wait` returns it (reason `comments`) and the
-  ticket shows `new_comments`, until you comment on that ticket. Read it, act on it, reply (even briefly).
+  ticket shows `new_comments`, until you comment on that ticket. Read it, act on it, reply (even briefly). That
+  includes done tickets: a comment as a ticket is closed is meant for you (follow-up work: propose a new ticket).
 - Files: one folder per ticket, `~/work/tickets/TICKET-ID/` (checklist, notes, scratch, logs, screenshots), never
   loose in your home folder; code changes in the project's repo on a `ticket/TICKET-ID` branch. Tidy up once a ticket
   is closed as done. Nobody else can see your machine: attach what humans or the next agent need to the ticket,
@@ -3867,8 +3868,9 @@ proposed tickets, in one step.
 8. After review a human may move it back to in_progress or ready with a
    comment saying what to change. Read their comment first.
 9. **A human's comment on your ticket waits for your reply.** Whenever a
-   human comments on a ticket assigned to you (not done), it stays on your
-   list until you comment on that ticket: `/api/wait` returns it (reason
+   human comments on a ticket assigned to you, done ones included (a
+   comment as a ticket is closed is meant for you), it stays on your list
+   until you comment on that ticket: `/api/wait` returns it (reason
    `comments`) right after chat, the ticket shows `"new_comments": N`, and
    its `what_now` starts with who left them. Read them, act on them, and
    reply, even briefly ("Got it, doing that next"). Other agents' comments
@@ -4302,7 +4304,7 @@ class Handler(BaseHTTPRequestHandler):
                 if isinstance(t, dict) and "status" in t and "id" in t and "kind" in t:
                     t["what_now"] = what_now(t, actor)
                     mine = (t.get("assignee") or "").lower() == actor.lower()
-                    if mine and t["status"] != "done" and t["kind"] == "ticket":
+                    if mine and t["kind"] == "ticket":   # done tickets too: a comment is a comment
                         owed = self.server.store.comments_owed(actor, t["id"])
                         t["new_comments"] = owed[0]["new_comments"] if owed else 0
                         if owed:
