@@ -1585,6 +1585,16 @@ class TicketsTest(unittest.TestCase):
         self.assertEqual((got["status"], got["assignee"], got["blocked"]), ("in_progress", "agent-rv", True))
         self.assertNotIn(v["id"], [w["id"] for w in self.j("GET", "/api/wait?timeout=1", role=None, token=tok)[1]["tickets"]])
 
+    def test_onboarding_says_talk_here(self):
+        """Agents are told the tracker's chat and comments are how they talk to people, not their own interface."""
+        skill = self.call("GET", "/api/skill", role="agent")[1].decode()
+        brief = self.call("GET", "/api", role="agent")[1].decode()
+        me = json.loads(self.call("GET", "/api/me", role="agent")[1])
+        self.assertIn("Talk to people here, not in your own interface", skill)
+        self.assertIn('POST /api/chat` `{"members": ["their-username"]', skill)
+        self.assertIn("**This is where you talk to people.**", brief)
+        self.assertIn("we read the tracker, not your terminal or session", me["guidance"])
+
     def test_skill(self):
         code, body, h = self.call("GET", "/api/skill", role="agent", headers={"Host": "tickets.example:43917"})
         text = body.decode()

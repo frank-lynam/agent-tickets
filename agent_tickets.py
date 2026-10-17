@@ -274,7 +274,7 @@ USERNAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,31}")
 # the /api briefing. Humans edit it on the Guidance page; this is the start.
 DEFAULT_GUIDANCE = """## How we work
 
-0. Chat comes first. When a response carries a "chat" notice, reply to the messages before your next step on the ticket. A human's message stays until you reply, even a short "Got it". Chat is for questions and planning that aren't about one ticket; anything about a ticket goes in a comment on that ticket.
+0. Chat comes first. When a response carries a "chat" notice, reply to the messages before your next step on the ticket. A human's message stays until you reply, even a short "Got it". Chat is for questions and planning that aren't about one ticket; anything about a ticket goes in a comment on that ticket. This is where you talk to us: we read the tracker, not your terminal or session, so anything you'd say to a person goes in chat or a comment here.
 1. When you take a ticket, it's in progress and assigned to you: that means you are working on it now. Make its folder (~/work/tickets/TICKET-ID/, e.g. ~/work/tickets/amber-otter/) and, if it changes a repo, a branch in that repo named ticket/TICKET-ID. Then post a one-line comment: you're starting (and on which branch), and you'll write a checklist.
 2. Write a markdown checklist of the steps ("- [ ] step") in that folder (checklist.md), upload it (PUT /api/tickets/ID/checklist), and post a short plan: what you'll do, and how you'll know it's done.
 3. After each step, tick it off in your file, upload it again, and comment what you did and what happened, including errors and surprises.
@@ -3614,6 +3614,11 @@ your harness's secret store); never write it into files, comments, chat or this 
 The full briefing, with every rule and endpoint: `GET {base}/api`. Re-read it when something here isn't
 enough, or a request fails in a way you don't understand. Errors come back as `{{"error": "..."}}`.
 
+Talk to people here, not in your own interface: the humans read this tracker, and may never see your
+terminal, session or logs. About a ticket: a comment on it. Anything else (questions, updates, ideas, "I'm
+stuck", "ready for more work"): chat. Reply where you're spoken to; to reach someone new,
+`POST /api/chat` `{{"members": ["their-username"], "body": "..."}}` (reuses your conversation with them).
+
 ## Each session
 
 1. `GET /api/me`: who you are, your humans' current guidance (follow it; it changes), your chat inbox count.
@@ -3874,6 +3879,15 @@ proposed tickets, in one step.
 Conversations between any users, humans and agents; anyone can read and
 post in any of them. The members of a conversation are the people who are
 told about its new messages.
+
+**This is where you talk to people.** The humans work in this tracker; they
+may never see your terminal, your session or your logs. So anything you'd
+say to a person goes here, not in your own interface: about one ticket, a
+comment on it; anything else (a question, an update, an idea, "I'm stuck",
+"I'm idle and ready for more"), chat. Reply in the conversations you're in;
+to reach someone else, `POST /api/chat` `{"members": ["their-username"],
+"body": "..."}` (it reuses your existing conversation with them). You'll see
+usernames on tickets, comments and chat.
 
 **Answer chat before you carry on.** While you owe chat an answer, every
 ticket response (`/api/next`, `GET`/`PATCH` a ticket, comments, uploads)
