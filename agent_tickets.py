@@ -3,11 +3,15 @@
 reviews their work. Python standard library only: a threaded HTTP server
 and an SQLite database.
 
-  python3 agent_tickets.py                     # serve on 127.0.0.1:43917, data in ./data
-  python3 agent_tickets.py --port 8080 --data /srv/tickets
-  python3 agent_tickets.py --add-user frank --kind human   # make a user, print their token
-  python3 agent_tickets.py --export backups/   # back everything up (see "Backups")
-  python3 agent_tickets.py --import FILE       # restore a backup into an empty data folder
+  agent-tickets                     # serve on 127.0.0.1:43917 (or: python3 agent_tickets.py)
+  agent-tickets --port 8080 --data /srv/tickets
+  agent-tickets --add-user frank --kind human   # make a user, print their token
+  agent-tickets service add         # run it as a systemd user service, with a nightly backup
+  agent-tickets --export backups/   # back everything up (see "Backups")
+  agent-tickets --import FILE       # restore a backup into an empty data folder
+
+Data lives in $AT_DATA, else data/ next to this file if there is one (a git
+checkout), else ~/.local/share/agent-tickets.
 
 Tickets move through five statuses:
   backlog      an idea, not cleared for work yet
@@ -24,6 +28,8 @@ backlog or done tickets (comments are always allowed). Only a hash of each
 token is stored. API docs: GET /api.
 """
 import argparse
+import shutil
+import subprocess
 import email.message
 import email.parser
 import email.policy
@@ -263,6 +269,8 @@ CREATE INDEX IF NOT EXISTS events_ticket ON events(ticket_id, at);
 
 
 # Bumped (with a migration in Store.__init__) whenever the tables change.
+__version__ = "0.1.0"
+
 SCHEMA_VERSION = 10
 TABLES = ("users", "settings", "tickets", "deps", "comments", "attachments", "events",
           "conversations", "chat_members", "messages", "chat_files", "wiki_pages", "wiki_revisions")
@@ -4809,6 +4817,133 @@ class Handler(BaseHTTPRequestHandler):
                 left -= len(chunk)
 
 
+def default_data_dir() -> str:
+    """$AT_DATA; else data/ beside this file if it exists (a git checkout, as before); else the
+    XDG data folder, so a pip install never keeps data inside the package."""
+    if os.environ.get("AT_DATA"):
+        return os.environ["AT_DATA"]
+    beside = Path(__file__).resolve().parent / "data"
+    if beside.is_dir():
+        return str(beside)
+    return str(Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share") / "agent-tickets")
+
+
+def command_line() -> str:
+    """How to run this same agent-tickets again: the installed command, or this file with this Python."""
+    me = os.path.abspath(sys.argv[0])
+    if os.path.basename(me) == "agent-tickets" and os.access(me, os.X_OK):
+        return me
+    return f"{sys.executable} {os.path.abspath(__file__)}"
+
+
+# ---- systemd user services: the server, and a nightly backup
+
+SERVICE_UNIT = """[Unit]
+Description=agent-tickets: ticket tracker for AI agents
+After=network-online.target
+
+[Service]
+ExecStart={exe} --host {host} --port {port} --data {data}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+"""
+
+BACKUP_UNIT = """[Unit]
+Description=agent-tickets: nightly backup (export to {backups}, keep {keep})
+
+[Service]
+Type=oneshot
+ExecStart={exe} --data {data} --export {backups}/ --keep {keep}
+"""
+
+BACKUP_TIMER = """[Unit]
+Description=agent-tickets: nightly backup
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+"""
+
+
+def quote_arg(a: str) -> str:
+    return f'"{a}"' if " " in a else a
+
+
+def cmd_service(argv):
+    ap = argparse.ArgumentParser(prog="agent-tickets service",
+                                 description="Run agent-tickets as a systemd user service (now and at boot), "
+                                             "with a nightly backup at 03:30.")
+    ap.add_argument("action", choices=["add", "remove"])
+    ap.add_argument("--host", help="address to listen on (default 127.0.0.1)")
+    ap.add_argument("--port", type=int, help="port (default 43917)")
+    ap.add_argument("--data", help="data folder (default: see agent-tickets --help)")
+    ap.add_argument("--backups", default=str(Path.home() / "backups" / "agent-tickets"), help="where nightly backups go")
+    ap.add_argument("--keep", type=int, default=30, help="backups to keep (default 30)")
+    a = ap.parse_args(argv)
+    if not shutil.which("systemctl"):
+        sys.exit("systemctl isn't available here: run agent-tickets under your own process manager instead")
+    systemctl = lambda *args: subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True)
+    units = Path.home() / ".config" / "systemd" / "user"
+    names = ("agent-tickets.service", "agent-tickets-backup.service", "agent-tickets-backup.timer")
+    if a.action == "remove":
+        systemctl("disable", "--now", "agent-tickets.service", "agent-tickets-backup.timer")
+        for n in names:
+            (units / n).unlink(missing_ok=True)
+        systemctl("daemon-reload")
+        return print("agent-tickets service and nightly backup stopped and removed (your data is untouched)")
+
+    # An existing service (say, one installed from a git checkout) keeps its data, address and port
+    old = (units / names[0]).read_text() if (units / names[0]).exists() else ""
+    old_exec = re.search(r"^ExecStart=(.*)$", old, re.M)
+    old_exec = old_exec.group(1) if old_exec else ""
+    def old_opt(name):
+        m = re.search(rf"--{name}[ =](\S+)", old_exec)
+        return m.group(1) if m else None
+    data = a.data or old_opt("data")
+    if not data and old_exec:
+        script = re.search(r"(\S+agent_tickets\.py)", old_exec)
+        beside = Path(script.group(1).replace("%h", str(Path.home()))).parent / "data" if script else None
+        if beside and beside.is_dir():
+            data = str(beside)
+    data = str(Path(data or default_data_dir()).expanduser().resolve())
+    host = a.host or old_opt("host") or "127.0.0.1"
+    port = a.port or int(old_opt("port") or 43917)
+    exe = " ".join(quote_arg(x) for x in command_line().split(" ", 1))
+    backups = str(Path(a.backups).expanduser().resolve())
+    Path(backups).mkdir(parents=True, exist_ok=True)
+    units.mkdir(parents=True, exist_ok=True)
+    texts = (SERVICE_UNIT.format(exe=exe, host=host, port=port, data=quote_arg(data)),
+             BACKUP_UNIT.format(exe=exe, data=quote_arg(data), backups=quote_arg(backups), keep=a.keep),
+             BACKUP_TIMER)
+    for n, text in zip(names, texts):
+        (units / n).write_text(text)
+    if old and old != texts[0]:
+        print(f"replaced the existing service (it ran: {old_exec})")
+    systemctl("daemon-reload")
+    r = systemctl("enable", "--now", "agent-tickets.service", "agent-tickets-backup.timer")
+    if r.returncode:
+        sys.exit(f"systemctl failed: {(r.stderr or r.stdout).strip()}")
+    if old:
+        systemctl("restart", "agent-tickets.service")
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+    linger = subprocess.run(["loginctl", "show-user", user, "-p", "Linger"], capture_output=True, text=True)
+    if "Linger=no" in linger.stdout and subprocess.run(["loginctl", "enable-linger", user], capture_output=True,
+                                                       stdin=subprocess.DEVNULL).returncode:
+        print(f"note: run `sudo loginctl enable-linger {user}` so it keeps running when you're logged out")
+    time.sleep(1.5)
+    state = systemctl("is-active", "agent-tickets.service").stdout.strip()
+    print(f"agent-tickets: service {state} on http://{host}:{port}, data in {data}\n"
+          f"nightly backup at 03:30 into {backups} (keeping {a.keep})\n"
+          f"logs: journalctl --user -u agent-tickets" + ("" if state == "active" else
+          "\nIt didn't stay up: see the logs"))
+
+
 def make_server(host, port, data_dir, max_upload_mb=1024):
     srv = ThreadingHTTPServer((host, port), Handler)
     srv.daemon_threads = True
@@ -4821,7 +4956,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--host", default=os.environ.get("AT_HOST", "127.0.0.1"))
     ap.add_argument("--port", type=int, default=int(os.environ.get("AT_PORT", 43917)))
-    ap.add_argument("--data", default=os.environ.get("AT_DATA", str(Path(__file__).resolve().parent / "data")),
+    ap.add_argument("--version", action="version", version=f"agent-tickets {__version__}")
+    ap.add_argument("--data", default=default_data_dir(),
                     help="folder for the database, uploads and keys")
     ap.add_argument("--max-upload-mb", type=int, default=int(os.environ.get("AT_MAX_UPLOAD_MB", 1024)))
     ap.add_argument("--add-user", metavar="NAME", help="add a user, print their token, and exit")
@@ -4869,9 +5005,16 @@ def main():
     srv = make_server(a.host, a.port, a.data, a.max_upload_mb)
     print(f"agent-tickets on http://{a.host}:{a.port}  data: {Path(a.data).resolve()}", flush=True)
     if not srv.store.users():
-        print("No users yet. Add yourself: python3 agent_tickets.py --add-user NAME --kind human", flush=True)
+        print(f"No users yet. Add yourself: {command_line()} --add-user NAME --kind human", flush=True)
     srv.serve_forever()
 
 
-if __name__ == "__main__":
+def cli():
+    """Entry point for the installed `agent-tickets` command."""
+    if sys.argv[1:2] == ["service"]:
+        return cmd_service(sys.argv[2:])
     main()
+
+
+if __name__ == "__main__":
+    cli()

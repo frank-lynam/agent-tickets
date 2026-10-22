@@ -1,6 +1,9 @@
 """Tests for agent_tickets.py: a real server on a temporary folder, driven
 over HTTP. Standard library only:  python3 -m unittest -v"""
 import io
+import os
+import subprocess
+import sys
 import json
 import re
 import tarfile
@@ -1644,6 +1647,32 @@ class TicketsTest(unittest.TestCase):
         self.assertNotIn("Approve", html)
         self.assertIn("Needs your review", self.call("GET", "/", role="human")[1].decode())
         self.assertEqual(self.call("GET", "/t/ZZZZ", role="human")[0], 404)
+
+
+
+class DataFolderTest(unittest.TestCase):
+    """Where data goes when --data isn't given: never inside an installed package."""
+
+    def where(self, folder, **env):
+        import shutil as _shutil
+        _shutil.copy(Path(__file__).resolve().parent / "agent_tickets.py", folder)
+        clean = {k: v for k, v in os.environ.items() if k not in ("AT_DATA", "XDG_DATA_HOME")}
+        r = subprocess.run([sys.executable, "-c", "import agent_tickets; print(agent_tickets.default_data_dir())"],
+                           cwd=folder, env={**clean, **env}, capture_output=True, text=True, check=True)
+        return r.stdout.strip()
+
+    def test_default_data_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            xdg = os.path.join(tmp, "xdg")
+            self.assertEqual(self.where(tmp, XDG_DATA_HOME=xdg), os.path.join(xdg, "agent-tickets"))
+            os.mkdir(os.path.join(tmp, "data"))                       # a git checkout that already has data
+            self.assertEqual(os.path.realpath(self.where(tmp, XDG_DATA_HOME=xdg)), os.path.realpath(os.path.join(tmp, "data")))
+            self.assertEqual(self.where(tmp, AT_DATA="/srv/at"), "/srv/at")
+
+    def test_version(self):
+        out = subprocess.run([sys.executable, str(Path(__file__).resolve().parent / "agent_tickets.py"), "--version"],
+                             capture_output=True, text=True).stdout
+        self.assertRegex(out, r"^agent-tickets \d+\.\d+\.\d+")
 
 
 if __name__ == "__main__":

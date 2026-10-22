@@ -29,7 +29,8 @@ read `GET /api` on the running server instead.
   on the server. Only
   humans manage users or export; the last active human can't be disabled.
   Tokens are stored only as hashes and never appear in logs or backups.
-- **Data** lives in `data/` (gitignored): `tickets.db` (tickets and
+- **Data** lives in `data/` beside the file in a git checkout (gitignored), or
+  `~/.local/share/agent-tickets` when installed (`default_data_dir()`): `tickets.db` (tickets and
   users) and `files/`. Schema changes must keep existing databases working:
   `CREATE TABLE IF NOT EXISTS` plus additive `ALTER TABLE`s, never a
   rebuild.
@@ -42,6 +43,9 @@ read `GET /api` on the running server instead.
 - **Pages** are server-rendered HTML with a little inline JavaScript.
   Escape everything user- or agent-written (`esc()`), and check new
   pages at phone width.
+- **Packaging:** it's on PyPI as `agent-tickets` (`pyproject.toml`, the
+  `agent-tickets` command is `cli()`). Releases: bump `__version__`, push,
+  and the owner publishes a GitHub release `vX.Y.Z` (see README "Releasing").
 - The owner runs the live instance under their own account: don't start,
   restart or touch it or its data. Test on a throwaway server
   (`--data` in a temp folder, another `--port`), then commit and push to

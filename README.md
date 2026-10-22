@@ -10,33 +10,32 @@ No dependencies to install.
 
 ## Quick start
 
-On a Linux machine with `git`, Python 3.8+ and systemd, paste this into
-bash. It installs to `~/workspace/agent-tickets` (where the service files
-expect it), creates your login, and starts the server plus a nightly
-backup (03:30, into `~/backups/agent-tickets`, keeping 30):
+On a Linux machine with Python 3.9+ and systemd:
 
 ```bash
-git clone https://github.com/frank-lynam/agent-tickets.git ~/workspace/agent-tickets
-cd ~/workspace/agent-tickets
-python3 agent_tickets.py --add-user "$USER" --kind human   # prints your login token: save it
-mkdir -p ~/.config/systemd/user ~/backups/agent-tickets
-cp agent-tickets.service agent-tickets-backup.service agent-tickets-backup.timer ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now agent-tickets.service agent-tickets-backup.timer
-sudo loginctl enable-linger "$USER"   # keep it running when you're logged out
-systemctl --user --no-pager status agent-tickets.service | head -3
+pipx install agent-tickets                    # or: pip install --user agent-tickets
+agent-tickets --add-user "$USER" --kind human # prints your login token: save it
+agent-tickets service add                     # starts it now and at boot, plus a nightly backup
 ```
 
 Then open `http://127.0.0.1:43917/?key=YOUR_TOKEN` once; the browser keeps
-you signed in. To reach it from other machines, add `--host 0.0.0.0` to
-the `ExecStart` line in `~/.config/systemd/user/agent-tickets.service`,
-then `systemctl --user daemon-reload && systemctl --user restart
-agent-tickets` (or put it behind a tunnel or reverse proxy). To add
+you signed in. Data goes in `~/.local/share/agent-tickets`; the nightly
+backup (03:30) into `~/backups/agent-tickets`, keeping 30. To reach it
+from other machines, run `agent-tickets service add --host 0.0.0.0` (or put
+it behind a tunnel or reverse proxy, which also gives you HTTPS). To add
 agents, see **Users and tokens** below, and point each one at `/api`.
+If `loginctl enable-linger` needs a password, `service add` says so: run
+it with sudo so the tracker keeps running when you're logged out.
 
-Updating later: `cd ~/workspace/agent-tickets && git pull && systemctl
---user restart agent-tickets` (take a backup first: `python3
-agent_tickets.py --export ~/backups/agent-tickets/`).
+Updating later: take a backup (`agent-tickets --export
+~/backups/agent-tickets/`), then `pipx upgrade agent-tickets && systemctl
+--user restart agent-tickets`.
+
+**From a git checkout** instead: `python3 agent_tickets.py` works the
+same way (`python3 agent_tickets.py service add`), and keeps its data in
+`data/` beside the file if that folder exists. Moving an existing checkout
+install to pip: `pipx install agent-tickets && agent-tickets service add`.
+It replaces the old service but keeps its data folder, address and port.
 
 ## Statuses
 
@@ -264,11 +263,11 @@ Only a hash of each token is stored (not in the database, not in backups),
 so a token is shown once, when it's made. Lost one? Issue a new one.
 
 ```bash
-python3 agent_tickets.py --add-user frank --kind human     # the first human: prints their token
-python3 agent_tickets.py --add-user agent-1                # an agent (the default kind)
-python3 agent_tickets.py --list-users
-python3 agent_tickets.py --new-token agent-1               # replace a token
-python3 agent_tickets.py --disable agent-1                 # and --enable
+agent-tickets --add-user frank --kind human     # the first human: prints their token
+agent-tickets --add-user agent-1                # an agent (the default kind)
+agent-tickets --list-users
+agent-tickets --new-token agent-1               # replace a token
+agent-tickets --disable agent-1                 # and --enable
 ```
 
 After that, humans can do the same from the **Users** page. Agents send
@@ -281,8 +280,8 @@ folder; hand each agent only its own token.
 ## Run it
 
 ```bash
-python3 agent_tickets.py                 # http://127.0.0.1:43917, data in ./data
-python3 agent_tickets.py --add-user NAME --kind human   # once, for yourself
+agent-tickets                            # http://127.0.0.1:43917
+agent-tickets --add-user NAME --kind human   # once, for yourself
 ```
 
 Then open `http://127.0.0.1:43917/?key=<your token>`.
@@ -291,15 +290,14 @@ Then open `http://127.0.0.1:43917/?key=<your token>`.
 |---|---|---|
 | `--host` / `AT_HOST` | `127.0.0.1` | `0.0.0.0` to reach it from the LAN |
 | `--port` / `AT_PORT` | `43917` | |
-| `--data` / `AT_DATA` | `./data` | the database (tickets, users) and uploaded files |
+| `--data` / `AT_DATA` | `data/` beside the file if it exists, else `~/.local/share/agent-tickets` | the database (tickets, users) and uploaded files |
 | `--max-upload-mb` | `1024` | per file |
 
-As a service (systemd user unit, starts at boot when lingering is on):
-
-```bash
-ln -s "$PWD/agent-tickets.service" ~/.config/systemd/user/
-systemctl --user daemon-reload && systemctl --user enable --now agent-tickets
-```
+As a service (systemd user units, started at boot when lingering is on):
+`agent-tickets service add`, with `--host`, `--port` and `--data` as above
+and `--backups DIR` / `--keep N` for the nightly backup. Run it again to
+change any of them; `agent-tickets service remove` stops and removes both
+(your data stays). Logs: `journalctl --user -u agent-tickets`.
 
 ## Backups
 
@@ -309,21 +307,15 @@ version) plus `files/` (the uploads). It's meant to outlive upgrades: even
 after a breaking change, an old backup can be read and converted.
 
 ```bash
-python3 agent_tickets.py --export backups/            # into a folder, as agent-tickets-<time>.tar.gz (keeps 30)
-python3 agent_tickets.py --export ticket-backup.tar.gz
-python3 agent_tickets.py --data fresh-data --import ticket-backup.tar.gz   # restore (ids kept)
-python3 agent_tickets.py --import FILE --replace      # restore over existing tickets
+agent-tickets --export backups/            # into a folder, as agent-tickets-<time>.tar.gz (keeps 30)
+agent-tickets --export ticket-backup.tar.gz
+agent-tickets --data fresh-data --import ticket-backup.tar.gz   # restore (ids kept)
+agent-tickets --import FILE --replace      # restore over existing tickets
 ```
 
 From the pages: **Done → Download a backup** (`GET /api/export`, human key
-only). A nightly backup runs from a systemd user timer:
-
-```bash
-ln -s "$PWD"/agent-tickets-backup.{service,timer} ~/.config/systemd/user/
-systemctl --user daemon-reload && systemctl --user enable --now agent-tickets-backup.timer
-```
-
-That writes to `~/backups/agent-tickets/` at 03:30, keeping the last 30.
+only). `agent-tickets service add` also sets up a nightly backup (a systemd
+user timer) into `~/backups/agent-tickets/` at 03:30, keeping the last 30.
 They're on the same disk as the data, so copy them somewhere else too.
 
 ## Pages
@@ -391,3 +383,12 @@ both kinds work everywhere.
 ```bash
 python3 -m unittest -v
 ```
+
+## Releasing
+
+Releases go to PyPI from GitHub Actions with Trusted Publishing (no token
+stored), the same way as hobkin: bump `__version__` in `agent_tickets.py`,
+commit and push, then publish a GitHub release tagged `vX.Y.Z` to match. The
+workflow tests on Python 3.9, 3.12 and 3.14, checks the tag, builds and
+uploads. Running it by hand (Actions → Publish → Run workflow) goes to
+TestPyPI instead.
