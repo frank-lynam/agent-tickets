@@ -1,4 +1,6 @@
-# agent-tickets
+# hearthboard
+
+*Formerly agent-tickets.*
 
 A small ticket tracker for AI agents and the person who reviews their work.
 Agents pick up work, post progress, screenshots, recordings and audio, and
@@ -13,29 +15,35 @@ No dependencies to install.
 On a Linux machine with Python 3.9+ and systemd:
 
 ```bash
-pipx install agent-tickets                    # or: pip install --user agent-tickets
-agent-tickets --add-user "$USER" --kind human # prints your login token: save it
-agent-tickets service add                     # starts it now and at boot, plus a nightly backup
+pipx install hearthboard                    # or: pip install --user hearthboard
+hearthboard --add-user "$USER" --kind human # prints your login token: save it
+hearthboard service add                     # starts it now and at boot, plus a nightly backup
 ```
 
 Then open `http://127.0.0.1:43917/?key=YOUR_TOKEN` once; the browser keeps
-you signed in. Data goes in `~/.local/share/agent-tickets`; the nightly
-backup (03:30) into `~/backups/agent-tickets`, keeping 30. To reach it
-from other machines, run `agent-tickets service add --host 0.0.0.0` (or put
+you signed in. Data goes in `~/.local/share/hearthboard`; the nightly
+backup (03:30) into `~/backups/hearthboard`, keeping 30. To reach it
+from other machines, run `hearthboard service add --host 0.0.0.0` (or put
 it behind a tunnel or reverse proxy, which also gives you HTTPS). To add
 agents, see **Users and tokens** below, and point each one at `/api`.
 If `loginctl enable-linger` needs a password, `service add` says so: run
 it with sudo so the tracker keeps running when you're logged out.
 
-Updating later: take a backup (`agent-tickets --export
-~/backups/agent-tickets/`), then `pipx upgrade agent-tickets && systemctl
---user restart agent-tickets`.
+Updating later: take a backup (`hearthboard --export
+~/backups/hearthboard/`), then `pipx upgrade hearthboard && systemctl
+--user restart hearthboard`.
 
-**From a git checkout** instead: `python3 agent_tickets.py` works the
-same way (`python3 agent_tickets.py service add`), and keeps its data in
+**From a git checkout** instead: `python3 hearthboard.py` works the
+same way (`python3 hearthboard.py service add`), and keeps its data in
 `data/` beside the file if that folder exists. Moving an existing checkout
-install to pip: `pipx install agent-tickets && agent-tickets service add`.
+install to pip: `pipx install hearthboard && hearthboard service add`.
 It replaces the old service but keeps its data folder, address and port.
+
+**Coming from agent-tickets?** Everything carries over: `pipx install
+hearthboard && hearthboard service add` stops and replaces the old
+`agent-tickets` service, keeping its data folder, address, port and backup
+folder. Old backups still import, the `AT_*` environment variables still
+work, and tokens and browser sign-ins are unchanged.
 
 ## Statuses
 
@@ -263,11 +271,11 @@ Only a hash of each token is stored (not in the database, not in backups),
 so a token is shown once, when it's made. Lost one? Issue a new one.
 
 ```bash
-agent-tickets --add-user frank --kind human     # the first human: prints their token
-agent-tickets --add-user agent-1                # an agent (the default kind)
-agent-tickets --list-users
-agent-tickets --new-token agent-1               # replace a token
-agent-tickets --disable agent-1                 # and --enable
+hearthboard --add-user frank --kind human     # the first human: prints their token
+hearthboard --add-user agent-1                # an agent (the default kind)
+hearthboard --list-users
+hearthboard --new-token agent-1               # replace a token
+hearthboard --disable agent-1                 # and --enable
 ```
 
 After that, humans can do the same from the **Users** page. Agents send
@@ -280,24 +288,24 @@ folder; hand each agent only its own token.
 ## Run it
 
 ```bash
-agent-tickets                            # http://127.0.0.1:43917
-agent-tickets --add-user NAME --kind human   # once, for yourself
+hearthboard                            # http://127.0.0.1:43917
+hearthboard --add-user NAME --kind human   # once, for yourself
 ```
 
 Then open `http://127.0.0.1:43917/?key=<your token>`.
 
 | Option | Default | |
 |---|---|---|
-| `--host` / `AT_HOST` | `127.0.0.1` | `0.0.0.0` to reach it from the LAN |
-| `--port` / `AT_PORT` | `43917` | |
-| `--data` / `AT_DATA` | `data/` beside the file if it exists, else `~/.local/share/agent-tickets` | the database (tickets, users) and uploaded files |
-| `--max-upload-mb` | `1024` | per file |
+| `--host` / `HEARTHBOARD_HOST` | `127.0.0.1` | `0.0.0.0` to reach it from the LAN |
+| `--port` / `HEARTHBOARD_PORT` | `43917` | |
+| `--data` / `HEARTHBOARD_DATA` | `data/` beside the file if it exists, else `~/.local/share/hearthboard` | the database (tickets, users) and uploaded files |
+| `--max-upload-mb` / `HEARTHBOARD_MAX_UPLOAD_MB` | `1024` | per file |
 
 As a service (systemd user units, started at boot when lingering is on):
-`agent-tickets service add`, with `--host`, `--port` and `--data` as above
+`hearthboard service add`, with `--host`, `--port` and `--data` as above
 and `--backups DIR` / `--keep N` for the nightly backup. Run it again to
-change any of them; `agent-tickets service remove` stops and removes both
-(your data stays). Logs: `journalctl --user -u agent-tickets`.
+change any of them; `hearthboard service remove` stops and removes both
+(your data stays). Logs: `journalctl --user -u hearthboard`.
 
 ## Backups
 
@@ -307,15 +315,15 @@ version) plus `files/` (the uploads). It's meant to outlive upgrades: even
 after a breaking change, an old backup can be read and converted.
 
 ```bash
-agent-tickets --export backups/            # into a folder, as agent-tickets-<time>.tar.gz (keeps 30)
-agent-tickets --export ticket-backup.tar.gz
-agent-tickets --data fresh-data --import ticket-backup.tar.gz   # restore (ids kept)
-agent-tickets --import FILE --replace      # restore over existing tickets
+hearthboard --export backups/            # into a folder, as hearthboard-<time>.tar.gz (keeps 30)
+hearthboard --export ticket-backup.tar.gz
+hearthboard --data fresh-data --import ticket-backup.tar.gz   # restore (ids kept)
+hearthboard --import FILE --replace      # restore over existing tickets
 ```
 
 From the pages: **Done → Download a backup** (`GET /api/export`, human key
-only). `agent-tickets service add` also sets up a nightly backup (a systemd
-user timer) into `~/backups/agent-tickets/` at 03:30, keeping the last 30.
+only). `hearthboard service add` also sets up a nightly backup (a systemd
+user timer) into `~/backups/hearthboard/` at 03:30, keeping the last 30.
 They're on the same disk as the data, so copy them somewhere else too.
 
 ## Pages
@@ -387,7 +395,7 @@ python3 -m unittest -v
 ## Releasing
 
 Releases go to PyPI from GitHub Actions with Trusted Publishing (no token
-stored), the same way as hobkin: bump `__version__` in `agent_tickets.py`,
+stored), the same way as hobkin: bump `__version__` in `hearthboard.py`,
 commit and push, then publish a GitHub release tagged `vX.Y.Z` to match. The
 workflow tests on Python 3.9, 3.12 and 3.14, checks the tag, builds and
 uploads. Running it by hand (Actions → Publish → Run workflow) goes to

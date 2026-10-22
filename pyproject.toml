@@ -3,9 +3,9 @@ requires = ["flit_core>=3.12,<4"]
 build-backend = "flit_core.buildapi"
 
 [project]
-name = "agent-tickets"
+name = "hearthboard"
 description = "A small ticket tracker for AI agents and the human who reviews their work: one stdlib-only file, SQLite, server-rendered pages and a JSON API."
-dynamic = ["version"]   # from agent_tickets.__version__
+dynamic = ["version"]   # from hearthboard.__version__
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -31,15 +31,15 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/frank-lynam/agent-tickets"
-Issues = "https://github.com/frank-lynam/agent-tickets/issues"
+Homepage = "https://github.com/frank-lynam/hearthboard"
+Issues = "https://github.com/frank-lynam/hearthboard/issues"
 
 [project.scripts]
-agent-tickets = "agent_tickets:cli"
+hearthboard = "hearthboard:cli"
 
 [tool.flit.module]
-name = "agent_tickets"
+name = "hearthboard"
 
 [tool.flit.sdist]
-include = ["test_agent_tickets.py"]
+include = ["test_hearthboard.py"]
 exclude = ["CLAUDE.md", "AGENTS.md", "data/"]

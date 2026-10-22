@@ -1,4 +1,4 @@
-"""Tests for agent_tickets.py: a real server on a temporary folder, driven
+"""Tests for hearthboard.py: a real server on a temporary folder, driven
 over HTTP. Standard library only:  python3 -m unittest -v"""
 import io
 import os
@@ -15,7 +15,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-import agent_tickets as at
+import hearthboard as at
 
 
 class TicketsTest(unittest.TestCase):
@@ -347,7 +347,7 @@ class TicketsTest(unittest.TestCase):
             backup.write_bytes(blob)
             with tarfile.open(backup) as tar:
                 doc = json.load(tar.extractfile("export.json"))
-                self.assertEqual((doc["format"], doc["version"]), ("agent-tickets-export", 1))
+                self.assertEqual((doc["format"], doc["version"]), ("hearthboard-export", 1))
                 self.assertIn("files/", " ".join(tar.getnames()))
             # Restore into a fresh data folder: every row and file comes back as it was.
             fresh = at.Store(Path(tmp) / "data")
@@ -370,9 +370,11 @@ class TicketsTest(unittest.TestCase):
             for i in range(3):
                 dest, counts, pruned = at.export_to(self.srv.store, tmp + "/", keep=2)
                 (Path(tmp) / f"agent-tickets-0000000{i}-000000.tar.gz").write_bytes(b"old")
-            names = sorted(p.name for p in Path(tmp).glob("agent-tickets-*.tar.gz"))
+            # Backups named before the rename (agent-tickets-...) are pruned along with the new ones
+            names = sorted(p.name for p in Path(tmp).glob("*.tar.gz"))
             self.assertEqual(len(names), 3)  # 2 kept by the last prune + the old one written after it
-            self.assertTrue(any(n.startswith("agent-tickets-2") for n in names))
+            self.assertTrue(any(n.startswith("hearthboard-2") for n in names), names)
+            self.assertNotIn("agent-tickets-00000000-000000.tar.gz", names)   # the oldest went, though it's old-named
             # A folder that doesn't exist yet, given with a trailing slash, is created.
             dest, _, _ = at.export_to(self.srv.store, tmp + "/new/sub/", keep=5)
             self.assertTrue((Path(tmp) / "new" / "sub").is_dir())
@@ -395,7 +397,7 @@ class TicketsTest(unittest.TestCase):
                 at.import_archive(store, archive({"format": "something-else"}))
             with self.assertRaises(ValueError):
                 at.import_archive(store, archive({"format": "agent-tickets-export", "version": 99, "tables": {}}))
-            # A file trying to escape the data folder is skipped.
+            # A file trying to escape the data folder is skipped. (A backup from before the rename.)
             ok = {"format": "agent-tickets-export", "version": 1, "tables": {}}
             at.import_archive(store, archive(ok, {"files/../../escaped.txt": b"x", "files/T/ok.txt": b"y"}))
             self.assertFalse((Path(tmp) / "escaped.txt").exists())
@@ -468,7 +470,7 @@ class TicketsTest(unittest.TestCase):
         self.assertIn("signed in as **tester** (agent)", mine)
         self.assertIn(f"{t['id']}: Briefing example", mine)
         # An agent calling the base URL gets the briefing, not the web page; a human gets the page.
-        self.assertIn("# Agent tickets: a briefing", self.call("GET", "/")[1].decode())
+        self.assertIn("# Hearthboard: a briefing", self.call("GET", "/")[1].decode())
         self.assertIn("<html", self.call("GET", "/", role="human")[1].decode())
         # Errors point at the briefing.
         self.assertIn("GET /api", self.j("GET", "/api/tickets", role=None)[1]["error"])
@@ -1611,7 +1613,7 @@ class TicketsTest(unittest.TestCase):
         code, body, h = self.call("GET", "/api/skill", role="agent", headers={"Host": "tickets.example:43917"})
         text = body.decode()
         self.assertEqual(code, 200)
-        self.assertTrue(text.startswith("---\nname: agent-tickets\ndescription: "))
+        self.assertTrue(text.startswith("---\nname: hearthboard\ndescription: "))
         self.assertIn("http://tickets.example:43917", text)
         self.assertIn("$AGENT_TICKETS_TOKEN", text)
         self.assertNotIn(self.keys["agent"], text)
@@ -1655,24 +1657,29 @@ class DataFolderTest(unittest.TestCase):
 
     def where(self, folder, **env):
         import shutil as _shutil
-        _shutil.copy(Path(__file__).resolve().parent / "agent_tickets.py", folder)
-        clean = {k: v for k, v in os.environ.items() if k not in ("AT_DATA", "XDG_DATA_HOME")}
-        r = subprocess.run([sys.executable, "-c", "import agent_tickets; print(agent_tickets.default_data_dir())"],
+        _shutil.copy(Path(__file__).resolve().parent / "hearthboard.py", folder)
+        clean = {k: v for k, v in os.environ.items() if k not in ("AT_DATA", "HEARTHBOARD_DATA", "XDG_DATA_HOME")}
+        r = subprocess.run([sys.executable, "-c", "import hearthboard; print(hearthboard.default_data_dir())"],
                            cwd=folder, env={**clean, **env}, capture_output=True, text=True, check=True)
         return r.stdout.strip()
 
     def test_default_data_folder(self):
         with tempfile.TemporaryDirectory() as tmp:
             xdg = os.path.join(tmp, "xdg")
-            self.assertEqual(self.where(tmp, XDG_DATA_HOME=xdg), os.path.join(xdg, "agent-tickets"))
+            self.assertEqual(self.where(tmp, XDG_DATA_HOME=xdg), os.path.join(xdg, "hearthboard"))
             os.mkdir(os.path.join(tmp, "data"))                       # a git checkout that already has data
             self.assertEqual(os.path.realpath(self.where(tmp, XDG_DATA_HOME=xdg)), os.path.realpath(os.path.join(tmp, "data")))
-            self.assertEqual(self.where(tmp, AT_DATA="/srv/at"), "/srv/at")
+            self.assertEqual(self.where(tmp, HEARTHBOARD_DATA="/srv/hb"), "/srv/hb")
+            self.assertEqual(self.where(tmp, AT_DATA="/srv/at"), "/srv/at")      # the name before the rename
 
     def test_version(self):
-        out = subprocess.run([sys.executable, str(Path(__file__).resolve().parent / "agent_tickets.py"), "--version"],
+        out = subprocess.run([sys.executable, str(Path(__file__).resolve().parent / "hearthboard.py"), "--version"],
                              capture_output=True, text=True).stdout
-        self.assertRegex(out, r"^agent-tickets \d+\.\d+\.\d+")
+        self.assertRegex(out, r"^hearthboard \d+\.\d+\.\d+")
+        # The old name keeps working for services and scripts that still run agent_tickets.py
+        old = subprocess.run([sys.executable, str(Path(__file__).resolve().parent / "agent_tickets.py"), "--version"],
+                             capture_output=True, text=True).stdout
+        self.assertEqual(old, out)
 
 
 if __name__ == "__main__":

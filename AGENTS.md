@@ -1,10 +1,10 @@
-# Working on agent-tickets
+# Working on hearthboard
 
 This file is for agents changing this repo. Agents *using* the tracker
 read `GET /api` on the running server instead.
 
 - **Standard library only.** No pip installs, no frameworks, no build
-  step, no CDN assets in the pages. It's one file, `agent_tickets.py`;
+  step, no CDN assets in the pages. It's one file, `hearthboard.py`;
   keep it that way unless it truly outgrows it.
 - **Tests:** `python3 -m unittest -v`. They start a real server on a
   temporary folder. Add a test for every behaviour you change, and run
@@ -30,7 +30,7 @@ read `GET /api` on the running server instead.
   humans manage users or export; the last active human can't be disabled.
   Tokens are stored only as hashes and never appear in logs or backups.
 - **Data** lives in `data/` beside the file in a git checkout (gitignored), or
-  `~/.local/share/agent-tickets` when installed (`default_data_dir()`): `tickets.db` (tickets and
+  `~/.local/share/hearthboard` when installed (`default_data_dir()`): `tickets.db` (tickets and
   users) and `files/`. Schema changes must keep existing databases working:
   `CREATE TABLE IF NOT EXISTS` plus additive `ALTER TABLE`s, never a
   rebuild.
@@ -43,8 +43,13 @@ read `GET /api` on the running server instead.
 - **Pages** are server-rendered HTML with a little inline JavaScript.
   Escape everything user- or agent-written (`esc()`), and check new
   pages at phone width.
-- **Packaging:** it's on PyPI as `agent-tickets` (`pyproject.toml`, the
-  `agent-tickets` command is `cli()`). Releases: bump `__version__`, push,
+- **The name:** it was agent-tickets until 0.1.0; `agent_tickets.py` is only a
+  shim that runs `hearthboard.py`, so old service files and scripts keep working.
+  Keep accepting the old names: `AT_*` variables, `agent-tickets-export` backups,
+  `agent-tickets-*.tar.gz` in backup folders, and `agent-tickets.service` (which
+  `service add` replaces).
+- **Packaging:** it's on PyPI as `hearthboard` (`pyproject.toml`, the
+  `hearthboard` command is `cli()`). Releases: bump `__version__`, push,
   and the owner publishes a GitHub release `vX.Y.Z` (see README "Releasing").
 - The owner runs the live instance under their own account: don't start,
   restart or touch it or its data. Test on a throwaway server
