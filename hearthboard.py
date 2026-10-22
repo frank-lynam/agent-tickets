@@ -2606,7 +2606,7 @@ def render_users(store, me):
                     f'<span class="chip {"s-in_progress" if u["kind"] == "human" else "s-ready"}">{u["kind"]}</span> {state}'
                     f'<div class="meta">added {when(u["created_at"])}{" by " + esc(u["created_by"]) if u["created_by"] else ""}'
                     f' · last seen {seen}</div></div><div class="row">'
-                    f"<button onclick='newToken({esc(name)})'>New token</button>"
+                    f"<button onclick='newToken({esc(name)}, {esc(json.dumps(u['kind']))})'>New token</button>"
                     f"<button onclick='toggleUser({esc(name)}, {str(not u['disabled']).lower()})'>{toggle}</button></div></div>")
     body = f"""<h1>Users</h1>
 <p class="meta">Humans can do anything, including managing users. Agents use the API: they can move tickets between
@@ -2614,26 +2614,31 @@ Ready, In progress and Needs review, and comment. Each user has their own token;
 token is shown once, when it's made. Give agents theirs as <code>Authorization: Bearer &lt;token&gt;</code>.</p>
 <div id="tok" class="box" hidden style="margin-bottom:14px;border-color:var(--ready)"><b id="tokwho"></b>
 <p class="meta">Copy it now: it won't be shown again.</p><div class="row"><input type="text" id="tokval" readonly>
-<button class="primary" onclick="copyTok()">Copy</button></div></div>
+<button class="primary" onclick="copyTok('tokval')">Copy</button></div>
+<div id="hobkin" hidden><p class="meta">To run this agent with <a href="https://github.com/frank-lynam/hobkin">hobkin</a>, on
+the machine it'll work on (add <code>API_URL MODEL KEY</code> in front the first time, to set up its model):</p>
+<div class="row"><input type="text" id="hobkincmd" readonly><button onclick="copyTok('hobkincmd')">Copy</button></div></div></div>
 <div class="list">{"".join(rows)}</div>
 <h2>Add a user</h2><form class="row box" id="uf"><input type="text" id="uname" placeholder="name, e.g. agent-1"
  aria-label="Username" style="flex:1;min-width:160px" required><select id="ukind" style="width:auto" aria-label="Kind">
  <option value="agent">Agent</option><option value="human">Human</option><option value="guest">Guest (read-only)</option></select><button class="primary">Add</button></form>
 <script>
 const $ = (id) => document.getElementById(id);
-function showTok(who, token) {{ $('tok').hidden = false; $('tokwho').textContent = 'Token for ' + who; $('tokval').value = token;
+function showTok(who, token, agent) {{ $('tok').hidden = false; $('tokwho').textContent = 'Token for ' + who; $('tokval').value = token;
+  $('hobkin').hidden = !agent;
+  if (agent) $('hobkincmd').value = 'hobkin --hearthboard ' + location.origin + ' ' + token + ' --id ' + agent;
   $('tokval').select(); window.scrollTo(0, 0); }}
-async function copyTok() {{ try {{ await navigator.clipboard.writeText($('tokval').value); }} catch (e) {{ $('tokval').select(); }} }}
-async function newToken(name) {{
+async function copyTok(id) {{ try {{ await navigator.clipboard.writeText($(id).value); }} catch (e) {{ $(id).select(); }} }}
+async function newToken(name, kind) {{
   if (!confirm('Give ' + name + ' a new token? Their current one stops working immediately.')) return;
-  try {{ const r = await api('POST', '/api/users/' + encodeURIComponent(name) + '/token'); showTok(name, r.token); }} catch (e) {{ fail(e); }}
+  try {{ const r = await api('POST', '/api/users/' + encodeURIComponent(name) + '/token'); showTok(name, r.token, kind === 'agent' ? name : ''); }} catch (e) {{ fail(e); }}
 }}
 async function toggleUser(name, disable) {{
   try {{ await api('PATCH', '/api/users/' + encodeURIComponent(name), {{disabled: disable}}); location.reload(); }} catch (e) {{ fail(e); }}
 }}
 $('uf').onsubmit = async (e) => {{ e.preventDefault();
   try {{ const r = await api('POST', '/api/users', {{username: $('uname').value.trim(), kind: $('ukind').value}});
-    showTok(r.user.username + ' (' + r.user.kind + ')', r.token); $('uname').value = '';
+    showTok(r.user.username + ' (' + r.user.kind + ')', r.token, r.user.kind === 'agent' ? r.user.username : ''); $('uname').value = '';
     const note = document.createElement('p'); note.className = 'meta'; note.textContent = 'Reload to see them in the list.';
     $('tok').appendChild(note); }} catch (err) {{ fail(err); }} }};
 </script>"""
@@ -3619,8 +3624,9 @@ description: Work with the hearthboard server at {base} - take tickets, comment,
 
 # Hearthboard ({base})
 
-Every request: `Authorization: Bearer $AGENT_TICKETS_TOKEN`. Keep the token in that environment variable (or
-your harness's secret store); never write it into files, comments, chat or this skill.
+Every request: `Authorization: Bearer $HEARTHBOARD_TOKEN` (set up before the rename: `$AGENT_TICKETS_TOKEN`). Keep
+the token in that environment variable (or your harness's secret store); never write it into files, comments,
+chat or this skill.
 
 The full briefing, with every rule and endpoint: `GET {base}/api`. Re-read it when something here isn't
 enough, or a request fails in a way you don't understand. Errors come back as `{{"error": "..."}}`.
@@ -3720,8 +3726,9 @@ If your harness supports skills or saved instructions (Claude Code:
 `~/.claude/skills/hearthboard/SKILL.md`, or the project's
 `.claude/skills/`), make one now: `GET /api/skill` returns a ready-made
 SKILL.md for this server. Save it as is, or adapt it to your harness. Keep
-your token out of it: put the token in the `AGENT_TICKETS_TOKEN` environment
-variable or your harness's secret store. Then you won't need to re-read this
+your token out of it: put the token in the `HEARTHBOARD_TOKEN` environment
+variable or your harness's secret store. (On hobkin, `hobkin --hearthboard URL
+TOKEN` does all of this for you.) Then you won't need to re-read this
 briefing each time; the skill points back here for the details.
 
 ## Signing in
@@ -5012,6 +5019,10 @@ def main():
             if a.add_user:
                 u, token = store.add_user(a.add_user, a.kind, "command line")
                 print(f"Added {u['kind']} {u['username']}. Their token (shown once):\n{token}")
+                if u["kind"] == "agent":
+                    print(f"To run it with hobkin, on the machine it'll work on:\n"
+                          f"  hobkin --hearthboard http://THIS-SERVER:{a.port} {token} --id {u['username']}\n"
+                          f"(the first time there, put API_URL MODEL KEY in front to set up its model)")
             elif a.new_token:
                 print(f"New token for {a.new_token} (the old one no longer works):\n{store.new_user_token(a.new_token)}")
             elif a.disable or a.enable:

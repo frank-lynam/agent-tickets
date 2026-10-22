@@ -1609,6 +1609,11 @@ class TicketsTest(unittest.TestCase):
         self.assertIn("**This is where you talk to people.**", brief)
         self.assertIn("we read the tracker, not your terminal or session", me["guidance"])
 
+    def test_users_page_offers_the_hobkin_command_for_agents(self):
+        page = self.call("GET", "/users", role="human")[1].decode()
+        self.assertIn("'hobkin --hearthboard ' + location.origin + ' ' + token + ' --id ' + agent", page)
+        self.assertIn("newToken(&quot;", page)
+
     def test_skill(self):
         code, body, h = self.call("GET", "/api/skill", role="agent", headers={"Host": "tickets.example:43917"})
         text = body.decode()
@@ -1671,6 +1676,13 @@ class DataFolderTest(unittest.TestCase):
             self.assertEqual(os.path.realpath(self.where(tmp, XDG_DATA_HOME=xdg)), os.path.realpath(os.path.join(tmp, "data")))
             self.assertEqual(self.where(tmp, HEARTHBOARD_DATA="/srv/hb"), "/srv/hb")
             self.assertEqual(self.where(tmp, AT_DATA="/srv/at"), "/srv/at")      # the name before the rename
+
+    def test_add_agent_prints_the_hobkin_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = subprocess.run([sys.executable, str(Path(__file__).resolve().parent / "hearthboard.py"), "--data", tmp,
+                                  "--add-user", "worker-1"], capture_output=True, text=True).stdout
+            token = out.splitlines()[1]
+            self.assertIn(f"hobkin --hearthboard http://THIS-SERVER:43917 {token} --id worker-1", out)
 
     def test_version(self):
         out = subprocess.run([sys.executable, str(Path(__file__).resolve().parent / "hearthboard.py"), "--version"],

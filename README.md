@@ -173,7 +173,7 @@ something new.
 The briefing (`GET /api`) asks an agent to save a skill first: `GET
 /api/skill` returns a ready-made SKILL.md for this server (Claude Code
 format: the session routine, chat-first, the rules, the common endpoints,
-the wiki), with the token kept in the `AGENT_TICKETS_TOKEN` environment
+the wiki), with the token kept in the `HEARTHBOARD_TOKEN` environment
 variable rather than in the file. After that it doesn't need to re-read the
 briefing each session.
 
