@@ -81,7 +81,7 @@ PAGE = 20  # comments or messages shown (and returned) at a time; older ones on 
 AGENT_TARGETS = {"ready", "in_progress", "review"}  # statuses an agent may set
 AGENT_LOCKED = {"backlog", "done"}                  # tickets an agent may only comment on
 PRIORITIES = {1: "High", 2: "Normal", 3: "Low"}
-COOKIE = "at_key"
+COOKIE = "hb_key"
 CHUNK = 1 << 16
 
 # Ticket ids are two words, "amber-otter": one from each of these hand-picked
@@ -1901,6 +1901,10 @@ form.stack{display:grid;gap:8px}
 .detail{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:20px}
 @media (max-width:800px){.detail{grid-template-columns:1fr}}
 .box{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}
+.login{max-width:420px;margin:12vh auto 0;padding:0 16px}
+.login form{display:flex;flex-direction:column;gap:10px}
+.login input[type=password]{width:100%;font:15px system-ui,sans-serif;padding:10px;border-radius:7px;border:1px solid var(--line);background:var(--bg);color:var(--ink)}
+.login-error{color:var(--review);margin:0}
 .desc{overflow-wrap:anywhere}
 .md p{white-space:pre-wrap;overflow-wrap:anywhere;margin:0 0 8px}.md>:last-child{margin-bottom:0}
 :is(.md,.wk) :is(ul,ol){margin:0 0 8px;padding-left:1.5em}:is(.md,.wk) li{margin:2px 0;white-space:pre-wrap;overflow-wrap:anywhere}
@@ -2681,11 +2685,36 @@ def render_settings(role, prefs):
            f'onchange="setTts(this.checked)"><span><b>Read aloud on tap</b><br><span class="meta">Tap a comment, chat '
            f'message or ticket description to hear its text; tap again to stop. Saved for your account, on every '
            f'device.</span></span></label><p class="meta" id="tts-none" hidden>This browser can\'t read aloud.</p></div>')
+    signout = ('<h2>Account</h2><form method="post" action="/logout"><button>Sign out</button></form>'
+               '<p class="meta">Signs this browser out. Your key keeps working; to stop it, give yourself a new one on '
+               'the Users page.</p>')
     body = (f'<h1>Settings</h1>{tts}<h2>Theme</h2><p class="meta">Saved in this browser.</p><div class="themes">{themes}</div>'
             f'{team}<h2>For agents</h2><div class="list">'
             '<div class="item"><a href="/api"><b>The agent briefing</b><div class="meta">What agents read to learn this '
-            'system (GET /api).</div></a></div></div><script>' + SETTINGS_JS + '</script>')
+            'system (GET /api).</div></a></div></div>' + signout + '<script>' + SETTINGS_JS + '</script>')
     return body
+
+
+def render_login(error="", next_="/"):
+    """The sign-in page: paste your key. Agents don't use it; they send their token as a Bearer header."""
+    err = f'<p class="login-error" role="alert">{esc(error)}</p>' if error else ""
+    return (f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
+            f'<meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in · Hearthboard</title>'
+            f'<style>{CSS}</style><script>{JS}</script></head><body><main class="login">'
+            f'<h1>Hearthboard</h1><form class="box" method="post" action="/login">'
+            f'<label for="key"><b>Your key</b></label>'
+            f'<p class="meta">The token you were given when your user was made. Your browser keeps you signed in.</p>'
+            f'<input type="password" id="key" name="key" autocomplete="current-password" required autofocus>'
+            f'<input type="hidden" name="next" value="{esc(next_)}">{err}'
+            f'<button class="primary">Sign in</button></form>'
+            f'<p class="meta">Lost your key? Someone with a human account can give you a new one on the Users page. '
+            f'AI agents: read <a href="/api">/api</a>.</p></main></body></html>')
+
+
+def safe_next(target):
+    """Where to go after signing in: a path on this site only."""
+    target = (target or "/").strip()
+    return target if target.startswith("/") and not target.startswith("//") and "\\" not in target else "/"
 
 
 def render_guidance(store):
@@ -4291,8 +4320,6 @@ class Handler(BaseHTTPRequestHandler):
         auth = self.headers.get("Authorization", "")
         if auth.startswith("Bearer "):
             given = auth[7:].strip()
-        elif query.get("key"):
-            given = query["key"][0]
         else:
             c = SimpleCookie(self.headers.get("Cookie", "")).get(COOKIE)
             given = c.value if c else None
@@ -4349,6 +4376,28 @@ class Handler(BaseHTTPRequestHandler):
         self.send(code, json.dumps(obj, default=str), "application/json; charset=utf-8", extra)
         if self.command not in ("GET", "HEAD") and code < 400:
             self.server.store.bump()  # wake anyone waiting in /api/wait
+
+    def redirect(self, location, cookie=None):
+        self.send_response(303)
+        self.send_header("Location", location)
+        if cookie:
+            self.send_header("Set-Cookie", cookie)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def sign_in(self):
+        """POST /login: the pasted key, checked; on success a cookie, and back to where they were going."""
+        n = int(self.headers.get("Content-Length") or 0)
+        if n > 4096:
+            raise ApiError(413, "that's not a key")
+        form = parse_qs(self.rfile.read(n).decode(errors="replace"))
+        key = (form.get("key") or [""])[0].strip()
+        nxt = safe_next((form.get("next") or ["/"])[0])
+        if not key or not self.server.store.user_by_token(key):
+            return self.send(401, render_login("That key didn't work: check you copied all of it, or ask for a new "
+                                               "one.", nxt), "text/html; charset=utf-8", {"Cache-Control": "no-store"})
+        secure = "; Secure" if self.headers.get("X-Forwarded-Proto") == "https" else ""
+        self.redirect(nxt, cookie=f"{COOKIE}={key}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax{secure}")
 
     def html(self, body):
         role, actor = getattr(self, "who_is", (None, None))
@@ -4457,22 +4506,18 @@ class Handler(BaseHTTPRequestHandler):
             if method == "GET" and (path == "/api" or (path == "/" and bearer and role == "agent")):
                 return self.send(200, docs_for(store, actor, role), "text/markdown; charset=utf-8",
                                  {"Cache-Control": "no-store"})
+            if path == "/login" and method == "GET":
+                return self.send(200, render_login(next_=safe_next((query.get("next") or ["/"])[0])),
+                                 "text/html; charset=utf-8", {"Cache-Control": "no-store"})
+            if path == "/login" and method == "POST":
+                return self.sign_in()
+            if path == "/logout" and method == "POST":
+                return self.redirect("/login", cookie=f"{COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
             if role is None:
-                if path.startswith(("/api", "/files", "/chat-files")):
+                if path.startswith(("/api", "/files", "/chat-files")) or method not in ("GET", "HEAD"):
                     raise ApiError(401, "missing, wrong or disabled token (Authorization: Bearer <token>). "
                                         "How this works: GET /api")
-                return self.send(401, page("Locked", "<h1>Locked</h1><p>Open this page once with "
-                                           "<code>?key=…</code> (your token) to sign in.</p>"
-                                           "<p class='meta'>AI agents: read <a href='/api'>/api</a>.</p>"),
-                                 "text/html; charset=utf-8")
-            if "key" in query and method == "GET" and not path.startswith("/api"):
-                # Trade the key in the URL for a cookie, then drop it from the address bar.
-                secure = "; Secure" if self.headers.get("X-Forwarded-Proto") == "https" else ""
-                self.send_response(303)
-                self.send_header("Location", path)
-                self.send_header("Set-Cookie", f"{COOKIE}={query['key'][0]}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax{secure}")
-                self.send_header("Content-Length", "0")
-                return self.end_headers()
+                return self.redirect("/login?next=" + quote(path + (f"?{url.query}" if url.query else ""), safe=""))
             # Guests read; the only thing they can change is their own display settings.
             if role == "guest" and (method not in ("GET", "HEAD") and path != "/api/me/prefs"
                                     or path in ("/new", "/wiki-new")):

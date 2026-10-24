@@ -12,6 +12,7 @@ import time
 import threading
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -63,29 +64,47 @@ class TicketsTest(unittest.TestCase):
         return t
 
     # --- auth
+    def no_redirect(self, method, path, body=None, headers=None):
+        """A request whose redirect isn't followed: (status, headers, body)."""
+        class Stop(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *a, **k):
+                return None
+        req = urllib.request.Request(self.url + path, data=body, method=method, headers=headers or {})
+        try:
+            with urllib.request.build_opener(Stop).open(req) as r:
+                return r.status, r.headers, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.headers, e.read()
+
     def test_needs_a_key(self):
         self.assertEqual(self.call("GET", "/api/tickets", role=None)[0], 401)
         self.assertEqual(self.call("GET", "/api/tickets", role=None, headers={"Authorization": "Bearer nope"})[0], 401)
-        self.assertEqual(self.call("GET", "/", role=None)[0], 401)
+        code, h, _ = self.no_redirect("GET", "/backlog?q=x")
+        self.assertEqual((code, h["Location"]), (303, "/login?next=%2Fbacklog%3Fq%3Dx"))
 
-    def test_key_in_url_becomes_a_cookie(self):
-        opener = urllib.request.build_opener(urllib.request.HTTPRedirectHandler)
-        req = urllib.request.Request(self.url + "/?key=" + self.keys["human"])
-        class NoRedirect(urllib.request.HTTPRedirectHandler):
-            def redirect_request(self, *a, **k):
-                return None
-        try:
-            urllib.request.build_opener(NoRedirect).open(req)
-            self.fail("expected a redirect")
-        except urllib.error.HTTPError as e:
-            self.assertEqual(e.code, 303)
-            self.assertEqual(e.headers["Location"], "/")
-            cookie = e.headers["Set-Cookie"]
+    def test_sign_in_with_a_pasted_key(self):
+        code, _, body = self.no_redirect("GET", "/login?next=/chat")
+        self.assertEqual(code, 200)
+        self.assertIn(b'type="password"', body)
+        self.assertIn(b'name="next" value="/chat"', body)
+        form = lambda key, nxt="/chat": urllib.parse.urlencode({"key": key, "next": nxt}).encode()
+        code, _, body = self.no_redirect("POST", "/login", form("at_wrong"))
+        self.assertEqual(code, 401)
+        self.assertIn(b"That key didn", body)
+        self.assertEqual(self.no_redirect("POST", "/login", form(self.keys["human"], "//evil.example"))[1]["Location"], "/")
+        code, h, _ = self.no_redirect("POST", "/login", form(" " + self.keys["human"] + "\n"))
+        self.assertEqual((code, h["Location"]), (303, "/chat"))
+        cookie = h["Set-Cookie"]
         self.assertIn("HttpOnly", cookie)
         value = cookie.split(";")[0]
         code, body, _ = self.call("GET", "/", role=None, headers={"Cookie": value})
         self.assertEqual(code, 200)
         self.assertIn(b"In flight", body)
+        self.assertIn(b'action="/logout"', self.call("GET", "/settings", role=None, headers={"Cookie": value})[1])
+        # The key in the address bar no longer signs anyone in
+        self.assertEqual(self.no_redirect("GET", "/?key=" + self.keys["human"])[0], 303)
+        # Signing out clears the cookie
+        self.assertIn("Max-Age=0", self.no_redirect("POST", "/logout", headers={"Cookie": value})[1]["Set-Cookie"])
         # Changes made with the cookie need the page's own header.
         self.assertEqual(self.call("POST", "/api/tickets", {"title": "x"}, role=None, headers={"Cookie": value})[0], 403)
         self.assertEqual(self.call("POST", "/api/tickets", {"title": "x"}, role=None,
