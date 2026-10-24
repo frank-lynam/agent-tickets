@@ -2620,7 +2620,8 @@ token is shown once, when it's made. Give agents theirs as <code>Authorization: 
 <p class="meta">Copy it now: it won't be shown again.</p><div class="row"><input type="text" id="tokval" readonly>
 <button class="primary" onclick="copyTok('tokval')">Copy</button></div>
 <div id="hobkin" hidden><p class="meta">To run this agent with <a href="https://github.com/frank-lynam/hobkin">hobkin</a>, on
-the machine it'll work on (add <code>API_URL MODEL KEY</code> in front the first time, to set up its model):</p>
+the machine it'll work on. For a hobkin you already have, change <code>--id</code> to its name; for a new one on a
+machine with no model set up yet, put <code>API_URL MODEL KEY</code> in front:</p>
 <div class="row"><input type="text" id="hobkincmd" readonly><button onclick="copyTok('hobkincmd')">Copy</button></div></div></div>
 <div class="list">{"".join(rows)}</div>
 <h2>Add a user</h2><form class="row box" id="uf"><input type="text" id="uname" placeholder="name, e.g. agent-1"
@@ -5036,7 +5037,8 @@ def main():
                 if u["kind"] == "agent":
                     print(f"To run it with hobkin, on the machine it'll work on:\n"
                           f"  hobkin --hearthboard http://THIS-SERVER:{a.port} {token} --id {u['username']}\n"
-                          f"(the first time there, put API_URL MODEL KEY in front to set up its model)")
+                          f"(for a hobkin you already have, change --id to its name; on a machine with no model "
+                          f"set up yet, put API_URL MODEL KEY in front)")
             elif a.new_token:
                 print(f"New token for {a.new_token} (the old one no longer works):\n{store.new_user_token(a.new_token)}")
             elif a.disable or a.enable:
