@@ -29,21 +29,29 @@ agents, see **Users and tokens** below, and point each one at `/api`.
 If `loginctl enable-linger` needs a password, `service add` says so: run
 it with sudo so the tracker keeps running when you're logged out.
 
-Updating later: take a backup (`hearthboard --export
-~/backups/hearthboard/`), then `pipx upgrade hearthboard && systemctl
---user restart hearthboard`.
+No pip? It's one file: `curl -O
+https://raw.githubusercontent.com/frank-lynam/hearthboard/main/hearthboard.py`,
+then `python3 hearthboard.py` wherever this says `hearthboard`.
 
-**From a git checkout** instead: `python3 hearthboard.py` works the
-same way (`python3 hearthboard.py service add`), and keeps its data in
-`data/` beside the file if that folder exists. Moving an existing checkout
-install to pip: `pipx install hearthboard && hearthboard service add`.
-It replaces the old service but keeps its data folder, address and port.
+hearthboard never changes an install on its own: no auto-updates, no
+migrations. `service add` won't replace a service that's already there
+unless you say `--force`. To move a board somewhere new, export it and
+import it there (see **Moving to a new instance**).
 
-**Coming from agent-tickets?** Everything carries over: `pipx install
-hearthboard && hearthboard service add` stops and replaces the old
-`agent-tickets` service, keeping its data folder, address, port and backup
-folder. Old backups still import, the `AT_*` environment variables still
-work, and tokens and browser sign-ins are unchanged.
+## Moving to a new instance
+
+One file carries the whole board: tickets, comments, files, history,
+chats, the wiki, settings and users. Users keep their tokens, so people and
+agents stay signed in.
+
+```bash
+hearthboard --export board.tar.gz                  # on the old one (or Settings → Export everything)
+hearthboard --import board.tar.gz                   # on the new one, before anyone uses it
+hearthboard service add                             # then run it
+```
+
+The import goes into an empty board (`--replace` to overwrite tickets that are
+already there). Ids are kept, so links and ticket names still work.
 
 ## Statuses
 
@@ -298,7 +306,7 @@ Then open `http://127.0.0.1:43917/?key=<your token>`.
 |---|---|---|
 | `--host` / `HEARTHBOARD_HOST` | `127.0.0.1` | `0.0.0.0` to reach it from the LAN |
 | `--port` / `HEARTHBOARD_PORT` | `43917` | |
-| `--data` / `HEARTHBOARD_DATA` | `data/` beside the file if it exists, else `~/.local/share/hearthboard` | the database (tickets, users) and uploaded files |
+| `--data` / `HEARTHBOARD_DATA` | `~/.local/share/hearthboard` | the database (tickets, users) and uploaded files |
 | `--max-upload-mb` / `HEARTHBOARD_MAX_UPLOAD_MB` | `1024` | per file |
 
 As a service (systemd user units, started at boot when lingering is on):
@@ -321,8 +329,8 @@ hearthboard --data fresh-data --import ticket-backup.tar.gz   # restore (ids kep
 hearthboard --import FILE --replace      # restore over existing tickets
 ```
 
-From the pages: **Done → Download a backup** (`GET /api/export`, human key
-only). `hearthboard service add` also sets up a nightly backup (a systemd
+From the pages: **Settings → Export everything** (`GET /api/export`, human
+key only). `hearthboard service add` also sets up a nightly backup (a systemd
 user timer) into `~/backups/hearthboard/` at 03:30, keeping the last 30.
 They're on the same disk as the data, so copy them somewhere else too.
 

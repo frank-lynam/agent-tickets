@@ -365,16 +365,51 @@ class TicketsTest(unittest.TestCase):
             at.import_archive(fresh, backup, replace=True)
             self.assertEqual(fresh.db().execute("SELECT COUNT(*) FROM tickets").fetchone()[0], counts["tickets"])
 
+    def test_move_to_a_new_instance(self):
+        """Export from one instance on the command line, import into a brand-new one: tickets, chats and users
+        all come across, and everyone's existing token still signs them in there."""
+        hb = str(Path(__file__).resolve().parent / "hearthboard.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            def serve(data):                 # its own board (the shared test board's file is read raw elsewhere)
+                srv = at.make_server("127.0.0.1", 0, Path(tmp) / data)
+                threading.Thread(target=srv.serve_forever, daemon=True).start()
+                return srv, f"http://127.0.0.1:{srv.server_address[1]}"
+            def call(url, method, path, key, body=None):
+                req = urllib.request.Request(url + path, method=method, data=json.dumps(body).encode() if body else None,
+                                             headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"})
+                with urllib.request.urlopen(req) as r:
+                    return json.loads(r.read())
+            old, url = serve("old")
+            try:
+                human = old.store.add_user("Frank", "human", "test")[1]
+                agent = old.store.add_user("tester", "agent", "test")[1]
+                t = call(url, "POST", "/api/tickets", human, {"title": "Moving house", "status": "ready"})
+                call(url, "POST", "/api/chat", human, {"members": ["tester"], "body": "see you on the new box"})
+                out = subprocess.run([sys.executable, hb, "--data", tmp + "/old", "--export", tmp + "/out/"],
+                                     capture_output=True, text=True, check=True).stdout
+            finally:
+                old.shutdown(); old.server_close()
+            self.assertIn("users", out)
+            backup = next(Path(tmp, "out").glob("hearthboard-*.tar.gz"))
+            subprocess.run([sys.executable, hb, "--data", tmp + "/new", "--import", str(backup)],
+                           capture_output=True, text=True, check=True)
+            new, url = serve("new")
+            try:
+                self.assertEqual(call(url, "GET", "/api/me", agent)["username"], "tester")
+                self.assertEqual(call(url, "GET", "/api/me", human)["username"], "Frank")
+                self.assertEqual(call(url, "GET", f"/api/tickets/{t['id']}", human)["title"], "Moving house")
+                self.assertIn("see you on the new box", json.dumps(call(url, "GET", "/api/chat", human)))
+            finally:
+                new.shutdown(); new.server_close()
+
     def test_export_folder_keeps_the_newest(self):
         with tempfile.TemporaryDirectory() as tmp:
             for i in range(3):
                 dest, counts, pruned = at.export_to(self.srv.store, tmp + "/", keep=2)
-                (Path(tmp) / f"agent-tickets-0000000{i}-000000.tar.gz").write_bytes(b"old")
-            # Backups named before the rename (agent-tickets-...) are pruned along with the new ones
-            names = sorted(p.name for p in Path(tmp).glob("*.tar.gz"))
+                (Path(tmp) / f"hearthboard-0000000{i}-000000.tar.gz").write_bytes(b"old")
+            names = sorted(p.name for p in Path(tmp).glob("hearthboard-*.tar.gz"))
             self.assertEqual(len(names), 3)  # 2 kept by the last prune + the old one written after it
-            self.assertTrue(any(n.startswith("hearthboard-2") for n in names), names)
-            self.assertNotIn("agent-tickets-00000000-000000.tar.gz", names)   # the oldest went, though it's old-named
+            self.assertTrue(any(n.startswith("hearthboard-2") for n in names))
             # A folder that doesn't exist yet, given with a trailing slash, is created.
             dest, _, _ = at.export_to(self.srv.store, tmp + "/new/sub/", keep=5)
             self.assertTrue((Path(tmp) / "new" / "sub").is_dir())
@@ -396,9 +431,9 @@ class TicketsTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 at.import_archive(store, archive({"format": "something-else"}))
             with self.assertRaises(ValueError):
-                at.import_archive(store, archive({"format": "agent-tickets-export", "version": 99, "tables": {}}))
-            # A file trying to escape the data folder is skipped. (A backup from before the rename.)
-            ok = {"format": "agent-tickets-export", "version": 1, "tables": {}}
+                at.import_archive(store, archive({"format": "hearthboard-export", "version": 99, "tables": {}}))
+            # A file trying to escape the data folder is skipped.
+            ok = {"format": "hearthboard-export", "version": 1, "tables": {}}
             at.import_archive(store, archive(ok, {"files/../../escaped.txt": b"x", "files/T/ok.txt": b"y"}))
             self.assertFalse((Path(tmp) / "escaped.txt").exists())
             self.assertFalse((store.dir / "escaped.txt").exists())
@@ -1620,7 +1655,7 @@ class TicketsTest(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertTrue(text.startswith("---\nname: hearthboard\ndescription: "))
         self.assertIn("http://tickets.example:43917", text)
-        self.assertIn("$AGENT_TICKETS_TOKEN", text)
+        self.assertIn("$HEARTHBOARD_TOKEN", text)
         self.assertNotIn(self.keys["agent"], text)
         brief = self.call("GET", "/api", role=None)[1].decode()
         self.assertLess(brief.index("GET /api/skill"), brief.index("## Signing in"))  # up front
@@ -1663,7 +1698,7 @@ class DataFolderTest(unittest.TestCase):
     def where(self, folder, **env):
         import shutil as _shutil
         _shutil.copy(Path(__file__).resolve().parent / "hearthboard.py", folder)
-        clean = {k: v for k, v in os.environ.items() if k not in ("AT_DATA", "HEARTHBOARD_DATA", "XDG_DATA_HOME")}
+        clean = {k: v for k, v in os.environ.items() if k not in ("HEARTHBOARD_DATA", "XDG_DATA_HOME")}
         r = subprocess.run([sys.executable, "-c", "import hearthboard; print(hearthboard.default_data_dir())"],
                            cwd=folder, env={**clean, **env}, capture_output=True, text=True, check=True)
         return r.stdout.strip()
@@ -1672,10 +1707,9 @@ class DataFolderTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             xdg = os.path.join(tmp, "xdg")
             self.assertEqual(self.where(tmp, XDG_DATA_HOME=xdg), os.path.join(xdg, "hearthboard"))
-            os.mkdir(os.path.join(tmp, "data"))                       # a git checkout that already has data
-            self.assertEqual(os.path.realpath(self.where(tmp, XDG_DATA_HOME=xdg)), os.path.realpath(os.path.join(tmp, "data")))
+            os.mkdir(os.path.join(tmp, "data"))              # a data/ folder beside the file isn't picked up
+            self.assertEqual(self.where(tmp, XDG_DATA_HOME=xdg), os.path.join(xdg, "hearthboard"))
             self.assertEqual(self.where(tmp, HEARTHBOARD_DATA="/srv/hb"), "/srv/hb")
-            self.assertEqual(self.where(tmp, AT_DATA="/srv/at"), "/srv/at")      # the name before the rename
 
     def test_add_agent_prints_the_hobkin_command(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1688,10 +1722,6 @@ class DataFolderTest(unittest.TestCase):
         out = subprocess.run([sys.executable, str(Path(__file__).resolve().parent / "hearthboard.py"), "--version"],
                              capture_output=True, text=True).stdout
         self.assertRegex(out, r"^hearthboard \d+\.\d+\.\d+")
-        # The old name keeps working for services and scripts that still run agent_tickets.py
-        old = subprocess.run([sys.executable, str(Path(__file__).resolve().parent / "agent_tickets.py"), "--version"],
-                             capture_output=True, text=True).stdout
-        self.assertEqual(old, out)
 
 
 if __name__ == "__main__":

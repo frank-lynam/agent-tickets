@@ -29,8 +29,8 @@ read `GET /api` on the running server instead.
   on the server. Only
   humans manage users or export; the last active human can't be disabled.
   Tokens are stored only as hashes and never appear in logs or backups.
-- **Data** lives in `data/` beside the file in a git checkout (gitignored), or
-  `~/.local/share/hearthboard` when installed (`default_data_dir()`): `tickets.db` (tickets and
+- **Data** lives in `$HEARTHBOARD_DATA`, else `~/.local/share/hearthboard`
+  (`default_data_dir()`): `tickets.db` (tickets and
   users) and `files/`. Schema changes must keep existing databases working:
   `CREATE TABLE IF NOT EXISTS` plus additive `ALTER TABLE`s, never a
   rebuild.
@@ -43,11 +43,11 @@ read `GET /api` on the running server instead.
 - **Pages** are server-rendered HTML with a little inline JavaScript.
   Escape everything user- or agent-written (`esc()`), and check new
   pages at phone width.
-- **The name:** it was agent-tickets until 0.1.0; `agent_tickets.py` is only a
-  shim that runs `hearthboard.py`, so old service files and scripts keep working.
-  Keep accepting the old names: `AT_*` variables, `agent-tickets-export` backups,
-  `agent-tickets-*.tar.gz` in backup folders, and `agent-tickets.service` (which
-  `service add` replaces).
+- **No auto-updates or migrations.** Never write code that detects an older
+  install and changes its files, services or data, and no legacy-name shims or
+  fallbacks. Assume a fresh install in an austere environment. Moving a board
+  is the owner's call, through `--export` / `--import`; `service add` leaves an
+  existing service alone unless given `--force`.
 - **Packaging:** it's on PyPI as `hearthboard` (`pyproject.toml`, the
   `hearthboard` command is `cli()`). Releases: bump `__version__`, push,
   and the owner publishes a GitHub release `vX.Y.Z` (see README "Releasing").

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""hearthboard (formerly agent-tickets): a small ticket tracker for AI agents and the human who
+"""hearthboard: a small ticket tracker for AI agents and the human who
 reviews their work. Python standard library only: a threaded HTTP server
 and an SQLite database.
 
@@ -10,8 +10,8 @@ and an SQLite database.
   hearthboard --export backups/   # back everything up (see "Backups")
   hearthboard --import FILE       # restore a backup into an empty data folder
 
-Data lives in $HEARTHBOARD_DATA (or the older $AT_DATA), else data/ next to
-this file if there is one (a git checkout), else ~/.local/share/hearthboard.
+Data lives in $HEARTHBOARD_DATA, else ~/.local/share/hearthboard. To move to a new
+instance: --export here, --import there (everything: tickets, chats, wiki, users).
 
 Tickets move through five statuses:
   backlog      an idea, not cleared for work yet
@@ -269,7 +269,7 @@ CREATE INDEX IF NOT EXISTS events_ticket ON events(ticket_id, at);
 
 
 # Bumped (with a migration in Store.__init__) whenever the tables change.
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 SCHEMA_VERSION = 10
 TABLES = ("users", "settings", "tickets", "deps", "comments", "attachments", "events",
@@ -1632,7 +1632,6 @@ class Store:
 #    "tables": {"tickets": [...], "comments": [...], "attachments": [...], "events": [...]}}
 
 EXPORT_FORMAT = "hearthboard-export"
-OLD_EXPORT_FORMATS = ("agent-tickets-export",)      # backups made before the rename
 EXPORT_VERSION = 1
 
 
@@ -1676,9 +1675,7 @@ def export_to(store, target, keep=30):
         target.mkdir(parents=True, exist_ok=True)
         dest = target / time.strftime("hearthboard-%Y%m%d-%H%M%S.tar.gz")
         counts = export_archive(store, dest)
-        # Backups from before the rename count too; newest by the time in the name
-        made = list(target.glob("hearthboard-*.tar.gz")) + list(target.glob("agent-tickets-*.tar.gz"))
-        old = sorted(made, key=lambda p: p.name[-22:])[:-keep] if keep > 0 else []
+        old = sorted(target.glob("hearthboard-*.tar.gz"))[:-keep] if keep > 0 else []
         for p in old:
             p.unlink()
         return dest, counts, len(old)
@@ -1706,7 +1703,7 @@ def import_archive(store, src, replace=False):
     know are skipped; ones it has that the backup lacks get their defaults."""
     with tarfile.open(src, "r:gz") as tar:
         doc = json.load(tar.extractfile("export.json"))
-        if doc.get("format") not in (EXPORT_FORMAT, *OLD_EXPORT_FORMATS):
+        if doc.get("format") != EXPORT_FORMAT:
             raise ValueError(f"{src} isn't a hearthboard backup")
         if doc.get("version", 0) > EXPORT_VERSION:
             raise ValueError(f"{src} was made by a newer hearthboard (backup version {doc['version']})")
@@ -2389,8 +2386,8 @@ def render_list(store, status, q):
     search = (f'<form class="row" method="get" style="margin-bottom:12px"><input type="search" name="q" value="{esc(q)}" '
               f'placeholder="Search {title.lower()}" aria-label="Search"><button>Search</button></form>')
     hint = ('<p class="meta">Ideas waiting to be cleared. "Make ready" lets agents pick one up.</p>' if status == "backlog"
-            else '<p class="meta">Tickets closed as done (and any cancelled or declined). <a href="/api/export">Download a backup</a> of everything '
-                 '(tickets, comments, history and files).</p>')
+            else '<p class="meta">Tickets closed as done (and any cancelled or declined). <a href="/api/export">Export everything</a> '
+                 '(tickets, comments, chat, wiki, history, files and users).</p>')
     body = (f'<h1>{title}</h1>{hint}{search}{props}<div class="list">{"".join(rows) or "<p class=empty>Nothing here.</p>"}</div>'
             + (f'<script>{PROPOSAL_JS}</script>' if status == "backlog" and not props else ""))
     return page(title, body, "/" + status, len(store.tickets(["review"])))
@@ -2673,8 +2670,9 @@ def render_settings(role, prefs):
                 'disable accounts.</div></a></div>'
                 '<div class="item"><a href="/guidance"><b>Guidance</b><div class="meta">What agents are told about how to '
                 'work here, for all of them and each one.</div></a></div>'
-                '<div class="item"><a href="/api/export"><b>Download a backup</b><div class="meta">Everything: tickets, '
-                'comments, chat, wiki, history and files.</div></a></div></div>')
+                '<div class="item"><a href="/api/export"><b>Export everything</b><div class="meta">Tickets, comments, chat, '
+                'wiki, history, files and users, in one file: a backup, or a move to a new instance '
+                '(<code>hearthboard --import FILE</code> there).</div></a></div></div>')
     tts = (f'<h2>TTS mode</h2><div class="box"><label class="row" style="gap:10px;cursor:pointer">'
            f'<input type="checkbox" id="tts" style="width:22px;height:22px"{" checked" if prefs["tts"] else ""} '
            f'onchange="setTts(this.checked)"><span><b>Read aloud on tap</b><br><span class="meta">Tap a comment, chat '
@@ -3624,8 +3622,7 @@ description: Work with the hearthboard server at {base} - take tickets, comment,
 
 # Hearthboard ({base})
 
-Every request: `Authorization: Bearer $HEARTHBOARD_TOKEN` (set up before the rename: `$AGENT_TICKETS_TOKEN`). Keep
-the token in that environment variable (or your harness's secret store); never write it into files, comments,
+Every request: `Authorization: Bearer $HEARTHBOARD_TOKEN`. Keep the token in that environment variable (or your harness's secret store); never write it into files, comments,
 chat or this skill.
 
 The full briefing, with every rule and endpoint: `GET {base}/api`. Re-read it when something here isn't
@@ -4828,25 +4825,21 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def setting_env(name: str, default=None):
-    """$HEARTHBOARD_<name>, or the older $AT_<name>."""
-    return os.environ.get(f"HEARTHBOARD_{name}") or os.environ.get(f"AT_{name}") or default
+    """$HEARTHBOARD_<name>."""
+    return os.environ.get(f"HEARTHBOARD_{name}") or default
 
 
 def default_data_dir() -> str:
-    """$HEARTHBOARD_DATA (or $AT_DATA); else data/ beside this file if it exists (a git checkout, as
-    before); else the XDG data folder, so a pip install never keeps data inside the package."""
+    """$HEARTHBOARD_DATA, else the XDG data folder (never inside the installed package)."""
     if setting_env("DATA"):
         return setting_env("DATA")
-    beside = Path(__file__).resolve().parent / "data"
-    if beside.is_dir():
-        return str(beside)
     return str(Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share") / "hearthboard")
 
 
 def command_line() -> str:
     """How to run this same hearthboard again: the installed command, or this file with this Python."""
     me = os.path.abspath(sys.argv[0])
-    if os.path.basename(me) in ("hearthboard", "agent-tickets") and os.access(me, os.X_OK):
+    if os.path.basename(me) == "hearthboard" and os.access(me, os.X_OK):
         return me
     return f"{sys.executable} {os.path.abspath(__file__)}"
 
@@ -4895,11 +4888,12 @@ def cmd_service(argv):
                                  description="Run hearthboard as a systemd user service (now and at boot), "
                                              "with a nightly backup at 03:30.")
     ap.add_argument("action", choices=["add", "remove"])
-    ap.add_argument("--host", help="address to listen on (default 127.0.0.1)")
-    ap.add_argument("--port", type=int, help="port (default 43917)")
-    ap.add_argument("--data", help="data folder (default: see hearthboard --help)")
-    ap.add_argument("--backups", help="where nightly backups go (default ~/backups/hearthboard)")
+    ap.add_argument("--host", default="127.0.0.1", help="address to listen on (default 127.0.0.1)")
+    ap.add_argument("--port", type=int, default=43917, help="port (default 43917)")
+    ap.add_argument("--data", default=default_data_dir(), help="data folder (default: see hearthboard --help)")
+    ap.add_argument("--backups", default=str(Path.home() / "backups" / "hearthboard"), help="where nightly backups go")
     ap.add_argument("--keep", type=int, default=30, help="backups to keep (default 30)")
+    ap.add_argument("--force", action="store_true", help="replace a hearthboard service that's already there")
     a = ap.parse_args(argv)
     if not shutil.which("systemctl"):
         sys.exit("systemctl isn't available here: run hearthboard under your own process manager instead")
@@ -4913,52 +4907,24 @@ def cmd_service(argv):
         systemctl("daemon-reload")
         return print("hearthboard service and nightly backup stopped and removed (your data is untouched)")
 
-    # An existing service keeps its data, address, port and backups: this one, or one from before the
-    # rename (agent-tickets.service, usually from a git checkout), which is stopped and replaced
-    renamed = [units / n for n in ("agent-tickets.service", "agent-tickets-backup.service", "agent-tickets-backup.timer")]
-    source = units / names[0] if (units / names[0]).exists() else renamed[0]
-    old = source.read_text() if source.exists() else ""
-    old_backup = (units / names[1] if (units / names[1]).exists() else renamed[1])
-    old_backups = re.search(r"--export (\S+?)/?(\s|$)", old_backup.read_text()) if old_backup.exists() else None
-    old_exec = re.search(r"^ExecStart=(.*)$", old, re.M)
-    old_exec = old_exec.group(1) if old_exec else ""
-    def old_opt(name):
-        m = re.search(rf"--{name}[ =](\S+)", old_exec)
-        return m.group(1) if m else None
-    data = a.data or old_opt("data")
-    if not data and old_exec:
-        script = re.search(r"(\S+(?:hearthboard|agent_tickets)\.py)", old_exec)
-        beside = Path(script.group(1).replace("%h", str(Path.home()))).parent / "data" if script else None
-        if beside and beside.is_dir():
-            data = str(beside)
-    data = str(Path(data or default_data_dir()).expanduser().resolve())
-    host = a.host or old_opt("host") or "127.0.0.1"
-    port = a.port or int(old_opt("port") or 43917)
+    if (units / names[0]).exists() and not a.force:
+        sys.exit(f"there's already a hearthboard service ({units / names[0]}): leaving it alone. "
+                 "`hearthboard service remove` first, or add --force to replace it")
+    data = str(Path(a.data).expanduser().resolve())
     exe = " ".join(quote_arg(x) for x in command_line().split(" ", 1))
-    backups = a.backups or (old_backups.group(1).replace("%h", str(Path.home())) if old_backups else None)
-    if not backups:
-        before = Path.home() / "backups" / "agent-tickets"
-        backups = str(before if before.is_dir() else Path.home() / "backups" / "hearthboard")
-    backups = str(Path(backups).expanduser().resolve())
+    backups = str(Path(a.backups).expanduser().resolve())
     Path(backups).mkdir(parents=True, exist_ok=True)
     units.mkdir(parents=True, exist_ok=True)
-    texts = (SERVICE_UNIT.format(exe=exe, host=host, port=port, data=quote_arg(data)),
+    texts = (SERVICE_UNIT.format(exe=exe, host=a.host, port=a.port, data=quote_arg(data)),
              BACKUP_UNIT.format(exe=exe, data=quote_arg(data), backups=quote_arg(backups), keep=a.keep),
              BACKUP_TIMER)
-    if any(p.exists() for p in renamed):                    # stop the old one first: it holds the port
-        systemctl("disable", "--now", "agent-tickets.service", "agent-tickets-backup.timer")
-        for p in renamed:
-            p.unlink(missing_ok=True)
     for n, text in zip(names, texts):
         (units / n).write_text(text)
-    if old and old != texts[0]:
-        print(f"replaced the existing service{' agent-tickets' if source != units / names[0] else ''} "
-              f"(it ran: {old_exec})")
     systemctl("daemon-reload")
     r = systemctl("enable", "--now", "hearthboard.service", "hearthboard-backup.timer")
     if r.returncode:
         sys.exit(f"systemctl failed: {(r.stderr or r.stdout).strip()}")
-    if old:
+    if a.force:
         systemctl("restart", "hearthboard.service")
     user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
     linger = subprocess.run(["loginctl", "show-user", user, "-p", "Linger"], capture_output=True, text=True)
@@ -4967,7 +4933,7 @@ def cmd_service(argv):
         print(f"note: run `sudo loginctl enable-linger {user}` so it keeps running when you're logged out")
     time.sleep(1.5)
     state = systemctl("is-active", "hearthboard.service").stdout.strip()
-    print(f"hearthboard: service {state} on http://{host}:{port}, data in {data}\n"
+    print(f"hearthboard: service {state} on http://{a.host}:{a.port}, data in {data}\n"
           f"nightly backup at 03:30 into {backups} (keeping {a.keep})\n"
           f"logs: journalctl --user -u hearthboard" + ("" if state == "active" else
           "\nIt didn't stay up: see the logs"))
