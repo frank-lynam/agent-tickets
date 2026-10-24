@@ -51,7 +51,8 @@ hearthboard service add                             # then run it
 ```
 
 The import goes into an empty board (`--replace` to overwrite tickets that are
-already there). Ids are kept, so links and ticket names still work.
+already there). Ids are kept, so links and ticket names still work. Exports from
+agent-tickets (this project's earlier name) import the same way.
 
 ## Statuses
 

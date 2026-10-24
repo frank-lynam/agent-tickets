@@ -1632,6 +1632,9 @@ class Store:
 #    "tables": {"tickets": [...], "comments": [...], "attachments": [...], "events": [...]}}
 
 EXPORT_FORMAT = "hearthboard-export"
+# Exports from agent-tickets (this project's name before 0.1.0) have the same layout: --import takes
+# them too, so a board can move from an old install to a new one. Only ever read on an explicit --import.
+IMPORTABLE_FORMATS = (EXPORT_FORMAT, "agent-tickets-export")
 EXPORT_VERSION = 1
 
 
@@ -1703,7 +1706,7 @@ def import_archive(store, src, replace=False):
     know are skipped; ones it has that the backup lacks get their defaults."""
     with tarfile.open(src, "r:gz") as tar:
         doc = json.load(tar.extractfile("export.json"))
-        if doc.get("format") != EXPORT_FORMAT:
+        if doc.get("format") not in IMPORTABLE_FORMATS:
             raise ValueError(f"{src} isn't a hearthboard backup")
         if doc.get("version", 0) > EXPORT_VERSION:
             raise ValueError(f"{src} was made by a newer hearthboard (backup version {doc['version']})")

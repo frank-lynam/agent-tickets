@@ -432,8 +432,8 @@ class TicketsTest(unittest.TestCase):
                 at.import_archive(store, archive({"format": "something-else"}))
             with self.assertRaises(ValueError):
                 at.import_archive(store, archive({"format": "hearthboard-export", "version": 99, "tables": {}}))
-            # A file trying to escape the data folder is skipped.
-            ok = {"format": "hearthboard-export", "version": 1, "tables": {}}
+            # A file trying to escape the data folder is skipped. (An export from agent-tickets, which --import takes.)
+            ok = {"format": "agent-tickets-export", "version": 1, "tables": {}}
             at.import_archive(store, archive(ok, {"files/../../escaped.txt": b"x", "files/T/ok.txt": b"y"}))
             self.assertFalse((Path(tmp) / "escaped.txt").exists())
             self.assertFalse((store.dir / "escaped.txt").exists())
